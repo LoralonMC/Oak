@@ -1,0 +1,135 @@
+# Configuration for Application Branch
+# Handles staff applications with multi-page modals
+
+# Set to false to disable this branch
+enabled: true
+
+# Version of this branch's config
+version: "1.0.0"
+
+settings:
+  # Application settings
+  application:
+    # What position/role are applicants applying for?
+    position_name: "Staff Member"  # Change to "Moderator", "Helper", "Admin", etc.
+    button_label: "Apply for Staff"  # Button text shown to users
+    channel_name_prefix: "application"  # Prefix for application channels (e.g., "application-01")
+
+  # Channel where the application button is posted
+  application_channel_id: 0  # CONFIGURE THIS
+
+  # Category where new applications are created
+  application_category_id: 0  # CONFIGURE THIS
+
+  # Category where accepted applications are moved (optional, set to 0 to disable)
+  accepted_category_id: 0  # CONFIGURE THIS (or 0 to disable)
+
+  # Channel for admin notifications (optional, set to 0 to disable)
+  admin_chat_id: 0  # CONFIGURE THIS (or 0 to disable)
+
+  # Forum channel for punishment history lookup (optional, set to 0 to disable)
+  punishment_forum_channel_id: 0  # CONFIGURE THIS (or 0 to disable)
+
+  # Role IDs that can review applications
+  reviewer_role_ids:
+    - 0  # CONFIGURE THIS - Add role IDs that can accept/deny applications
+
+  # Required link role ID (optional, set to 0 to disable account linking requirement)
+  required_link_role_id: 0  # CONFIGURE THIS (or 0 to disable)
+
+  # Guild ID
+  guild_id: 0  # CONFIGURE THIS - Your Discord server ID
+
+  # Cleanup settings
+  cleanup:
+    abandoned_after_days: 7  # Applications inactive for this long will be marked abandoned
+
+  # MySQL/Plan Database (for background checks - playtime stats)
+  # Set enabled to false if you don't use MySQL/Plan
+  # This is optional and only needed for Minecraft servers using Plan plugin
+  mysql:
+    enabled: false  # Set to true if you want to use MySQL/Plan integration
+    host: "your_mysql_host"
+    user: "your_mysql_user"
+    password: "your_mysql_password"
+    database: "your_plan_database"
+
+  # UI settings
+  ui:
+    embed_colors:
+      info: 0x5865F2  # Blurple
+      success: 0x57F287  # Green
+      warning: 0xFEE75C  # Yellow
+      error: 0xED4245  # Red
+
+  # Application questions (customize these for your needs)
+  questions:
+    - label: "What is your username?"
+      max_length: 50
+      placeholder: "Your username or in-game name"
+
+    - label: "What is your age?"
+      max_length: 20
+      placeholder: "Your age"
+
+    - label: "How long have you been part of the community?"
+      max_length: 100
+      placeholder: "e.g., 3 months, 1 year, etc."
+
+    - label: "How much time do you spend here daily?"
+      max_length: 100
+      placeholder: "e.g., 2-3 hours per day"
+
+    - label: "What is your time zone?"
+      max_length: 50
+      placeholder: "e.g., EST, PST, GMT, etc."
+
+    - label: "Have you been active and helpful?"
+      max_length: 1000
+      placeholder: "Describe how you've been active in the community"
+
+    - label: "Give an example of how you recently helped someone:"
+      max_length: 1000
+      placeholder: "Describe a specific situation"
+
+    - label: "Is your profile appropriate and professional?"
+      max_length: 100
+      placeholder: "Yes/No and explain"
+
+    - label: "Do you have a working microphone?"
+      max_length: 100
+      placeholder: "Yes/No"
+
+    - label: "Rate your enjoyment of helping others (1-5):"
+      max_length: 20
+      placeholder: "1 (low) to 5 (high)"
+
+    - label: "Do you have any moderation experience?"
+      max_length: 1000
+      placeholder: "Describe any past staff/moderation roles"
+
+    - label: "Have you been banned or warned before?"
+      max_length: 500
+      placeholder: "Be honest - we can check records"
+
+    - label: "Why do you want to join the staff team?"
+      max_length: 1000
+      placeholder: "What motivates you?"
+
+    - label: "What are your strengths and weaknesses?"
+      max_length: 1000
+      placeholder: "Be honest about both"
+
+    - label: "How would you handle a rule-breaking member?"
+      max_length: 1000
+      placeholder: "Describe your approach"
+
+    - label: "How do you handle stressful situations?"
+      max_length: 1000
+      placeholder: "Describe your stress management"
+
+    - label: "Do you agree to follow all staff guidelines?"
+      max_length: 100
+      placeholder: "Yes/No"
+
+# Add more settings as needed

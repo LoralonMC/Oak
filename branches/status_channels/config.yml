@@ -1,0 +1,30 @@
+# Configuration for Status Channels Branch
+# Updates voice channels with server status information
+
+# Set to false to disable this branch
+enabled: true
+
+# Version of this branch's config
+version: "1.0.0"
+
+settings:
+  # Voice channel IDs to update with status
+  player_count_channel_id: 0
+  member_count_channel_id: 0
+
+  # Update interval in seconds
+  update_interval: 60
+
+  # Server information (configure for your Minecraft server)
+  server:
+    host: "mc.example.com"
+    port: 25565
+
+  # Channel name formats
+  formats:
+    player_count: "Players: {count}/{max}"
+    server_status: "Status: {status}"
+    offline: "Offline"
+    online: "Online"
+
+# Add more settings as needed

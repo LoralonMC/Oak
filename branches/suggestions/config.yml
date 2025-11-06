@@ -1,0 +1,44 @@
+# Configuration for Suggestions Branch
+# Handles user suggestions with voting and management
+
+# Set to false to disable this branch
+enabled: true
+
+# Version of this branch's config
+version: "1.0.0"
+
+settings:
+  # Channel ID where suggestions are posted
+  channel_id: 0
+
+  # Role IDs that can manage suggestions (approve/deny)
+  manager_role_ids:
+    - 0
+
+  # Validation settings
+  validation:
+    min_length: 10
+    max_length: 4000
+
+  # UI settings
+  ui:
+    embed_colors:
+      pending: 0x2B2D31  # Dark embed color
+      approved: 0x57F287  # Green
+      denied: 0xED4245    # Red
+
+    # Thread settings
+    thread:
+      title_max_length: 40
+      title_prefix: "💬 Discussion: "
+
+  # Messages
+  messages:
+    too_short: "Your suggestion is too short. Please provide more detail (at least 10 characters)."
+    empty: "Your suggestion was empty or invalid."
+    created_error: "Failed to create your suggestion. Please try again later."
+    not_found: "Suggestion not found."
+    no_permission: "You don't have permission to manage suggestions."
+    vote_failed: "Failed to update vote."
+
+# Add more settings as needed

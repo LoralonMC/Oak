@@ -1,0 +1,26 @@
+# Configuration for Link Branch
+# Handles linking Discord accounts to Minecraft accounts
+
+# Set to false to disable this branch
+enabled: true
+
+# Version of this branch's config
+version: "1.0.0"
+
+settings:
+  # Role ID given when account is linked
+  linked_role_id: 0
+
+  # Validation settings
+  validation:
+    code_length: 6
+    code_expiry_minutes: 15
+
+  # Messages
+  messages:
+    already_linked: "Your account is already linked!"
+    link_success: "Successfully linked your Discord account to your Minecraft account!"
+    link_failed: "Failed to link your account. Please try again."
+    invalid_code: "Invalid verification code. Please try again."
+
+# Add more settings as needed
