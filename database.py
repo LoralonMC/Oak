@@ -11,14 +11,14 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 
-async def init_cog_database(db_path: str, schema: str, cog_name: str = "Branch"):
+async def init_branch_database(db_path: str, schema: str, branch_name: str = "Branch") -> None:
     """
     Initialize a branch's database with the provided schema.
 
     Args:
         db_path: Path to the database file (e.g., "branches/suggestions/data.db")
         schema: SQL schema to execute (CREATE TABLE statements)
-        cog_name: Name of the branch (for logging)
+        branch_name: Name of the branch (for logging)
     """
     try:
         # Ensure parent directory exists
@@ -32,13 +32,13 @@ async def init_cog_database(db_path: str, schema: str, cog_name: str = "Branch")
             # Execute schema (can be multiple statements)
             await db.executescript(schema)
             await db.commit()
-            logger.info(f"{cog_name} database initialized at {db_path}")
+            logger.info(f"{branch_name} database initialized at {db_path}")
     except Exception as e:
-        logger.error(f"Failed to initialize {cog_name} database: {e}")
+        logger.error(f"Failed to initialize {branch_name} database: {e}")
         raise
 
 
-async def get_db_connection(db_path: str):
+async def get_db_connection(db_path: str) -> aiosqlite.Connection:
     """
     Get a database connection for a branch with foreign keys enabled.
 

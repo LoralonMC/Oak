@@ -1,14 +1,12 @@
 """
 Oak - A modular Discord bot framework
 
-Website: https://oak.oakheart.dev
-GitHub: https://github.com/oakheart-dev/oak
+GitHub: https://github.com/LoralonMC/oak
 """
 
 import discord
 from discord.ext import commands
-from config import DISCORD_TOKEN, ADMIN_ROLE_IDS, GUILD_ID
-from branches.suggestions import DummyView
+from config import DISCORD_TOKEN, GUILD_ID
 import logging
 import sys
 from datetime import datetime
@@ -57,20 +55,6 @@ for intent_name, reason in REQUIRED_INTENTS.items():
         logger.error("https://discord.com/developers/applications")
         sys.exit(1)
 
-async def is_admin_check(ctx):
-    """Check if user has one of the admin roles defined in .env"""
-    logger.info(f"Checking admin permission for {ctx.author}")
-    if not ctx.guild:
-        logger.info("No guild context, denying")
-        return False
-    user_role_ids = [role.id for role in ctx.author.roles]
-    logger.info(f"User roles: {user_role_ids}, Admin roles: {ADMIN_ROLE_IDS}")
-    has_permission = any(role_id in ADMIN_ROLE_IDS for role_id in user_role_ids)
-    logger.info(f"Permission check result: {has_permission}")
-    if not has_permission:
-        logger.warning(f"User {ctx.author} attempted to use admin command without permission")
-    return has_permission
-
 class Oak(commands.Bot):
     """Oak - Modular Discord bot framework."""
 
@@ -79,12 +63,6 @@ class Oak(commands.Bot):
 
     async def setup_hook(self):
         try:
-            logger.info("Registering persistent views...")
-            self.add_view(DummyView())
-
-            logger.info("Loading admin commands...")
-            await self.load_extension("admin_commands")
-
             logger.info("Loading branches...")
             await self.load_branches()
 
@@ -145,8 +123,6 @@ class Oak(commands.Bot):
     async def on_ready(self):
         logger.info(f"Logged in as {self.user} (ID: {self.user.id})")
         logger.info(f"Connected to {len(self.guilds)} guild(s)")
-        logger.info(f"Command prefix: {self.command_prefix}")
-        logger.info(f"Admin role IDs: {ADMIN_ROLE_IDS}")
         logger.info(f"Registered prefix commands: {[cmd.name for cmd in self.commands]}")
 
         # Sync slash commands to Discord
@@ -174,204 +150,12 @@ class Oak(commands.Bot):
         if isinstance(error, commands.CommandNotFound):
             return
         elif isinstance(error, (commands.MissingPermissions, commands.MissingRole, commands.MissingAnyRole, commands.CheckFailure)):
-            await ctx.send("❌ You don't have permission to use this command. This requires an admin role.")
+            await ctx.send("❌ You don't have permission to use this command.")
         elif isinstance(error, commands.MissingRequiredArgument):
             await ctx.send(f"❌ Missing required argument: `{error.param.name}`")
         else:
             logger.error(f"Command error in {ctx.command}: {error}", exc_info=True)
             await ctx.send("❌ An error occurred while executing the command.")
-
-    # ========================================================================
-    # Built-in Admin Commands
-    # ========================================================================
-
-    @commands.command()
-    async def reload(self, ctx, branch_name: str):
-        """Reload a specific branch AND its config without restarting the bot.
-
-        Usage: !reload suggestions
-        """
-        # Check admin permission manually
-        if not await is_admin_check(ctx):
-            await ctx.send("❌ You don't have permission to use this command. This requires an admin role.")
-            return
-
-        logger.info(f"Reload command called by {ctx.author} for branch: {branch_name}")
-        from core.branch_loader import get_branch_loader
-
-        try:
-            loader = get_branch_loader()
-
-            # Reload config first
-            config = loader.reload_config(branch_name)
-
-            # Get the correct load path
-            load_path = loader.get_load_path(branch_name)
-            if not load_path:
-                await ctx.send(f"❌ Branch **{branch_name}** not found.")
-                return
-
-            # Reload the branch
-            await self.reload_extension(load_path)
-
-            # Show status
-            enabled = config.get("enabled", True)
-            version = config.get("version", "unknown")
-
-            embed = discord.Embed(
-                title=f"✅ Reloaded: {branch_name}",
-                color=discord.Color.green()
-            )
-            embed.add_field(name="Version", value=version, inline=True)
-            embed.add_field(name="Enabled", value="✅" if enabled else "❌", inline=True)
-            embed.set_footer(text=f"Reloaded by {ctx.author}")
-
-            await ctx.send(embed=embed)
-            logger.info(f"{ctx.author} reloaded branch: {branch_name}")
-
-        except commands.ExtensionNotLoaded:
-            await ctx.send(f"❌ Branch **{branch_name}** is not loaded.")
-        except commands.ExtensionNotFound:
-            await ctx.send(f"❌ Branch **{branch_name}** not found.")
-        except Exception as e:
-            await ctx.send(f"❌ Failed to reload **{branch_name}**: {e}")
-            logger.error(f"Failed to reload {branch_name}: {e}")
-
-    @commands.command(name="load")
-    @commands.check(is_admin_check)
-    async def load_branch(self, ctx, branch_name: str):
-        """Load a new branch.
-
-        Usage: !load my_new_feature
-        """
-        from core.branch_loader import get_branch_loader
-
-        try:
-            loader = get_branch_loader()
-            load_path = loader.get_load_path(branch_name)
-
-            if not load_path:
-                await ctx.send(f"❌ Branch **{branch_name}** not found.")
-                return
-
-            await self.load_extension(load_path)
-            await ctx.send(f"✅ Loaded branch: **{branch_name}**")
-            logger.info(f"{ctx.author} loaded branch: {branch_name}")
-        except commands.ExtensionAlreadyLoaded:
-            await ctx.send(f"⚠️ Branch **{branch_name}** is already loaded.")
-        except commands.ExtensionNotFound:
-            await ctx.send(f"❌ Branch **{branch_name}** not found.")
-        except Exception as e:
-            await ctx.send(f"❌ Failed to load **{branch_name}**: {e}")
-            logger.error(f"Failed to load {branch_name}: {e}")
-
-    @commands.command(name="unload")
-    @commands.check(is_admin_check)
-    async def unload_branch(self, ctx, branch_name: str):
-        """Unload a branch.
-
-        Usage: !unload suggestions
-        """
-        from core.branch_loader import get_branch_loader
-
-        try:
-            loader = get_branch_loader()
-            load_path = loader.get_load_path(branch_name)
-
-            if not load_path:
-                await ctx.send(f"❌ Branch **{branch_name}** not found.")
-                return
-
-            await self.unload_extension(load_path)
-            await ctx.send(f"✅ Unloaded branch: **{branch_name}**")
-            logger.info(f"{ctx.author} unloaded branch: {branch_name}")
-        except commands.ExtensionNotLoaded:
-            await ctx.send(f"⚠️ Branch **{branch_name}** is not loaded.")
-        except Exception as e:
-            await ctx.send(f"❌ Failed to unload **{branch_name}**: {e}")
-            logger.error(f"Failed to unload {branch_name}: {e}")
-
-    @commands.command(name="branches")
-    @commands.check(is_admin_check)
-    async def list_branches(self, ctx):
-        """List all loaded branches."""
-        loaded_branches = [cog for cog in self.cogs.keys()]
-
-        embed = discord.Embed(
-            title="🌿 Loaded Branches",
-            description=f"Total: **{len(loaded_branches)}** branches",
-            color=discord.Color.green()
-        )
-
-        branch_list = "\n".join([f"• {branch}" for branch in sorted(loaded_branches)])
-        embed.add_field(name="Branches", value=branch_list or "None", inline=False)
-
-        embed.set_footer(text="Use !reload <branch> to reload a branch")
-
-        await ctx.send(embed=embed)
-
-    @commands.command(name="reloadall")
-    @commands.check(is_admin_check)
-    async def reload_all_branches(self, ctx):
-        """Reload all branches."""
-        loaded_branches = list(self.extensions.keys())
-        success_count = 0
-        failed_branches = []
-
-        msg = await ctx.send("🔄 Reloading all branches...")
-
-        for extension in loaded_branches:
-            try:
-                await self.reload_extension(extension)
-                success_count += 1
-            except Exception as e:
-                failed_branches.append((extension, str(e)))
-                logger.error(f"Failed to reload {extension}: {e}")
-
-        result_text = f"✅ Reloaded **{success_count}/{len(loaded_branches)}** branches"
-
-        if failed_branches:
-            failed_text = "\n".join([f"❌ {ext}: {err[:50]}" for ext, err in failed_branches])
-            result_text += f"\n\n**Failed:**\n{failed_text}"
-
-        await msg.edit(content=result_text)
-        logger.info(f"{ctx.author} reloaded all branches ({success_count} successful)")
-
-    @commands.command(name="botinfo")
-    async def bot_info(self, ctx):
-        """Show bot information."""
-        embed = discord.Embed(
-            title="🌳 Oak Bot Info",
-            description="A modular Discord bot framework",
-            color=discord.Color.green()
-        )
-
-        # Bot stats
-        embed.add_field(
-            name="📊 Statistics",
-            value=f"**Servers:** {len(self.guilds)}\n"
-                  f"**Users:** {sum(g.member_count for g in self.guilds)}\n"
-                  f"**Branches:** {len(self.cogs)}",
-            inline=True
-        )
-
-        # System info
-        embed.add_field(
-            name="💻 System",
-            value=f"**Python:** {sys.version.split()[0]}\n"
-                  f"**discord.py:** {discord.__version__}",
-            inline=True
-        )
-
-        # Latency
-        embed.add_field(
-            name="🏓 Latency",
-            value=f"**{round(self.latency * 1000)}ms**",
-            inline=True
-        )
-
-        embed.set_footer(text=f"Requested by {ctx.author} • oak.oakheart.dev")
-        await ctx.send(embed=embed)
 
 def main():
     try:

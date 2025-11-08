@@ -1,0 +1,137 @@
+# Configuration for Tickets Branch
+enabled: true
+version: "1.0.0"
+
+settings:
+  # Channel where ticket panel button is posted
+  ticket_panel_channel_id: 0  # CONFIGURE THIS
+
+  # Channel for ticket event logs
+  log_channel_id: 0  # CONFIGURE THIS (or 0 to disable)
+
+  # Global staff roles (can manage all tickets)
+  staff_role_ids:
+    - 0  # Add staff role IDs here
+
+  # Panel message customization
+  panel:
+    title: "🎫 Support Tickets"
+    description: |
+      Need help? Create a support ticket!
+
+      Select a category below to get started.
+      A staff member will assist you shortly.
+    color: 0x5865F2  # Blurple
+
+  # Anti-archive settings
+  anti_archive:
+    enabled: true
+    check_interval_minutes: 30  # How often to check for archived threads
+
+  # Ticket categories
+  categories:
+    ingame_support:
+      enabled: true
+      label: "🎮 Ingame Support"
+      emoji: "🎮"
+      description: "Get help with gameplay issues"
+      naming_pattern: "ingame-{number}"
+      ping_roles:
+        - 0  # Staff role to ping for ingame tickets
+      allow_user_additions: true  # Users can add others via @mention
+      welcome_message: |
+        Thanks for creating an ingame support ticket!
+
+        Please describe your issue in detail:
+        - What were you doing?
+        - What happened?
+        - What did you expect to happen?
+
+        A staff member will help you soon!
+
+    billing_support:
+      enabled: true
+      label: "💳 Billing Support"
+      emoji: "💳"
+      description: "Issues with purchases or donations"
+      naming_pattern: "billing-{nickname}"
+      ping_roles:
+        - 0  # Admin/billing role
+      allow_user_additions: false  # Restrict for privacy (billing info sensitive)
+      welcome_message: |
+        Billing support ticket created.
+
+        Please provide:
+        - Transaction ID
+        - Purchase date
+        - Description of the issue
+
+        An admin will review your case shortly.
+
+    player_report:
+      enabled: true
+      label: "⚠️ Report Player"
+      emoji: "⚠️"
+      description: "Report a player for rule violations"
+      naming_pattern: "report-{number}"
+      ping_roles:
+        - 0  # Moderator role
+      allow_user_additions: true
+      welcome_message: |
+        Player report ticket created.
+
+        Please provide:
+        - Player's username
+        - What rule(s) they broke
+        - Evidence (screenshots, video, etc.)
+        - When did this happen?
+
+        A moderator will investigate.
+
+    punishment_appeal:
+      enabled: true
+      label: "🔓 Punishment Appeal"
+      emoji: "🔓"
+      description: "Appeal a ban, mute, or warning"
+      naming_pattern: "appeal-{nickname}"
+      ping_roles:
+        - 0  # Admin role
+      allow_user_additions: false  # Restrict for privacy (appeals are sensitive)
+      welcome_message: |
+        Punishment appeal ticket created.
+
+        Please explain:
+        - What punishment are you appealing?
+        - Why should it be removed or reduced?
+        - Do you understand what you did wrong?
+
+        An admin will review your appeal.
+
+    bug_report:
+      enabled: true
+      label: "🐛 Bug Report"
+      emoji: "🐛"
+      description: "Report a bug or technical issue"
+      naming_pattern: "bug-{number}"
+      ping_roles:
+        - 0  # Developer/admin role
+      allow_user_additions: true
+      welcome_message: |
+        Bug report ticket created.
+
+        Please provide:
+        - What is the bug?
+        - Steps to reproduce it
+        - What should happen vs what actually happens
+        - Any error messages or screenshots
+
+        A developer will investigate.
+
+  # UI colors
+  ui:
+    colors:
+      open: 0x5865F2      # Blurple - active ticket
+      closed: 0x99AAB5    # Gray - closed ticket
+      log_created: 0x57F287   # Green - ticket created log
+      log_closed: 0xED4245    # Red - ticket closed log
+      log_reopened: 0xFEE75C  # Yellow - ticket reopened log

@@ -9,22 +9,30 @@ version: "1.0.0"
 
 settings:
   # Voice channel IDs to update with status
+  # Right-click a voice channel in Discord → Copy Channel ID
   player_count_channel_id: 0
   member_count_channel_id: 0
-
-  # Update interval in seconds
-  update_interval: 60
 
   # Server information (configure for your Minecraft server)
   server:
     host: "mc.example.com"
     port: 25565
 
-  # Channel name formats
+  # Channel name formats (customize these!)
+  # Available variables:
+  #   member_count: {count} = total member count
+  #   player_count: {online} = online players, {max} = max players
   formats:
-    player_count: "Players: {count}/{max}"
-    server_status: "Status: {status}"
-    offline: "Offline"
-    online: "Online"
+    # Format for member count channel
+    # Examples:
+    #   "Members: {count}"
+    #   "Total Members: {count:,}"  (with comma separator)
+    #   "👥 {count} Members"
+    member_count: "Total Members: {count:,}"
 
-# Add more settings as needed
+    # Format for player count channel
+    # Examples:
+    #   "Online: {online}/{max}"
+    #   "Players: {online}/{max}"
+    #   "🎮 {online}/{max} Online"
+    player_count: "Online: {online}/{max}"

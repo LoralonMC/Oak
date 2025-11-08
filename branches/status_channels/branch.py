@@ -6,57 +6,63 @@ from pathlib import Path
 import yaml
 import random
 import asyncio
+from typing import Dict, Any
 from config import GUILD_ID
 
 logger = logging.getLogger(__name__)
 
+# Default configuration for this branch
+DEFAULT_CONFIG = {
+    "enabled": True,
+    "version": "1.0.0",
+    "settings": {
+        "player_count_channel_id": 0,
+        "member_count_channel_id": 0,
+        "server": {
+            "host": "localhost",
+            "port": 25565
+        },
+        "formats": {
+            "member_count": "Total Members: {count:,}",
+            "player_count": "Online: {online}/{max}"
+        }
+    }
+}
+
+
 class StatusChannels(commands.Cog):
-    def __init__(self, bot):
+    """Automatically updates voice channel names with server statistics."""
+
+    def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
 
         # Load config
         self.config = self.load_config()
         settings = self.config.get("settings", {})
 
-        self.player_count_channel_id = settings.get("player_count_channel_id", 0)
-        self.member_count_channel_id = settings.get("member_count_channel_id", 0)
+        self.player_count_channel_id: int = settings.get("player_count_channel_id", 0)
+        self.member_count_channel_id: int = settings.get("member_count_channel_id", 0)
 
         server_config = settings.get("server", {})
-        self.minecraft_server_host = server_config.get("host", "localhost")
-        self.minecraft_server_port = server_config.get("port", 25565)
+        self.minecraft_server_host: str = server_config.get("host", "localhost")
+        self.minecraft_server_port: int = server_config.get("port", 25565)
+
+        # Load format strings
+        formats = settings.get("formats", {})
+        self.member_count_format: str = formats.get("member_count", "Total Members: {count:,}")
+        self.player_count_format: str = formats.get("player_count", "Online: {online}/{max}")
 
         logger.info(f"StatusChannels initialized (player: {self.player_count_channel_id}, member: {self.member_count_channel_id})")
 
         self.update_status_channels.start()
 
-    def load_config(self) -> dict:
+    def load_config(self) -> Dict[str, Any]:
         """Load config from config.yml in this branch's folder."""
+        from utils import load_branch_config
         config_path = Path(__file__).parent / "config.yml"
+        return load_branch_config(config_path, DEFAULT_CONFIG, "StatusChannels")
 
-        if config_path.exists():
-            try:
-                with open(config_path, "r") as f:
-                    config = yaml.safe_load(f) or {}
-                logger.info("Loaded config for StatusChannels")
-                return config
-            except Exception as e:
-                logger.error(f"Failed to load config for StatusChannels: {e}")
-
-        # Return default config if file doesn't exist
-        return {
-            "enabled": True,
-            "version": "1.0.0",
-            "settings": {
-                "player_count_channel_id": 0,
-                "member_count_channel_id": 0,
-                "server": {
-                    "host": "localhost",
-                    "port": 25565
-                }
-            }
-        }
-
-    def cog_unload(self):
+    def cog_unload(self) -> None:
         """Cancel background tasks when branch is unloaded."""
         logger.info("StatusChannels branch unloading - cancelling background tasks")
         self.update_status_channels.cancel()
@@ -82,7 +88,7 @@ class StatusChannels(commands.Cog):
                 if not member_channel:
                     logger.warning(f"Member channel {self.member_count_channel_id} not found")
                 else:
-                    new_name = f"Total Members: {total_members:,}"
+                    new_name = self.member_count_format.format(count=total_members)
                     if member_channel.name != new_name:
                         logger.info(f"Updating member channel: '{member_channel.name}' -> '{new_name}'")
                         await member_channel.edit(name=new_name)
@@ -105,7 +111,7 @@ class StatusChannels(commands.Cog):
                 if not online_channel:
                     logger.warning(f"Online channel {self.player_count_channel_id} not found")
                 else:
-                    new_name = f"Online: {online_count}/{max_count}"
+                    new_name = self.player_count_format.format(online=online_count, max=max_count)
                     if online_channel.name != new_name:
                         logger.info(f"Updating online channel: '{online_channel.name}' -> '{new_name}'")
                         await online_channel.edit(name=new_name)
@@ -121,8 +127,6 @@ class StatusChannels(commands.Cog):
             logger.error(f"Critical error in update_status_channels: {e}")
 
     @update_status_channels.before_loop
-    async def before_status_update(self):
+    async def before_status_update(self) -> None:
+        """Wait for bot to be ready before starting status updates."""
         await self.bot.wait_until_ready()
-
-async def setup(bot):
-    await bot.add_cog(StatusChannels(bot))

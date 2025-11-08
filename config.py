@@ -62,11 +62,82 @@ if GUILD_ID == 0:
     print("Please update your .env file with your Discord server ID.")
     sys.exit(1)
 
-# Admin Role IDs (Bot management only - !reload, !load, etc.)
-ADMIN_ROLE_IDS = get_env_int_list("ADMIN_ROLE_IDS")
+# Note: Bot admin commands (/reload, /load, etc.) now use Discord's built-in
+# Administrator permission via @app_commands.default_permissions(administrator=True)
+# No custom role IDs needed for bot management.
 
-# Validate at least one admin role is configured
-if not ADMIN_ROLE_IDS or ADMIN_ROLE_IDS == [0]:
-    print("WARNING: No valid admin role IDs configured!")
-    print("Bot management commands (!reload, !load, etc.) will not be accessible.")
-    print("Please update ADMIN_ROLE_IDS in your .env file.")
+# ============================================================================
+# Configuration Validation Helpers
+# ============================================================================
+
+def validate_channel_id(channel_id: int, name: str = "channel_id") -> bool:
+    """
+    Validate a Discord channel ID.
+
+    Args:
+        channel_id: The channel ID to validate
+        name: Name of the setting (for error messages)
+
+    Returns:
+        True if valid, False otherwise
+    """
+    if not isinstance(channel_id, int):
+        print(f"ERROR: {name} must be an integer, got {type(channel_id)}")
+        return False
+
+    if channel_id != 0 and (channel_id < 0 or channel_id > 2**63):
+        print(f"ERROR: {name} must be a valid Discord ID (got {channel_id})")
+        return False
+
+    return True
+
+
+def validate_role_ids(role_ids: list, name: str = "role_ids") -> bool:
+    """
+    Validate a list of Discord role IDs.
+
+    Args:
+        role_ids: List of role IDs to validate
+        name: Name of the setting (for error messages)
+
+    Returns:
+        True if valid, False otherwise
+    """
+    if not isinstance(role_ids, list):
+        print(f"ERROR: {name} must be a list, got {type(role_ids)}")
+        return False
+
+    for i, role_id in enumerate(role_ids):
+        if not isinstance(role_id, int):
+            print(f"ERROR: {name}[{i}] must be an integer, got {type(role_id)}")
+            return False
+
+        if role_id != 0 and (role_id < 0 or role_id > 2**63):
+            print(f"ERROR: {name}[{i}] must be a valid Discord ID (got {role_id})")
+            return False
+
+    return True
+
+
+def validate_config_dict(config: dict, required_keys: list = None) -> bool:
+    """
+    Validate a configuration dictionary.
+
+    Args:
+        config: Configuration dictionary to validate
+        required_keys: List of required keys
+
+    Returns:
+        True if valid, False otherwise
+    """
+    if not isinstance(config, dict):
+        print(f"ERROR: Config must be a dictionary, got {type(config)}")
+        return False
+
+    if required_keys:
+        missing_keys = [key for key in required_keys if key not in config]
+        if missing_keys:
+            print(f"ERROR: Missing required config keys: {', '.join(missing_keys)}")
+            return False
+
+    return True

@@ -21,6 +21,15 @@ Thank you for your interest in contributing to Oak! This document provides guide
 - Add docstrings to all functions and classes
 - Keep functions focused and single-purpose
 
+### Understanding Oak's Branch Terminology
+
+Oak uses **"branch"** as the user-facing term for modular extensions. However, in the code you'll see Discord.py's native terminology:
+- **`commands.Cog`** - The base class all branches inherit from (required by Discord.py)
+- **`bot.add_cog()`** - The method to register branches (required by Discord.py)
+- **`cog_load()` / `cog_unload()`** - Lifecycle methods for setup/cleanup (Discord.py Cog API)
+
+This is not a terminology inconsistency - it's Discord.py's API. When writing Oak branches, you're creating Cogs under the hood, but we call them "branches" for clarity and to match Oak's modular philosophy.
+
 ### Branch Development
 When creating new branches:
 - Use the `create_branch.py` script as a starting point
@@ -80,6 +89,11 @@ Description
 from .branch import BranchName
 
 async def setup(bot):
+    """
+    Load the BranchName branch.
+
+    Note: bot.add_cog() is Discord.py's method for registering Cogs.
+    """
     await bot.add_cog(BranchName(bot))
 ```
 

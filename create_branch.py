@@ -71,8 +71,24 @@ from discord.ext import commands
 import aiosqlite
 import logging
 from pathlib import Path
+from typing import Dict, Any
 import yaml
-from database import init_cog_database
+from database import init_branch_database
+from config import validate_channel_id, validate_role_ids
+from constants import (
+    EMBED_TITLE_MAX,
+    EMBED_DESCRIPTION_MAX,
+    EMBED_FIELD_VALUE_MAX,
+    MESSAGE_CONTENT_MAX,
+    truncate_for_embed_field,
+    truncate_for_embed_description,
+    truncate_for_message
+)
+# Import additional constants as needed:
+# - MODAL_* constants for modal inputs
+# - CHANNEL_NAME_MAX, THREAD_NAME_MAX for channel/thread names
+# - BUTTON_LABEL_MAX for button labels
+# See constants.py for all available Discord API limits
 
 logger = logging.getLogger(__name__)
 
@@ -86,15 +102,6 @@ CREATE TABLE IF NOT EXISTS {branch_name}_data (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 )
 """
-
-# Database path - set by branch when loaded
-_DB_PATH = None
-
-def get_db_path():
-    """Get the database path for this branch."""
-    if _DB_PATH is None:
-        return str(Path(__file__).parent / "data.db")
-    return _DB_PATH
 
 
 # Default configuration for this branch
@@ -126,52 +133,49 @@ DEFAULT_CONFIG = {{
 class {class_name}(commands.Cog):
     """{description or f"Branch for {branch_name} functionality."}"""
 
-    def __init__(self, bot):
-        global _DB_PATH
+    def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
 
         # Set database path (in this branch's folder)
         self.db_path = str(Path(__file__).parent / "data.db")
-        _DB_PATH = self.db_path
 
         # Load config
         self.config = self.load_config()
 
         # Access settings
         settings = self.config.get("settings", {{}})
-        self.channel_id = settings.get("example_channel_id")
-        self.max_items = settings.get("limits", {{}}).get("max_items", 10)
+        self.channel_id: int = settings.get("example_channel_id", 0)
+        self.max_items: int = settings.get("limits", {{}}).get("max_items", 10)
+
+        # Validate configuration
+        if not validate_channel_id(self.channel_id, "example_channel_id"):
+            logger.warning("Invalid example_channel_id in config")
 
         # Feature flags
         features = settings.get("features", {{}})
-        self.feature_a_enabled = features.get("feature_a", True)
+        self.feature_a_enabled: bool = features.get("feature_a", True)
 
         logger.info(f"{class_name} branch initialized (db: {{self.db_path}})")
 
-    async def cog_load(self):
-        """Initialize database when branch is loaded."""
+    async def cog_load(self) -> None:
+        """
+        Initialize database when branch is loaded.
+
+        Note: cog_load() is a Discord.py lifecycle method (part of the Cog API).
+        It's called automatically when the branch is loaded by the bot.
+        """
         # Only initialize if you need a database
         # Comment out if you don't need database functionality
-        await init_cog_database(self.db_path, DATABASE_SCHEMA, "{class_name}")
+        await init_branch_database(self.db_path, DATABASE_SCHEMA, "{class_name}")
 
-    def load_config(self) -> dict:
+    def load_config(self) -> Dict[str, Any]:
         """Load config from config.yml in this branch's folder."""
+        from utils import load_branch_config
         config_path = Path(__file__).parent / "config.yml"
-
-        if config_path.exists():
-            try:
-                with open(config_path, "r") as f:
-                    config = yaml.safe_load(f) or {{}}
-                logger.info(f"Loaded config for {class_name}")
-                return config
-            except Exception as e:
-                logger.error(f"Failed to load config for {class_name}: {{e}}")
-
-        # Return default config if file doesn't exist
-        return DEFAULT_CONFIG
+        return load_branch_config(config_path, DEFAULT_CONFIG, "{class_name}")
 
     @commands.Cog.listener()
-    async def on_ready(self):
+    async def on_ready(self) -> None:
         """Called when the branch is ready."""
         logger.info(f"{class_name} branch ready")
 
@@ -180,7 +184,7 @@ class {class_name}(commands.Cog):
     # ========================================================================
 
     @commands.command(name="{branch_name}_example")
-    async def example_command(self, ctx):
+    async def example_command(self, ctx: commands.Context) -> None:
         """Example command - replace with your own."""
 
         # Check if feature is enabled
@@ -196,7 +200,7 @@ class {class_name}(commands.Cog):
 
     # Example database operation (if using database)
     @commands.command(name="{branch_name}_save")
-    async def save_data(self, ctx, *, data: str):
+    async def save_data(self, ctx: commands.Context, *, data: str) -> None:
         """Example database save command."""
         try:
             async with aiosqlite.connect(self.db_path) as db:
@@ -210,8 +214,13 @@ class {class_name}(commands.Cog):
             logger.error(f"Error saving data: {{e}}")
             await ctx.send("❌ Failed to save data.")
 
-    def cog_unload(self):
-        """Called when the branch is unloaded."""
+    def cog_unload(self) -> None:
+        """
+        Called when the branch is unloaded.
+
+        Note: cog_unload() is a Discord.py lifecycle method (part of the Cog API).
+        Use this to clean up resources (cancel tasks, close connections, etc.)
+        """
         logger.info(f"{class_name} branch unloaded")
 '''
 
@@ -284,7 +293,8 @@ settings:
     print(f"   - Auto-created on first bot run")
     print(f"   - Automatically gitignored")
     print(f"   - Modify DATABASE_SCHEMA in branch.py to add tables")
-    print(f"   - Comment out cog_load() method if you don't need a database")
+    print(f"   - Comment out the database init in cog_load() if you don't need a database")
+    print(f"   - Note: cog_load() is a Discord.py Cog lifecycle method")
 
     print(f"\n🚀 Next steps:")
     print(f"   1. Edit {config_file} to configure your branch")

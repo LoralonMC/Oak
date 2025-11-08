@@ -24,6 +24,16 @@ Oak uses a **modular, folder-based branch system** inspired by Minecraft Paper p
 - Clean separation between global settings (`.env`) and branch-specific settings (`config.yml`)
 - Per-branch databases - each branch manages its own SQLite database
 
+### Terminology Note
+
+Oak uses **"branch"** terminology for its modular extensions (inspired by Git branches and tree branches). However, because Oak is built on Discord.py, you'll see references to Discord.py's native `commands.Cog` class and `bot.add_cog()` method in the code. These are Discord.py's implementation details - from a user and developer perspective, everything is a **"branch"**.
+
+**In practice:**
+- 📁 **User-facing**: "branches" (folders, commands, documentation)
+- 🔧 **Code-level**: `commands.Cog` (Discord.py's required base class)
+- 💬 **When talking about Oak**: Use "branch"
+- 💻 **When writing code**: Inherit from `commands.Cog` (required by Discord.py)
+
 ## Setup
 
 ### Requirements
@@ -54,9 +64,8 @@ Oak uses a **modular, folder-based branch system** inspired by Minecraft Paper p
    # Guild ID (Your Discord server ID)
    GUILD_ID=your_guild_id
 
-   # Admin Role IDs (Bot Management - can use !reload, !load, etc.)
-   # Comma-separated list of role IDs
-   ADMIN_ROLE_IDS=role_id_1,role_id_2
+   # Note: Bot admin commands (/reload, /load, etc.) use Discord's built-in
+   # Administrator permission. No custom role configuration needed.
    ```
 
 4. **Configure branches**
@@ -76,58 +85,71 @@ Oak uses a **modular, folder-based branch system** inspired by Minecraft Paper p
 ## Project Structure
 
 ```
-Discord Bot/
+Oak/
 ├── bot.py                     # Main bot entry point
-├── admin_commands.py          # Bot management commands (reload, load, etc.)
 ├── config.py                  # Global configuration loader
 ├── database.py                # Database utility functions
 ├── utils.py                   # Utility functions (validation, sanitization)
+├── constants.py               # Discord API limits and framework constants
 ├── requirements.txt           # Python dependencies
 ├── create_branch.py           # Utility to create new branches
 ├── .env                       # Environment variables (with placeholders)
 ├── .gitignore                 # Git ignore file
-├── logs/                      # Log files directory
+├── logs/                      # Log files directory (auto-created)
 ├── core/
 │   ├── __init__.py
 │   └── branch_loader.py       # Auto-discovery and hot-reload system
 └── branches/
     ├── __init__.py
+    ├── admin/                 # Bot management commands
+    │   ├── __init__.py
+    │   └── branch.py
     ├── application/           # Staff application system
     │   ├── __init__.py
     │   ├── branch.py
-    │   ├── config.yml
-    │   └── data.db            # Application database (auto-created)
+    │   └── config.yml
     ├── suggestions/           # Suggestion voting system
     │   ├── __init__.py
     │   ├── branch.py
-    │   ├── config.yml
-    │   └── data.db            # Suggestions database (auto-created)
+    │   └── config.yml
     ├── status_channels/       # Server status voice channels
     │   ├── __init__.py
     │   ├── branch.py
     │   └── config.yml
-    └── link/                  # Account linking guide
+    ├── link/                  # Account linking guide
+    │   ├── __init__.py
+    │   ├── branch.py
+    │   └── config.yml
+    └── tickets/               # Support ticket system
         ├── __init__.py
         ├── branch.py
         └── config.yml
+
+Note: Branch databases (data.db files) are automatically created when branches first load.
+They are git-ignored and not included in the repository.
 ```
 
 ## Bot Admin Commands
 
-These commands require roles specified in `ADMIN_ROLE_IDS` in `.env`:
+These commands require Administrator permission in Discord:
 
-- `!reload <branch>` - Reload a branch and its config (hot-reload without restart)
-- `!load <branch>` - Load a previously unloaded branch
-- `!unload <branch>` - Unload a branch (disable without deleting)
-- `!branches` - List all currently loaded branches
-- `!reloadall` - Reload all loaded branches at once
-- `!botinfo` - Display bot statistics and information
+- `/reload <branch>` - Reload a branch and its config (hot-reload without restart)
+- `/load <branch>` - Load a previously unloaded branch
+- `/unload <branch>` - Unload a branch (disable without deleting)
+- `/branches` - List all currently loaded branches
+- `/reloadall` - Reload all loaded branches at once
+- `/botinfo` - Display bot statistics and information
+
+**Features:**
+- Branch name autocomplete for easy selection
+- Ephemeral responses (only you see them)
+- Built-in parameter validation
 
 **Example:**
 ```
-!reload suggestions
-!load application
-!branches
+/reload suggestions
+/load application
+/branches
 ```
 
 ## Creating New Branches
@@ -147,9 +169,11 @@ branches/polls/
 └── data.db           # Database (auto-created on first run)
 ```
 
-The branch will be automatically discovered on next bot restart, or use `!load polls`.
+The branch will be automatically discovered on next bot restart, or use `/load polls`.
 
 **Note:** The generated template includes database functionality. If your branch doesn't need a database, simply comment out the database initialization in the `cog_load()` method and database-related code.
+
+> **About `cog_load()`**: This is a Discord.py Cog lifecycle method that's automatically called when your branch loads. It's the perfect place to initialize databases, register views, or set up background tasks.
 
 ## Branch Features
 
@@ -213,7 +237,6 @@ Provides instructions for linking Minecraft accounts to Discord using the Discor
 ### Global Settings (`.env`)
 - `DISCORD_TOKEN` - Bot authentication token
 - `GUILD_ID` - Discord server ID
-- `ADMIN_ROLE_IDS` - Roles that can manage the bot
 
 ### Per-Branch Settings (`branches/<name>/config.yml`)
 Each branch has its own configuration file with:
@@ -238,7 +261,7 @@ settings:
 ### Hot-Reload
 Change a config file and reload the branch:
 ```
-!reload suggestions
+/reload suggestions
 ```
 No bot restart needed!
 
@@ -247,9 +270,10 @@ No bot restart needed!
 The bot has **two separate permission levels**:
 
 ### Bot Admin Permissions
-Defined in `.env` as `ADMIN_ROLE_IDS`. Controls:
-- Bot management commands (!reload, !load, !unload, etc.)
+Uses Discord's built-in **Administrator permission**. Controls:
+- Bot management commands (/reload, /load, /unload, etc.)
 - Access to bot information
+- Anyone with Administrator permission in Discord can use these commands
 
 ### Branch-Specific Permissions
 Defined in each branch's `config.yml`. Examples:
@@ -291,7 +315,7 @@ Logs are also output to console for real-time monitoring.
 
 1. Edit the branch file: `branches/<name>/branch.py`
 2. Add new settings to: `branches/<name>/config.yml`
-3. Reload the branch: `!reload <name>`
+3. Reload the branch: `/reload <name>`
 
 ### Creating New Branches
 
@@ -301,15 +325,17 @@ Logs are also output to console for real-time monitoring.
    ```
 2. Edit `branches/my_feature/config.yml` - Set your channel IDs, role IDs, etc.
 3. Edit `branches/my_feature/branch.py` - Add your commands and logic
-4. If you don't need a database, comment out the `cog_load()` method
-5. Load the branch: `!load my_feature` (or restart bot)
+4. If you don't need a database, comment out the database init in `cog_load()`
+5. Load the branch: `/load my_feature` (or restart bot)
+
+> **Tip**: `cog_load()` and `cog_unload()` are Discord.py Cog lifecycle methods. Keep them for resource initialization/cleanup even if you don't use a database.
 
 ### Best Practices
 
 1. **Always use config files** - Never hardcode IDs or settings
 2. **Test in development** - Use a test server before production
 3. **Check logs** - Monitor logs in the `logs/` directory for errors
-4. **Use hot-reload** - Use `!reload <branch>` instead of restarting
+4. **Use hot-reload** - Use `/reload <branch>` instead of restarting
 5. **Validate input** - Use utility functions from `utils.py`
 6. **Handle errors** - Use try-except blocks with logging
 
@@ -323,7 +349,7 @@ Logs are also output to console for real-time monitoring.
 ### Commands not working
 - Verify bot has proper Discord permissions in server settings
 - Check that role IDs in configs are correct
-- Use `!branches` to see if branch is loaded
+- Use `/branches` to see if branch is loaded
 
 ### Branch won't load
 - Check syntax: `python -m py_compile branches/<name>/branch.py`

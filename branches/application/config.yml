@@ -40,7 +40,48 @@ settings:
   # Guild ID
   guild_id: 0  # CONFIGURE THIS - Your Discord server ID
 
-  # Cleanup settings
+  # Inactivity and cleanup settings
+  inactivity:
+    enabled: true  # Enable automatic inactivity warnings and cleanup
+    check_interval_hours: 12  # How often to check for inactive applications
+    warning_after_days: 3  # Send warning after this many days of inactivity
+    abandon_after_days: 7  # Auto-abandon after this many days of inactivity (must be > warning_after_days)
+
+    # Warning message configuration
+    warning_dm:
+      title: "⚠️ Application Inactivity Warning"
+      description: |
+        Your application has been inactive for **{warning_days} days**.
+
+        **Please continue your application within the next {days_remaining} days** or it will be automatically closed and marked as abandoned.
+
+        Click the button in {channel_mention} to continue.
+
+    warning_channel:
+      title: "⚠️ Inactivity Warning"
+      description: |
+        {user_mention}, your application has been inactive for **{warning_days} days**.
+
+        **Please continue within {days_remaining} days** or this application will be closed.
+
+        Click the button below to continue your application.
+      footer: "Note: I couldn't DM you. Please enable DMs from server members."  # Only shown if DM fails
+
+    # Abandonment message configuration
+    abandon_dm:
+      title: "❌ Application Abandoned"
+      description: |
+        Your application has been automatically closed due to inactivity.
+
+        You can start a new application at any time by clicking the application button again.
+
+  # Denial settings
+  denial:
+    delete_delay_seconds: 10  # How long to wait before deleting channel (when DM succeeds)
+    auto_delete_no_dm: true  # Automatically delete denied apps where DM failed after X time
+    auto_delete_no_dm_after_hours: 24  # Hours to wait before auto-deleting denied apps where DM failed
+
+  # Manual cleanup settings (for /appcleanup command)
   cleanup:
     abandoned_after_days: 7  # Applications inactive for this long will be marked abandoned
 

@@ -1,0 +1,12 @@
+# Configuration for Admin Branch
+# Bot management and administration commands
+
+# Set to false to disable this branch (NOT recommended - disables all admin commands)
+enabled: true
+
+# Version of this branch's config
+version: "1.0.0"
+
+settings:
+  # No specific settings needed - admin commands use Discord's built-in Administrator permission
+  # This branch is essential for bot management (/reload, /load, /unload, etc.)
