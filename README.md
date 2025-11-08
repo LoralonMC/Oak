@@ -6,12 +6,14 @@ A feature-rich, modular Discord bot framework providing suggestion management, s
 
 ## Features
 
-- **Suggestion System**: Users can submit suggestions with voting (likes/dislikes) and staff management
-- **Staff Application System**: Automated trainee application process with multi-step forms and background checks
-- **Server Status Tracking**: Real-time Minecraft server statistics and member count in voice channels
-- **Account Linking Guide**: Instructions for linking Minecraft accounts to Discord
-- **Modular Architecture**: Hot-reload branches without restarting the bot
-- **Auto-Discovery**: New branches are automatically detected and loaded
+- **Suggestion System**: Community suggestion voting with like/dislike buttons, discussion threads, and staff approval/denial workflow
+- **Staff Application System**: Comprehensive multi-page application forms with inactivity tracking, background checks (optional MySQL/Plan integration), and automated denial/acceptance workflow
+- **Support Ticket System**: Thread-based tickets with multiple categories (gameplay, billing, reports, appeals, bugs), staff management, and automatic anti-archive protection
+- **Server Status Tracking**: Auto-updating voice channels showing real-time Minecraft server player count and Discord member count
+- **Account Linking Guide**: Simple command displaying instructions for linking Minecraft accounts via Discord
+- **Bot Management**: Admin slash commands for hot-reloading branches, viewing stats, and managing the bot
+- **Modular Architecture**: Hot-reload any branch and its config without restarting the bot
+- **Auto-Discovery**: New branches are automatically detected and loaded on startup
 
 ## Architecture
 
@@ -180,57 +182,155 @@ The branch will be automatically discovered on next bot restart, or use `/load p
 ### Suggestions System
 **Location:** `branches/suggestions/`
 
-Users post messages in the configured suggestion channel. The bot:
-1. Creates an embed with the suggestion
-2. Adds like/dislike voting buttons
-3. Creates a discussion thread
-4. Saves to database
+**What it does:**
+When users post a message in the designated suggestions channel, the bot automatically:
+1. Deletes the original message
+2. Creates a professional embed with the suggestion content
+3. Adds interactive voting buttons (👍 Like, 👎 Dislike, ⚙️ Manage)
+4. Creates a discussion thread for community feedback
+5. Tracks all votes in the database
 
-Staff with `manager_role_ids` can manage suggestions:
-- Approve with reason
-- Deny with reason
-- Delete suggestion
-- View vote statistics
+**Staff Management Features:**
+Staff members with configured manager roles can:
+- **Approve** suggestions with a custom reason (embed turns green)
+- **Deny** suggestions with a custom reason (embed turns red)
+- **Delete** suggestions entirely
+- View real-time vote statistics
+- All actions update the embed and notify the original author
+
+**Features:**
+- Input validation (min/max length)
+- Duplicate vote prevention
+- Vote toggling (click again to remove vote)
+- Persistent buttons (work after bot restart)
+- Configurable embed colors and messages
 
 ### Application System
 **Location:** `branches/application/`
 
-Comprehensive staff application system with configurable questions and workflow:
-1. Users click configurable application button (e.g., "Apply for Staff")
-2. Creates a private application channel
-3. Multi-page application forms with customizable questions
-4. Answer quality validation
-5. Staff review tools:
-   - Read full application across multiple pages
-   - Accept/Deny with feedback to applicant
-   - Optional: Background check (playtime via Plan plugin for Minecraft servers)
-   - Optional: Punishment history lookup
-6. Auto-cleanup of abandoned applications
+**What it does:**
+A complete staff application workflow system. Users click an "Apply for Staff" button which:
+1. Creates a private application channel (only visible to applicant + reviewers)
+2. Presents a multi-page form system (Discord modals with 5 questions per page)
+3. Saves progress after each page (can continue later)
+4. Validates answers for quality
+5. Notifies staff when application is submitted
+
+**Staff Review Tools:**
+- **Read Applications**: View full application with pagination (handles Discord's field limits)
+- **Accept**: Moves channel to "accepted" category, notifies applicant
+- **Deny**: Sends reason to applicant, optionally deletes channel after delay
+- **Background Checks** (optional): Query Minecraft playtime via MySQL/Plan plugin
+- **Punishment History** (optional): Check forum for prior warnings/bans
+- **Application History**: View user's past applications with `/apphistory`
+
+**Automated Management:**
+- **Inactivity Warnings**: Warns applicants after 3 days of inactivity
+- **Auto-Abandon**: Closes applications after 7 days of inactivity
+- **Duplicate Prevention**: Users can only have one active application
+- **Statistics Tracking**: Track processing times, acceptance rates, etc.
+
+**Slash Commands:**
+- `/appstats` - View detailed application statistics
+- `/apphistory <user>` - View a user's complete application history
 
 **Configuration:**
-- Fully customizable application questions in `config.yml`
-- Configurable position name (Staff, Moderator, Helper, etc.)
+- 17 customizable application questions (edit in `config.yml`)
+- Configurable position name and channel naming
 - Optional MySQL/Plan integration for Minecraft servers
-- Configurable button labels and channel names
+- Customizable inactivity thresholds and messages
+- Optional account linking requirement
 
-**Staff Commands:**
-- `!appstats` - View application statistics
-- `!appcleanup [days]` - Clean up abandoned applications
-- `!applist [status]` - List applications by status
+### Tickets System
+**Location:** `branches/tickets/`
+
+**What it does:**
+A thread-based support ticket system with multiple categories. Users click a button to select their issue type, which:
+1. Creates a private thread in a configured channel
+2. Adds the user and pings relevant staff roles
+3. Sends a customized welcome message for that category
+4. Provides ticket control buttons (Close, Reopen)
+
+**Ticket Categories (fully configurable):**
+- 🎮 **Ingame Support**: Gameplay help and questions
+- 💳 **Billing Support**: Purchase/donation issues
+- ⚠️ **Player Reports**: Report rule-breaking players
+- 🔓 **Punishment Appeals**: Appeal bans or warnings
+- 🐛 **Bug Reports**: Report technical issues
+
+**Features:**
+- **Unique Numbering**: Each category has sequential ticket numbers (e.g., `ingame-01`, `billing-02`)
+- **Flexible Naming**: Use `{number}` for sequential, `{nickname}` for user-specific names
+- **Staff Management**: Close tickets with custom reasons, reopen if needed
+- **Anti-Archive**: Automatically unarchives closed tickets that get reopened
+- **Activity Tracking**: View user's ticket history with `/tickets` command
+- **Statistics**: Detailed ticket stats with `/ticketstats` command
+- **Logging**: Optional ticket event logging to a dedicated channel
+- **Privacy Controls**: Configure which categories allow adding other users
+
+**Slash Commands:**
+- `/ticketstats` - View ticket statistics (total, by category, resolution times)
+- `/tickets` - View your open tickets
+
+**Configuration:**
+- Define unlimited custom categories with unique settings
+- Per-category staff role pings
+- Custom welcome messages per category
+- Configurable panel embed and button layout
 
 ### Status Channels
 **Location:** `branches/status_channels/`
 
-Automatically updates voice channels every 6 minutes:
-- **Player Count Channel**: Shows online players (e.g., "Online: 15/100")
-- **Member Count Channel**: Shows total Discord members (e.g., "Total Members: 1,234")
+**What it does:**
+Automatically updates voice channel names every 6 minutes with live statistics:
+- **Player Count**: Minecraft server online players (e.g., "Online: 15/100")
+- **Member Count**: Total Discord server members (e.g., "Total Members: 1,234")
 
-Uses `mcstatus` to query the Minecraft server.
+**Features:**
+- Uses `mcstatus` library to query Minecraft Java servers
+- Graceful error handling (continues on server offline)
+- Rate limit protection with retry logic
+- Anti-spike jitter (±10% randomization to avoid synchronized API calls)
+- Customizable format strings for both counters
+
+**Configuration:**
+- Minecraft server host and port
+- Channel IDs for player count and member count
+- Custom format strings (supports number formatting)
 
 ### Link Command
 **Location:** `branches/link/`
 
-Provides instructions for linking Minecraft accounts to Discord using the Discord bot integration.
+**What it does:**
+Displays instructions for linking Minecraft accounts to Discord.
+
+**Features:**
+- Simple `!link` command
+- Customizable embed (title, description, color)
+- Explains the linking process step-by-step
+
+**Use Case:**
+For Minecraft servers using Discord linking plugins (e.g., DiscordSRV, Plan) where players need to link their accounts to get roles synchronized.
+
+### Admin Commands
+**Location:** `branches/admin/`
+
+**What it does:**
+Provides bot management slash commands (requires Discord Administrator permission).
+
+**Available Commands:**
+- `/reload <branch>` - Hot-reload a branch and its config without restarting
+- `/load <branch>` - Load a previously unloaded branch
+- `/unload <branch>` - Unload a branch temporarily
+- `/branches` - List all currently loaded branches
+- `/reloadall` - Reload all branches at once
+- `/botinfo` - Display bot statistics and information
+
+**Features:**
+- Branch name autocomplete for easy selection
+- Ephemeral responses (only you see them)
+- Protection against unloading critical branches
+- Detailed error messages
 
 ## Configuration System
 
