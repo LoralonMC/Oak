@@ -13,6 +13,11 @@ settings:
   staff_role_ids:
     - 0  # Add staff role IDs here
 
+  # Roles that can bypass the 1 ticket per category restriction
+  # Useful for staff who need to create tickets on behalf of users
+  bypass_duplicate_check_role_ids:
+    - 0  # Add role IDs here (e.g., Admin, Moderator roles)
+
   # Panel message customization
   panel:
     title: "🎫 Support Tickets"
@@ -22,108 +27,231 @@ settings:
       Select a category below to get started.
       A staff member will assist you shortly.
     color: 0x5865F2  # Blurple
+    categories_field_name: "Available Categories"  # Set to "" to hide the field name
 
   # Anti-archive settings
   anti_archive:
     enabled: true
     check_interval_minutes: 30  # How often to check for archived threads
 
+  # Rate limiting settings
+  rate_limit:
+    ticket_creation_cooldown_seconds: 60  # Cooldown between ticket creations per user (0 to disable)
+
   # Ticket categories
   categories:
     ingame_support:
       enabled: true
-      label: "🎮 Ingame Support"
+      label: "Ingame Support"
       emoji: "🎮"
       description: "Get help with gameplay issues"
+      button_style: "primary"  # Options: primary (blue), secondary (gray), success (green), danger (red)
       naming_pattern: "ingame-{number}"
-      ping_roles:
-        - 0  # Staff role to ping for ingame tickets
+      staff_roles:
+        - 0  # Roles that can manage and are pinged for ingame tickets
       allow_user_additions: true  # Users can add others via @mention
+
+      # Initial questions modal (optional - set enabled to false to skip)
+      # Max 5 questions per category (Discord limit)
+      # Use {answers} in welcome_message to show formatted Q&A
+      initial_questions:
+        enabled: true
+        title: "Support Request"
+        questions:
+          - label: "Brief description of your issue"
+            placeholder: "e.g., Can't break blocks, stuck in world..."
+            required: true
+            max_length: 200
+
+          - label: "Full details"
+            placeholder: "Explain in detail what happened..."
+            required: true
+            max_length: 2000
+
       welcome_message: |
         Thanks for creating an ingame support ticket!
 
-        Please describe your issue in detail:
-        - What were you doing?
-        - What happened?
-        - What did you expect to happen?
+        {answers}
 
         A staff member will help you soon!
 
     billing_support:
       enabled: true
-      label: "💳 Billing Support"
+      label: "Billing Support"
       emoji: "💳"
       description: "Issues with purchases or donations"
+      button_style: "success"  # Options: primary (blue), secondary (gray), success (green), danger (red)
       naming_pattern: "billing-{nickname}"
-      ping_roles:
-        - 0  # Admin/billing role
+      staff_roles:
+        - 0  # Roles that can manage and are pinged for billing tickets (admin/owner only)
       allow_user_additions: false  # Restrict for privacy (billing info sensitive)
+
+      # Initial questions modal (optional - set enabled to false to skip)
+      # Max 5 questions per category (Discord limit)
+      # Use {answers} in welcome_message to show formatted Q&A
+      initial_questions:
+        enabled: true
+        title: "Billing Support Details"  # Modal title (max 45 chars)
+        questions:
+          - label: "Transaction ID"
+            placeholder: "e.g., tbx-37731125a12883-b6bca7"
+            required: true
+            max_length: 100
+
+          - label: "Your ingame name"
+            placeholder: "Your Minecraft username (case-sensitive)"
+            required: true
+            max_length: 50
+
+          - label: "Describe your issue"
+            placeholder: "Describe the issue in detail..."
+            required: true
+            max_length: 2000
+
       welcome_message: |
-        Billing support ticket created.
+        Thanks for creating a billing support ticket!
 
-        Please provide:
-        - Transaction ID
-        - Purchase date
-        - Description of the issue
+        {answers}
 
-        An admin will review your case shortly.
+        A staff member will help you soon!
 
     player_report:
       enabled: true
-      label: "⚠️ Report Player"
+      label: "Report Player"
       emoji: "⚠️"
       description: "Report a player for rule violations"
+      button_style: "danger"  # Options: primary (blue), secondary (gray), success (green), danger (red)
       naming_pattern: "report-{number}"
-      ping_roles:
-        - 0  # Moderator role
+      staff_roles:
+        - 0  # Roles that can manage and are pinged for player reports (moderators)
       allow_user_additions: true
+
+      # Initial questions modal (optional - set enabled to false to skip)
+      # Max 5 questions per category (Discord limit)
+      # Use {answers} in welcome_message to show formatted Q&A
+      initial_questions:
+        enabled: true
+        title: "Player Report Details"
+        questions:
+          - label: "Player's username"
+            placeholder: "Who are you reporting?"
+            required: true
+            max_length: 100
+
+          - label: "What rule(s) did they break?"
+            placeholder: "e.g., Griefing, harassment, cheating..."
+            required: true
+            max_length: 500
+
+          - label: "What happened?"
+            placeholder: "Describe the incident in detail..."
+            required: true
+            max_length: 2000
+
+          - label: "When did this happen?"
+            placeholder: "e.g., About 10 minutes ago, Yesterday at 3pm..."
+            required: true
+            max_length: 200
+
+          - label: "Evidence (screenshots/video links)"
+            placeholder: "Paste links to evidence (optional)..."
+            required: false
+            max_length: 1000
+
       welcome_message: |
         Player report ticket created.
 
-        Please provide:
-        - Player's username
-        - What rule(s) they broke
-        - Evidence (screenshots, video, etc.)
-        - When did this happen?
+        {answers}
 
         A moderator will investigate.
 
     punishment_appeal:
       enabled: true
-      label: "🔓 Punishment Appeal"
+      label: "Punishment Appeal"
       emoji: "🔓"
       description: "Appeal a ban, mute, or warning"
+      button_style: "secondary"  # Options: primary (blue), secondary (gray), success (green), danger (red)
       naming_pattern: "appeal-{nickname}"
-      ping_roles:
-        - 0  # Admin role
+      staff_roles:
+        - 0  # Roles that can manage and are pinged for appeals (admins)
       allow_user_additions: false  # Restrict for privacy (appeals are sensitive)
+
+      # Initial questions modal (optional - set enabled to false to skip)
+      # Max 5 questions per category (Discord limit)
+      # Use {answers} in welcome_message to show formatted Q&A
+      initial_questions:
+        enabled: true
+        title: "Punishment Appeal"
+        questions:
+          - label: "Your ingame name"
+            placeholder: "Your Minecraft username"
+            required: true
+            max_length: 50
+
+          - label: "What punishment are you appealing?"
+            placeholder: "e.g., Permanent ban, 7-day mute, warning..."
+            required: true
+            max_length: 200
+
+          - label: "Why should it be reduced/removed?"
+            placeholder: "Explain your reasoning..."
+            required: true
+            max_length: 2000
+
+          - label: "Do you understand what you did wrong?"
+            placeholder: "Yes/No and explain..."
+            required: true
+            max_length: 1000
+
       welcome_message: |
         Punishment appeal ticket created.
 
-        Please explain:
-        - What punishment are you appealing?
-        - Why should it be removed or reduced?
-        - Do you understand what you did wrong?
+        {answers}
 
         An admin will review your appeal.
 
     bug_report:
       enabled: true
-      label: "🐛 Bug Report"
+      label: "Bug Report"
       emoji: "🐛"
       description: "Report a bug or technical issue"
+      button_style: "primary"  # Options: primary (blue), secondary (gray), success (green), danger (red)
       naming_pattern: "bug-{number}"
-      ping_roles:
-        - 0  # Developer/admin role
+      staff_roles:
+        - 0  # Roles that can manage and are pinged for bug reports (developers/admins)
       allow_user_additions: true
+
+      # Initial questions modal (optional - set enabled to false to skip)
+      # Max 5 questions per category (Discord limit)
+      # Use {answers} in welcome_message to show formatted Q&A
+      initial_questions:
+        enabled: true
+        title: "Bug Report Details"
+        questions:
+          - label: "What is the bug?"
+            placeholder: "Brief summary of the issue..."
+            required: true
+            max_length: 200
+
+          - label: "Steps to reproduce"
+            placeholder: "1. Do this\n2. Then do that\n3. Bug happens"
+            required: true
+            max_length: 2000
+
+          - label: "Expected vs actual behavior"
+            placeholder: "Expected: X should happen\nActual: Y happened instead"
+            required: true
+            max_length: 1000
+
+          - label: "Error messages or screenshots"
+            placeholder: "Paste error messages or image links (optional)..."
+            required: false
+            max_length: 1000
+
       welcome_message: |
         Bug report ticket created.
 
-        Please provide:
-        - What is the bug?
-        - Steps to reproduce it
-        - What should happen vs what actually happens
-        - Any error messages or screenshots
+        {answers}
 
         A developer will investigate.
 

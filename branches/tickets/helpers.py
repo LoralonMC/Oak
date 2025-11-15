@@ -74,6 +74,66 @@ def is_staff(interaction: discord.Interaction, staff_role_ids: list = None) -> b
     return any(role.id in staff_role_ids for role in interaction.user.roles)
 
 
+def can_manage_ticket_category(interaction: discord.Interaction, category: str) -> bool:
+    """
+    Check if user can manage tickets in a specific category.
+
+    Users can manage a category if they have:
+    - Global staff role (from staff_role_ids), OR
+    - Category-specific role (from that category's staff_roles)
+
+    Args:
+        interaction: Discord interaction
+        category: Ticket category key
+
+    Returns:
+        True if user can manage this category, False otherwise
+    """
+    # Administrators always have access
+    if interaction.user.guild_permissions.administrator:
+        return True
+
+    config = get_tickets_config()
+
+    # Check global staff roles
+    global_staff_role_ids = config.get("settings", {}).get("staff_role_ids", [])
+    if any(role.id in global_staff_role_ids for role in interaction.user.roles):
+        return True
+
+    # Check category-specific staff_roles (with backwards compatibility for ping_roles)
+    categories = config.get("settings", {}).get("categories", {})
+    category_config = categories.get(category, {})
+    staff_roles = category_config.get("staff_roles", category_config.get("ping_roles", []))
+
+    if any(role.id in staff_roles for role in interaction.user.roles):
+        return True
+
+    return False
+
+
+def can_bypass_duplicate_check(interaction: discord.Interaction) -> bool:
+    """
+    Check if user can bypass the 1 ticket per category restriction.
+
+    Useful for staff who need to create tickets on behalf of users.
+
+    Args:
+        interaction: Discord interaction
+
+    Returns:
+        True if user can bypass duplicate check, False otherwise
+    """
+    config = get_tickets_config()
+    bypass_role_ids = config.get("settings", {}).get("bypass_duplicate_check_role_ids", [])
+
+    # Administrators can always bypass
+    if interaction.user.guild_permissions.administrator:
+        return True
+
+    # Check if user has any bypass roles
+    return any(role.id in bypass_role_ids for role in interaction.user.roles)
+
+
 def sanitize_name(name: str, user_id: int = None) -> str:
     """
     Sanitize username for use in thread names.
@@ -343,3 +403,62 @@ def check_permissions(channel: discord.TextChannel) -> list:
             missing.append(perm)
 
     return missing
+
+
+def parse_time_string(time_str: str) -> int:
+    """
+    Parse a time string into seconds.
+
+    Supports formats like:
+    - "30m", "1h", "2h", "1d", "3d"
+    - "30", "60", "120" (assumed to be minutes)
+
+    Maximum allowed: 30 days (43200m, 720h, 30d)
+
+    Args:
+        time_str: Time string to parse
+
+    Returns:
+        Number of seconds, or None if invalid or exceeds maximum
+
+    Examples:
+        parse_time_string("30m") -> 1800
+        parse_time_string("2h") -> 7200
+        parse_time_string("1d") -> 86400
+        parse_time_string("60") -> 3600
+        parse_time_string("9999d") -> None (exceeds max)
+    """
+    if not time_str:
+        return None
+
+    time_str = time_str.strip().lower()
+
+    # Match pattern like "30m", "2h", "1d"
+    match = re.match(r'^(\d+)([mhd])$', time_str)
+    if match:
+        value = int(match.group(1))
+        unit = match.group(2)
+
+        # Enforce reasonable limits (max 30 days)
+        if unit == 'm':  # minutes
+            if value > 43200:  # 30 days in minutes
+                return None
+            return value * 60
+        elif unit == 'h':  # hours
+            if value > 720:  # 30 days in hours
+                return None
+            return value * 3600
+        elif unit == 'd':  # days
+            if value > 30:  # 30 days max
+                return None
+            return value * 86400
+
+    # Try parsing as plain number (assume minutes)
+    match = re.match(r'^(\d+)$', time_str)
+    if match:
+        value = int(match.group(1))
+        if value > 43200:  # 30 days in minutes
+            return None
+        return value * 60  # Assume minutes
+
+    return None
