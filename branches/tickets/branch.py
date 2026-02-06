@@ -69,6 +69,7 @@ CREATE TABLE IF NOT EXISTS ticket_reminders (
     user_id INTEGER NOT NULL,
     initial_reminder_at TIMESTAMP,
     last_reminded_at TIMESTAMP,
+    last_reminder_message_id INTEGER,
     daily_reminder_enabled INTEGER DEFAULT 1,
     dm_enabled INTEGER DEFAULT 0,
     active INTEGER DEFAULT 1,
@@ -117,6 +118,9 @@ class Tickets(commands.Cog):
         """Initialize database and register persistent views."""
         await init_branch_database(self.db_path, TICKETS_SCHEMA, "Tickets")
 
+        # Run migrations for existing databases
+        await self._run_migrations()
+
         # Reload config values (important for hot-reload support)
         self.config = get_tickets_config()
         settings = self.config.get("settings", {})
@@ -147,6 +151,24 @@ class Tickets(commands.Cog):
 
         # Validate and create panel if needed
         await self.validate_panel()
+
+    async def _run_migrations(self):
+        """Run database migrations for existing databases."""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                # Check if last_reminder_message_id column exists
+                cursor = await db.execute("PRAGMA table_info(ticket_reminders)")
+                columns = [row[1] async for row in cursor]
+
+                if 'last_reminder_message_id' not in columns:
+                    logger.info("Running migration: Adding last_reminder_message_id column to ticket_reminders")
+                    await db.execute(
+                        "ALTER TABLE ticket_reminders ADD COLUMN last_reminder_message_id INTEGER"
+                    )
+                    await db.commit()
+                    logger.info("Migration completed successfully")
+        except Exception as e:
+            logger.error(f"Error running migrations: {e}", exc_info=True)
 
     async def cog_unload(self):
         """Stop background tasks."""
@@ -357,7 +379,7 @@ class Tickets(commands.Cog):
                 # 1. Initial reminder is due (initial_reminder_at <= now AND last_reminded_at IS NULL)
                 # 2. Daily reminder is due (last_reminded_at + 24h <= now)
                 cursor = await db.execute(
-                    """SELECT id, ticket_thread_id, user_id, initial_reminder_at, last_reminded_at, dm_enabled
+                    """SELECT id, ticket_thread_id, user_id, initial_reminder_at, last_reminded_at, dm_enabled, last_reminder_message_id
                     FROM ticket_reminders
                     WHERE active = 1
                     AND (
@@ -372,7 +394,7 @@ class Tickets(commands.Cog):
             if not due_reminders:
                 return
 
-            for reminder_id, thread_id, user_id, initial_reminder_at, last_reminded_at, dm_enabled in due_reminders:
+            for reminder_id, thread_id, user_id, initial_reminder_at, last_reminded_at, dm_enabled, last_reminder_message_id in due_reminders:
                 try:
                     # Get thread
                     thread = self.bot.get_channel(thread_id)
@@ -406,6 +428,17 @@ class Tickets(commands.Cog):
                             logger.warning(f"User {user_id} not found for reminder {reminder_id}")
                             continue
 
+                    # Delete old reminder message if it exists
+                    if last_reminder_message_id:
+                        try:
+                            old_message = await thread.fetch_message(last_reminder_message_id)
+                            await old_message.delete()
+                            logger.info(f"Deleted old reminder message {last_reminder_message_id} for reminder {reminder_id}")
+                        except discord.NotFound:
+                            logger.debug(f"Old reminder message {last_reminder_message_id} not found (already deleted)")
+                        except discord.HTTPException as e:
+                            logger.warning(f"Failed to delete old reminder message {last_reminder_message_id}: {e}")
+
                     # Determine if this is initial or daily reminder
                     is_initial = last_reminded_at is None and initial_reminder_at is not None
                     reminder_type = "Initial" if is_initial else "Daily"
@@ -424,7 +457,7 @@ class Tickets(commands.Cog):
                     )
                     embed.set_footer(text="Use the buttons below to stop or snooze this reminder")
 
-                    await thread.send(content=user.mention, embed=embed, view=view)
+                    reminder_message = await thread.send(content=user.mention, embed=embed, view=view)
                     logger.info(f"Sent {reminder_type.lower()} reminder for ticket {thread_id} to user {user_id}")
 
                     # Send DM if enabled
@@ -447,11 +480,11 @@ class Tickets(commands.Cog):
                         except discord.HTTPException as e:
                             logger.error(f"Failed to DM user {user_id}: {e}")
 
-                    # Update last_reminded_at
+                    # Update last_reminded_at and last_reminder_message_id
                     async with aiosqlite.connect(self.db_path) as db:
                         await db.execute(
-                            "UPDATE ticket_reminders SET last_reminded_at = ? WHERE id = ?",
-                            (now.strftime('%Y-%m-%d %H:%M:%S'), reminder_id)
+                            "UPDATE ticket_reminders SET last_reminded_at = ?, last_reminder_message_id = ? WHERE id = ?",
+                            (now.strftime('%Y-%m-%d %H:%M:%S'), reminder_message.id, reminder_id)
                         )
                         await db.commit()
 

@@ -37,6 +37,9 @@ data/
 # Per-branch databases (each branch has its own data.db)
 branches/*/data.db
 
+# Shopkeepers CSV trade data (local development data)
+branches/shopkeepers/csv_data/
+
 # Configuration files with secrets
 db_config.ini
 config.ini
@@ -59,3 +62,6 @@ logs/
 
 # nul
 nul
+
+# temp
+temp/
