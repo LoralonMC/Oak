@@ -3,10 +3,8 @@ from discord.ext import commands, tasks
 from mcstatus import JavaServer
 import logging
 from pathlib import Path
-import yaml
 import random
 import asyncio
-from typing import Dict, Any
 from config import GUILD_ID
 
 logger = logging.getLogger(__name__)
@@ -56,7 +54,7 @@ class StatusChannels(commands.Cog):
 
         self.update_status_channels.start()
 
-    def load_config(self) -> Dict[str, Any]:
+    def load_config(self) -> dict:
         """Load config from config.yml in this branch's folder."""
         from utils import load_branch_config
         config_path = Path(__file__).parent / "config.yml"
@@ -69,6 +67,10 @@ class StatusChannels(commands.Cog):
 
     @tasks.loop(minutes=6)
     async def update_status_channels(self):
+        # Skip if no channels configured
+        if not self.member_count_channel_id and not self.player_count_channel_id:
+            return
+
         # Add jitter (±10%) to avoid synchronized spikes
         jitter = random.uniform(-36, 36)  # ±10% of 6 minutes (in seconds)
         if jitter > 0:

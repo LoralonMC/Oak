@@ -77,7 +77,7 @@ class StatusModal(ui.Modal, title="Reason for Action"):
         reason_text = f"{self.reason.value}\n\n— {moderator.mention} ({discord_timestamp})"
         embed.add_field(name=f"📝 Reason for {self.status}", value=reason_text, inline=False)
 
-        view = DummyView(status=self.status)
+        view = DummyView()
 
         await message.edit(embed=embed, view=view)
         await interaction.response.send_message(f"Suggestion {self.status.lower()}!", ephemeral=True)

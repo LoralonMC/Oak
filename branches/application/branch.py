@@ -458,7 +458,7 @@ class Application(commands.Cog):
                     WHERE status IN ('accepted', 'denied')
                 """) as cursor:
                     avg_days = await cursor.fetchone()
-                    avg_processing = avg_days[0] if avg_days[0] else 0
+                    avg_processing = avg_days[0] if avg_days and avg_days[0] else 0
 
             embed = discord.Embed(
                 title="📊 Application Statistics",

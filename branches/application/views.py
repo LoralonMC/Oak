@@ -13,6 +13,16 @@ from .helpers import get_embed_colors
 
 logger = logging.getLogger(__name__)
 
+# Status emoji mapping used across application views
+STATUS_EMOJI = {
+    "pending": "⏳",
+    "accepted": "✅",
+    "denied": "❌",
+    "cancelled": "🚫",
+    "abandoned": "💤",
+    "in_progress": "📝"
+}
+
 
 class ContinueView(View):
     """View with Continue button for multi-page applications."""
@@ -366,16 +376,9 @@ class ManageView(View):
 
         for app_index, status, submitted_at, answers_json, channel_id, denied_at, denial_reason in previous_apps:
             # Format status with emoji
-            status_emoji = {
-                "pending": "⏳",
-                "accepted": "✅",
-                "denied": "❌",
-                "cancelled": "🚫",
-                "abandoned": "💤",
-                "in_progress": "📝"
-            }.get(status, "❓")
+            emoji = STATUS_EMOJI.get(status, "❓")
 
-            field_value = f"**Status:** {status_emoji} {status.title()}\n**Date:** {submitted_at[:10]}"
+            field_value = f"**Status:** {emoji} {status.title()}\n**Date:** {submitted_at[:10]}"
 
             # Add denial reason if available
             if status == "denied" and denial_reason:
@@ -407,14 +410,7 @@ class ApplicationHistoryView(View):
         # Create dropdown options
         options = []
         for app_index, status, submitted_at, answers_json, channel_id, denied_at, denial_reason in previous_apps[:25]:  # Discord limit
-            status_emoji = {
-                "pending": "⏳",
-                "accepted": "✅",
-                "denied": "❌",
-                "cancelled": "🚫",
-                "abandoned": "💤",
-                "in_progress": "📝"
-            }.get(status, "❓")
+            emoji = STATUS_EMOJI.get(status, "❓")
 
             description = f"Submitted: {submitted_at[:10]}"
             if status == "denied" and denied_at:
@@ -425,7 +421,7 @@ class ApplicationHistoryView(View):
                     label=f"App #{app_index} - {status.title()}",
                     description=description,
                     value=str(app_index),
-                    emoji=status_emoji
+                    emoji=emoji
                 )
             )
 
@@ -465,16 +461,9 @@ class ApplicationHistoryView(View):
 
         # Add header info to first embed
         if embeds:
-            status_emoji = {
-                "pending": "⏳",
-                "accepted": "✅",
-                "denied": "❌",
-                "cancelled": "🚫",
-                "abandoned": "💤",
-                "in_progress": "📝"
-            }.get(status, "❓")
+            emoji = STATUS_EMOJI.get(status, "❓")
 
-            header_info = f"**Status:** {status_emoji} {status.title()}\n**Submitted:** {submitted_at[:10]}\n"
+            header_info = f"**Status:** {emoji} {status.title()}\n**Submitted:** {submitted_at[:10]}\n"
 
             if status == "denied":
                 if denied_at:
@@ -532,19 +521,10 @@ class StatusChangeView(View):
                 )
                 await db.commit()
 
-            # Send confirmation
-            status_emoji = {
-                "pending": "⏳",
-                "accepted": "✅",
-                "denied": "❌",
-                "cancelled": "🚫",
-                "abandoned": "⚠️"
-            }
-
             await interaction.response.send_message(
                 embed=discord.Embed(
                     title="Status Updated",
-                    description=f"{status_emoji.get(new_status, '')} Application #{self.app_index} status changed to **{new_status.title()}**",
+                    description=f"{STATUS_EMOJI.get(new_status, '')} Application #{self.app_index} status changed to **{new_status.title()}**",
                     color=get_embed_colors()["success"]
                 ),
                 ephemeral=True

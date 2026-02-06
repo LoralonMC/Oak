@@ -263,7 +263,7 @@ def validate_config(config: dict) -> tuple:
         errors.append("ticket_panel_channel_id not configured")
 
     log_channel = settings.get('log_channel_id', 0)
-    if log_channel != 0 and (log_channel < 0 or log_channel > 2**63):
+    if log_channel != 0 and (log_channel < 0 or log_channel > 2**64 - 1):
         errors.append("Invalid log_channel_id")
 
     # Validate staff roles

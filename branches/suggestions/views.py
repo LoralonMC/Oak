@@ -15,9 +15,8 @@ logger = logging.getLogger(__name__)
 class DummyView(ui.View):
     """Persistent view for suggestion voting and management."""
 
-    def __init__(self, status="Pending"):
+    def __init__(self):
         super().__init__(timeout=None)
-        self.status = status
 
     @discord.ui.button(label="👍 Like", style=discord.ButtonStyle.green, custom_id="suggestion_like")
     async def like(self, interaction: Interaction, button: discord.ui.Button):

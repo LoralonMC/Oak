@@ -5,7 +5,7 @@ Discord modals for ticket interactions.
 
 import discord
 import logging
-from typing import List, Dict, Any, Callable
+from collections.abc import Callable
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +47,7 @@ class CloseReasonModal(discord.ui.Modal, title="Close Ticket with Reason"):
 class TicketQuestionsModal(discord.ui.Modal):
     """Dynamic modal for collecting ticket information before creation."""
 
-    def __init__(self, questions_config: List[Dict[str, Any]], title: str, submit_callback: Callable):
+    def __init__(self, questions_config: list[dict], title: str, submit_callback: Callable):
         """
         Initialize the modal with questions from config.
 

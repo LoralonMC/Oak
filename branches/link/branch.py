@@ -2,8 +2,6 @@ import discord
 from discord.ext import commands
 from pathlib import Path
 import logging
-from typing import Dict, Any
-
 logger = logging.getLogger(__name__)
 
 # Default configuration
@@ -43,7 +41,7 @@ class Link(commands.Cog):
 
         logger.info("Link branch initialized")
 
-    def load_config(self) -> Dict[str, Any]:
+    def load_config(self) -> dict:
         """Load config from config.yml in this branch's folder."""
         from utils import load_branch_config
         config_path = Path(__file__).parent / "config.yml"

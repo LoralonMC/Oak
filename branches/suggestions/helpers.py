@@ -6,7 +6,6 @@ Shared utility functions for the suggestions system.
 import yaml
 import logging
 from pathlib import Path
-from typing import Dict, Any
 from constants import EMBED_FIELD_VALUE_MAX, truncate_for_embed_field
 
 logger = logging.getLogger(__name__)

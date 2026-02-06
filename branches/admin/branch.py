@@ -23,20 +23,24 @@ class Admin(commands.Cog):
         current: str,
     ) -> list[app_commands.Choice[str]]:
         """Autocomplete for branch names - returns actual folder names."""
-        from core.branch_loader import get_branch_loader
+        try:
+            from core.branch_loader import get_branch_loader
 
-        # Get all available branches from the filesystem (folder names)
-        loader = get_branch_loader()
-        all_branches = loader.discover_branches()
+            # Get all available branches from the filesystem (folder names)
+            loader = get_branch_loader()
+            all_branches = loader.discover_branches()
 
-        # Filter based on what the user has typed
-        filtered = [b for b in all_branches if current.lower() in b.lower()]
+            # Filter based on what the user has typed
+            filtered = [b for b in all_branches if current.lower() in b.lower()]
 
-        # Return as choices (max 25), showing the folder name
-        return [
-            app_commands.Choice(name=branch, value=branch)
-            for branch in sorted(filtered)[:25]
-        ]
+            # Return as choices (max 25), showing the folder name
+            return [
+                app_commands.Choice(name=branch, value=branch)
+                for branch in sorted(filtered)[:25]
+            ]
+        except Exception as e:
+            logger.error(f"Branch autocomplete error: {e}")
+            return []
 
     # ========================================================================
     # Slash Commands (App Commands)
@@ -139,7 +143,7 @@ class Admin(commands.Cog):
     async def slash_branches(self, interaction: discord.Interaction):
         """Slash command to list branches."""
 
-        loaded_branches = [branch for branch in self.bot.cogs.keys() if branch != "Admin"]
+        loaded_branches = [ext.rsplit(".", 1)[-1] for ext in self.bot.extensions.keys() if not ext.endswith(".admin")]
 
         embed = discord.Embed(
             title="🌿 Loaded Branches",
@@ -193,6 +197,6 @@ class Admin(commands.Cog):
 
         embed.add_field(name="Branches Loaded", value=len(self.bot.cogs) - 1, inline=True)
         embed.add_field(name="Guilds", value=len(self.bot.guilds), inline=True)
-        embed.add_field(name="Commands", value=len(self.bot.commands), inline=True)
+        embed.add_field(name="Commands", value=len(self.bot.tree.get_commands()), inline=True)
 
         await interaction.response.send_message(embed=embed, ephemeral=True)

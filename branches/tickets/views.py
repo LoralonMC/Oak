@@ -27,7 +27,15 @@ from .modals import CloseReasonModal
 logger = logging.getLogger(__name__)
 
 # Rate limiting: Track last ticket creation time per user
-_last_ticket_creation = {}  # {user_id: timestamp}
+_last_ticket_creation: dict[int, float] = {}
+
+
+def _cleanup_rate_limits(cooldown_seconds: int) -> None:
+    """Remove expired entries from the rate limit dict."""
+    now = time.time()
+    expired = [uid for uid, ts in _last_ticket_creation.items() if now - ts > cooldown_seconds]
+    for uid in expired:
+        del _last_ticket_creation[uid]
 
 
 class TicketPanelView(discord.ui.View):
@@ -86,6 +94,7 @@ class TicketPanelView(discord.ui.View):
             cooldown_seconds = fresh_config.get("settings", {}).get("rate_limit", {}).get("ticket_creation_cooldown_seconds", 60)
 
             if cooldown_seconds > 0:
+                _cleanup_rate_limits(cooldown_seconds)
                 global _last_ticket_creation
                 now = time.time()
                 last_creation = _last_ticket_creation.get(interaction.user.id, 0)

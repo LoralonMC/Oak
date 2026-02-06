@@ -57,7 +57,7 @@ async def handle_vote_button(interaction: Interaction, vote_type: str):
         embed = interaction.message.embeds[0]
         embed.set_field_at(1, name="📊 Statistics", value=f"**{len(likes)}** Likes\n**{len(dislikes)}** Dislikes\nStatus: **{status}**", inline=True)
 
-        view = DummyView(status=status)
+        view = DummyView()
 
         await interaction.message.edit(embed=embed, view=view)
         await interaction.response.defer()

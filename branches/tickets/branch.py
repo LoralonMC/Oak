@@ -149,7 +149,9 @@ class Tickets(commands.Cog):
         self.check_reminders_task.start()
         logger.info("Reminder check task started (interval: 1 minute)")
 
-        # Validate and create panel if needed
+    @commands.Cog.listener()
+    async def on_ready(self):
+        """Validate panel after bot is connected and channel cache is populated."""
         await self.validate_panel()
 
     async def _run_migrations(self):
@@ -356,6 +358,9 @@ class Tickets(commands.Cog):
                     logger.error(f"Failed to unarchive thread {thread_id}: {e}")
                 except Exception as e:
                     logger.error(f"Error processing thread {thread_id}: {e}")
+
+            if unarchived > 0:
+                logger.info(f"Anti-archive: unarchived {unarchived} ticket thread(s)")
 
         except Exception as e:
             logger.error(f"Error in anti-archive task: {e}", exc_info=True)
