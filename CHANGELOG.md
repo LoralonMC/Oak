@@ -2,6 +2,50 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased] - 2026-02-06
+
+### Added - Shopkeepers Branch (New)
+A complete CSV-based trade log importer and market analysis system for Minecraft Shopkeepers plugin data.
+
+#### Core System
+- **CSV Importer**: Automatic and manual import of Shopkeepers trade log CSV files
+- **NBT Parser**: Identifies vanilla items, enchanted books, potions, tipped arrows, shulker boxes, and custom plugin items
+- **Dual NBT Format Support**: Handles both legacy Bukkit (`v:4189`) and modern 1.20.5+ component (`DataVersion:4440`) formats
+- **SHA-256 Deduplication**: Fingerprint-based trade dedup prevents double-counting on re-import
+- **Incremental Import**: Only processes new lines from each CSV, skips unchanged files entirely
+- **Price Summary Table**: Maintains daily price averages for fast lookups, rebuilt incrementally for affected dates only
+
+#### Public Commands
+- **`/price <item> [days]`**: Check average, min, max price with daily price chart (1-365 days)
+- **`/top [sort_by]`**: View top traded items by trade count, volume, or total value
+- **`/search <query>`**: Search for items by name with price info
+- **`/player <name>`**: View trade stats for a player (spending, favorites, recent trades)
+- **`/shop <owner>`**: View trade stats for a shop owner (revenue, top items, recent trades)
+- **`/trending [period] [direction]`**: Items with biggest price changes (compares recent half vs prior half)
+- **`/shops [sort_by]`**: Top shop owner leaderboard (by revenue, trades, or unique items)
+- **`/players [sort_by]`**: Top player leaderboard (by spending, trades, or unique items)
+
+#### Admin Commands
+- **`/shopkeepers_import`**: Manually trigger CSV import
+- **`/shopkeepers_stats`**: View database statistics (total trades, items, files, etc.)
+- **`/economy [period]`**: Economy sink/faucet analysis (emerald flow through admin shops)
+- **`/sinks [period]`**: Detailed breakdown of items players buy from admin shops
+- **`/faucets [period]`**: Detailed breakdown of items players sell to admin shops
+
+#### Configuration
+- Configurable multi-tier currency system (Emeralds, Emerald Blocks, Compressed Emerald Blocks)
+- Plugin identity key support (ExecutableItems, ItemsAdder, PhoenixCrates, etc.)
+- Auto-import interval, UI settings, admin role IDs
+- Admin shop prices excluded from market averages
+
+#### Architecture
+- 5 database tables: `imported_files`, `items`, `trades`, `players`, `price_summary`
+- 6 source files: `branch.py`, `importer.py`, `nbt_parser.py`, `helpers.py`, `views.py`, `__init__.py`
+- Paginated embeds with interactive Previous/Next buttons for all list commands
+- Background auto-import task with configurable interval
+
+---
+
 ## [Unreleased] - 2025-01-15
 
 ### Added - Tickets Branch

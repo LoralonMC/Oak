@@ -10,6 +10,7 @@ A feature-rich, modular Discord bot framework providing suggestion management, s
 - **Staff Application System**: Comprehensive multi-page application forms with inactivity tracking, background checks (optional MySQL/Plan integration), and automated denial/acceptance workflow
 - **Support Ticket System**: Thread-based tickets with multiple categories (gameplay, billing, reports, appeals, bugs), staff management, and automatic anti-archive protection
 - **Server Status Tracking**: Auto-updating voice channels showing real-time Minecraft server player count and Discord member count
+- **Shopkeepers Market Analysis**: CSV trade log importer with price checking, market trends, economy sink/faucet analysis, player and shop leaderboards
 - **Account Linking Guide**: Simple command displaying instructions for linking Minecraft accounts via Discord
 - **Bot Management**: Admin slash commands for hot-reloading branches, viewing stats, and managing the bot
 - **Modular Architecture**: Hot-reload any branch and its config without restarting the bot
@@ -78,6 +79,7 @@ Oak uses **"branch"** terminology for its modular extensions (inspired by Git br
    - `branches/suggestions/config.yml` - Suggestion system settings
    - `branches/status_channels/config.yml` - Status channel settings
    - `branches/link/config.yml` - Link command settings
+   - `branches/shopkeepers/config.yml` - Shopkeepers market analysis settings
 
 5. **Run the bot**
    ```bash
@@ -121,6 +123,14 @@ Oak/
     ├── link/                  # Account linking guide
     │   ├── __init__.py
     │   ├── branch.py
+    │   └── config.yml
+    ├── shopkeepers/           # Market analysis system
+    │   ├── __init__.py
+    │   ├── branch.py
+    │   ├── helpers.py
+    │   ├── importer.py
+    │   ├── nbt_parser.py
+    │   ├── views.py
     │   └── config.yml
     └── tickets/               # Support ticket system
         ├── __init__.py
@@ -312,6 +322,54 @@ Displays instructions for linking Minecraft accounts to Discord.
 **Use Case:**
 For Minecraft servers using Discord linking plugins (e.g., DiscordSRV, Plan) where players need to link their accounts to get roles synchronized.
 
+### Shopkeepers Market Analysis
+**Location:** `branches/shopkeepers/`
+
+**What it does:**
+A CSV-based trade log importer and market analysis system for Minecraft Shopkeepers plugin data. Automatically imports trade logs and provides price checking, economy analysis, and leaderboards.
+
+**How it works:**
+1. The Shopkeepers Minecraft plugin generates CSV trade logs for every shop transaction
+2. The branch auto-imports these CSVs every 30 minutes (configurable)
+3. An NBT metadata parser identifies items (vanilla, enchanted, custom plugin items, potions, shulker boxes)
+4. Trades are deduplicated via SHA-256 fingerprinting to prevent double-counting on re-import
+5. A price summary table tracks daily averages for fast lookups
+
+**Public Commands:**
+- `/price <item> [days]` - Check average, min, max price with daily price chart (1-365 days)
+- `/top [sort_by]` - View top traded items (by trade count, volume, or value)
+- `/search <query>` - Search for items by name with price info
+- `/player <name>` - View trade stats for a player (spending, favorite items, recent trades)
+- `/shop <owner>` - View trade stats for a shop owner (revenue, top items, recent trades)
+- `/trending [period] [direction]` - Items with biggest price changes (compares recent half vs prior half)
+- `/shops [sort_by]` - Top shop owner leaderboard (by revenue, trade count, or unique items)
+- `/players [sort_by]` - Top player leaderboard (by spending, trade count, or unique items)
+
+**Admin Commands:**
+- `/shopkeepers_import` - Manually trigger CSV import
+- `/shopkeepers_stats` - View database statistics (total trades, items, files, etc.)
+- `/economy [period]` - Economy sink/faucet analysis (emerald flow through admin shops)
+- `/sinks [period]` - Detailed breakdown of items players buy from admin shops
+- `/faucets [period]` - Detailed breakdown of items players sell to admin shops
+
+**Features:**
+- **Automatic Import**: Background task imports new CSV data on a configurable interval
+- **Incremental Processing**: Only imports new lines from each CSV file, skips unchanged files
+- **NBT Parsing**: Identifies enchanted books, potions, tipped arrows, shulker boxes, and custom plugin items
+- **Dual Format Support**: Handles both legacy Bukkit NBT and modern 1.20.5+ component format
+- **Currency System**: Configurable multi-tier currency (Emeralds, Emerald Blocks, Compressed Emerald Blocks)
+- **Plugin Item Recognition**: Identifies items from ExecutableItems, ItemsAdder, PhoenixCrates, and other plugins
+- **Paginated Embeds**: All list commands use interactive Previous/Next buttons
+- **Admin Shop Exclusion**: Admin shop prices are excluded from market averages (fixed prices would skew data)
+
+**Configuration:**
+- CSV directory path (point to Shopkeepers plugin trade-logs folder)
+- Auto-import interval
+- Currency definitions with emerald values
+- Plugin identity keys for custom item recognition
+- UI settings (embed color, items per page, default lookback period)
+- Admin role IDs for economy commands
+
 ### Admin Commands
 **Location:** `branches/admin/`
 
@@ -387,6 +445,7 @@ This separation allows you to give different people access to bot management vs.
 Oak uses a **per-branch database architecture** where each branch manages its own SQLite database:
 - **branches/suggestions/data.db** - Stores suggestions, votes, status, and reasons
 - **branches/application/data.db** - Stores application data, answers, and status
+- **branches/shopkeepers/data.db** - Stores imported trades, items, players, price summaries, and import tracking
 
 Each database is automatically created and initialized when the branch loads for the first time. This makes each branch truly self-contained and portable.
 
