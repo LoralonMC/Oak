@@ -10,7 +10,7 @@ import yaml
 import logging
 import importlib
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Any
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
@@ -31,7 +31,6 @@ class BranchLoader:
 
     def __init__(self, branches_dir: str = "branches"):
         self.branches_dir = Path(branches_dir)
-        self.loaded_branches: Dict[str, BranchMetadata] = {}
 
     def discover_branches(self) -> list[str]:
         """
@@ -61,7 +60,7 @@ class BranchLoader:
 
         return sorted(branch_names)
 
-    def get_branch_path(self, branch_name: str) -> Optional[Path]:
+    def get_branch_path(self, branch_name: str) -> Path | None:
         """Get the path for a branch."""
         # Check for folder-based branch first
         branch_folder = self.branches_dir / branch_name
@@ -75,7 +74,7 @@ class BranchLoader:
 
         return None
 
-    def get_config_path(self, branch_name: str) -> Optional[Path]:
+    def get_config_path(self, branch_name: str) -> Path | None:
         """Get the config path for a branch."""
         branch_path = self.get_branch_path(branch_name)
         if not branch_path:
@@ -88,7 +87,7 @@ class BranchLoader:
             # Single-file branch - config in same directory with .yaml extension
             return branch_path.parent / f"{branch_name}.yaml"
 
-    def load_config(self, branch_name: str) -> Dict[str, Any]:
+    def load_config(self, branch_name: str) -> dict[str, Any]:
         """Load config for a branch, generating default if it doesn't exist."""
         config_path = self.get_config_path(branch_name)
 
@@ -108,7 +107,7 @@ class BranchLoader:
             logger.error(f"Failed to load config for {branch_name}: {e}")
             return self.get_default_config(branch_name)
 
-    def save_config(self, branch_name: str, config: Dict[str, Any]):
+    def save_config(self, branch_name: str, config: dict[str, Any]):
         """Save config for a branch."""
         config_path = self.get_config_path(branch_name)
         if not config_path:
@@ -122,11 +121,11 @@ class BranchLoader:
             with open(config_path, "w") as f:
                 yaml.safe_dump(config, f, default_flow_style=False, sort_keys=False)
 
-            logger.info(f"✅ Saved config for {branch_name}")
+            logger.info(f"Saved config for {branch_name}")
         except Exception as e:
             logger.error(f"Failed to save config for {branch_name}: {e}")
 
-    def get_default_config(self, branch_name: str) -> Dict[str, Any]:
+    def get_default_config(self, branch_name: str) -> dict[str, Any]:
         """
         Get default config for a branch.
 
@@ -170,12 +169,12 @@ class BranchLoader:
         config = self.load_config(branch_name)
         return config.get("enabled", True)
 
-    def reload_config(self, branch_name: str) -> Dict[str, Any]:
+    def reload_config(self, branch_name: str) -> dict[str, Any]:
         """Reload config for a branch."""
         logger.info(f"Reloading config for {branch_name}")
         return self.load_config(branch_name)
 
-    def get_load_path(self, branch_name: str) -> Optional[str]:
+    def get_load_path(self, branch_name: str) -> str | None:
         """
         Get the import path for loading a branch.
 
@@ -212,7 +211,7 @@ class BranchLoader:
 
 
 # Global loader instance
-_loader: Optional[BranchLoader] = None
+_loader: BranchLoader | None = None
 
 
 def get_branch_loader() -> BranchLoader:

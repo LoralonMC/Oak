@@ -26,33 +26,13 @@ async def init_branch_database(db_path: str, schema: str, branch_name: str = "Br
         db_file.parent.mkdir(parents=True, exist_ok=True)
 
         async with aiosqlite.connect(db_path) as db:
-            # Enable foreign key constraints
-            await db.execute("PRAGMA foreign_keys = ON")
+            # Enable WAL mode for better concurrent read/write performance
+            # (persists across connections once set)
+            await db.execute("PRAGMA journal_mode = WAL")
 
             # Execute schema (can be multiple statements)
             await db.executescript(schema)
-            await db.commit()
             logger.info(f"{branch_name} database initialized at {db_path}")
     except Exception as e:
         logger.error(f"Failed to initialize {branch_name} database: {e}")
         raise
-
-
-async def get_db_connection(db_path: str) -> aiosqlite.Connection:
-    """
-    Get a database connection for a branch with foreign keys enabled.
-
-    Usage:
-        async with await get_db_connection(self.db_path) as db:
-            cursor = await db.execute("SELECT * FROM table")
-            ...
-
-    Args:
-        db_path: Path to the database file
-
-    Returns:
-        aiosqlite.Connection with foreign keys enabled
-    """
-    db = await aiosqlite.connect(db_path)
-    await db.execute("PRAGMA foreign_keys = ON")
-    return db

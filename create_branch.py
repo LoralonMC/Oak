@@ -67,28 +67,13 @@ async def setup(bot):
 """
 
 import discord
+from discord import app_commands
 from discord.ext import commands
 import aiosqlite
 import logging
 from pathlib import Path
-from typing import Dict, Any
 import yaml
 from database import init_branch_database
-from config import validate_channel_id, validate_role_ids
-from constants import (
-    EMBED_TITLE_MAX,
-    EMBED_DESCRIPTION_MAX,
-    EMBED_FIELD_VALUE_MAX,
-    MESSAGE_CONTENT_MAX,
-    truncate_for_embed_field,
-    truncate_for_embed_description,
-    truncate_for_message
-)
-# Import additional constants as needed:
-# - MODAL_* constants for modal inputs
-# - CHANNEL_NAME_MAX, THREAD_NAME_MAX for channel/thread names
-# - BUTTON_LABEL_MAX for button labels
-# See constants.py for all available Discord API limits
 
 logger = logging.getLogger(__name__)
 
@@ -147,10 +132,6 @@ class {class_name}(commands.Cog):
         self.channel_id: int = settings.get("example_channel_id", 0)
         self.max_items: int = settings.get("limits", {{}}).get("max_items", 10)
 
-        # Validate configuration
-        if not validate_channel_id(self.channel_id, "example_channel_id"):
-            logger.warning("Invalid example_channel_id in config")
-
         # Feature flags
         features = settings.get("features", {{}})
         self.feature_a_enabled: bool = features.get("feature_a", True)
@@ -168,7 +149,7 @@ class {class_name}(commands.Cog):
         # Comment out if you don't need database functionality
         await init_branch_database(self.db_path, DATABASE_SCHEMA, "{class_name}")
 
-    def load_config(self) -> Dict[str, Any]:
+    def load_config(self) -> dict:
         """Load config from config.yml in this branch's folder."""
         from utils import load_branch_config
         config_path = Path(__file__).parent / "config.yml"
@@ -183,36 +164,37 @@ class {class_name}(commands.Cog):
     # Add your commands here
     # ========================================================================
 
-    @commands.command(name="{branch_name}_example")
-    async def example_command(self, ctx: commands.Context) -> None:
+    @app_commands.command(name="{branch_name}_example", description="Example command - replace with your own")
+    async def example_command(self, interaction: discord.Interaction) -> None:
         """Example command - replace with your own."""
 
         # Check if feature is enabled
         if not self.feature_a_enabled:
-            await ctx.send("This feature is disabled in config.")
+            await interaction.response.send_message("This feature is disabled in config.", ephemeral=True)
             return
 
         # Get message from config
         messages = self.config.get("settings", {{}}).get("messages", {{}})
         welcome = messages.get("welcome", "Hello!")
 
-        await ctx.send(welcome)
+        await interaction.response.send_message(welcome)
 
     # Example database operation (if using database)
-    @commands.command(name="{branch_name}_save")
-    async def save_data(self, ctx: commands.Context, *, data: str) -> None:
+    @app_commands.command(name="{branch_name}_save", description="Example database save command")
+    @app_commands.describe(data="Data to save")
+    async def save_data(self, interaction: discord.Interaction, data: str) -> None:
         """Example database save command."""
         try:
             async with aiosqlite.connect(self.db_path) as db:
                 await db.execute(
                     "INSERT INTO {branch_name}_data (user_id, data) VALUES (?, ?)",
-                    (ctx.author.id, data)
+                    (interaction.user.id, data)
                 )
                 await db.commit()
-            await ctx.send("✅ Data saved!")
+            await interaction.response.send_message("Data saved!", ephemeral=True)
         except Exception as e:
             logger.error(f"Error saving data: {{e}}")
-            await ctx.send("❌ Failed to save data.")
+            await interaction.response.send_message("Failed to save data.", ephemeral=True)
 
     def cog_unload(self) -> None:
         """
@@ -300,9 +282,9 @@ settings:
     print(f"   1. Edit {config_file} to configure your branch")
     print(f"   2. Edit {branch_file} to add your functionality")
     print(f"   3. Restart the bot (it will auto-load) or use:")
-    print(f"      !load {branch_name}")
+    print(f"      /load {branch_name}")
     print(f"\n   4. To reload after changes:")
-    print(f"      !reload {branch_name}")
+    print(f"      /reload {branch_name}")
     print(f"\n   5. To disable:")
     print(f"      Edit config.yml and set enabled: false")
 

@@ -5,14 +5,14 @@ Handles all modal forms for the application system.
 
 import discord
 from discord.ui import Modal, TextInput
-from utils import check_application_answer_quality, sanitize_text
+from utils import sanitize_text
 from constants import (
     MODAL_TITLE_MAX,
     MODAL_TEXT_INPUT_LABEL_MAX,
     MODAL_TEXT_INPUT_PLACEHOLDER_MAX,
     MODAL_TEXT_INPUT_VALUE_MAX
 )
-from .helpers import get_embed_colors
+from .helpers import get_embed_colors, check_application_answer_quality
 import aiosqlite
 import json
 import logging

@@ -161,3 +161,31 @@ def is_application_reviewer():
         return any(role_id in reviewer_role_ids for role_id in user_role_ids)
 
     return commands.check(predicate)
+
+
+def check_application_answer_quality(question: str, answer: str) -> tuple[bool, str]:
+    """
+    Check if an application answer is of sufficient quality.
+
+    Simple validation that only catches empty answers and obvious spam.
+    Server owners can review answers themselves and decide what's acceptable.
+
+    Args:
+        question: The question that was asked
+        answer: The answer provided
+
+    Returns:
+        Tuple of (is_valid, error_message)
+    """
+    answer = answer.strip()
+
+    # Check for empty answers
+    if len(answer) == 0:
+        return False, "Please provide an answer."
+
+    # Check if it's just repeated characters (spam like "aaaaa" or ".....")
+    if len(answer) >= 3 and len(set(answer.replace(' ', ''))) < 2:
+        return False, "Please provide a real answer."
+
+    # All other answers are accepted - let staff review them
+    return True, ""

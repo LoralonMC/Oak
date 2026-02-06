@@ -5,6 +5,7 @@ GitHub: https://github.com/LoralonMC/oak
 """
 
 import discord
+from discord import app_commands
 from discord.ext import commands
 from config import DISCORD_TOKEN, GUILD_ID
 import logging
@@ -40,21 +41,6 @@ intents.messages = True          # Required for message events
 intents.guilds = True            # Required for guild information
 intents.members = True           # Required for member information
 
-# Validate required intents are enabled
-REQUIRED_INTENTS = {
-    "message_content": "Required for reading message commands (!reload, etc.)",
-    "guilds": "Required for accessing guild information",
-    "members": "Required for member count and role checking"
-}
-
-for intent_name, reason in REQUIRED_INTENTS.items():
-    if not getattr(intents, intent_name, False):
-        logger.error(f"Missing required intent: {intent_name}")
-        logger.error(f"Reason: {reason}")
-        logger.error("Please enable this intent in the Discord Developer Portal:")
-        logger.error("https://discord.com/developers/applications")
-        sys.exit(1)
-
 class Oak(commands.Bot):
     """Oak - Modular Discord bot framework."""
 
@@ -63,8 +49,16 @@ class Oak(commands.Bot):
 
     async def setup_hook(self):
         try:
+            self.tree.on_error = self._on_app_command_error
+
             logger.info("Loading branches...")
             await self.load_branches()
+
+            # Sync slash commands to guild (runs once at startup)
+            guild = discord.Object(id=GUILD_ID)
+            self.tree.copy_global_to(guild=guild)
+            synced = await self.tree.sync(guild=guild)
+            logger.info(f"Synced {len(synced)} slash commands to guild {GUILD_ID}")
 
             logger.info("Oak setup complete!")
         except Exception as e:
@@ -92,7 +86,7 @@ class Oak(commands.Bot):
                 # Check if enabled
                 if not config.get("enabled", True):
                     skipped_branches.append(branch_name)
-                    logger.info(f"⏭️  Skipped {branch_name} (disabled in config)")
+                    logger.info(f"Skipped {branch_name} (disabled in config)")
                     continue
 
                 # Get the correct import path
@@ -104,11 +98,11 @@ class Oak(commands.Bot):
                 # Load the branch
                 await self.load_extension(load_path)
                 loaded_branches.append(branch_name)
-                logger.info(f"✅ Loaded branch: {branch_name}")
+                logger.info(f"Loaded branch: {branch_name}")
 
             except Exception as e:
                 failed_branches.append((branch_name, str(e)))
-                logger.error(f"❌ Failed to load branch {branch_name}: {e}")
+                logger.error(f"Failed to load branch {branch_name}: {e}")
 
         logger.info(f"Loaded {len(loaded_branches)}/{len(branch_names)} branches: {', '.join(loaded_branches)}")
 
@@ -123,24 +117,11 @@ class Oak(commands.Bot):
     async def on_ready(self):
         logger.info(f"Logged in as {self.user} (ID: {self.user.id})")
         logger.info(f"Connected to {len(self.guilds)} guild(s)")
-        logger.info(f"Registered prefix commands: {[cmd.name for cmd in self.commands]}")
-
-        # Sync slash commands to Discord
-        try:
-            logger.info("Syncing slash commands...")
-            guild = discord.Object(id=GUILD_ID)
-            self.tree.copy_global_to(guild=guild)
-            synced = await self.tree.sync(guild=guild)
-            logger.info(f"Synced {len(synced)} slash commands to guild {GUILD_ID}")
-        except Exception as e:
-            logger.error(f"Failed to sync slash commands: {e}")
-
         logger.info("Bot is ready!")
 
     async def on_message(self, message):
-        # Log commands for debugging
         if message.content.startswith(self.command_prefix) and not message.author.bot:
-            logger.info(f"Command received from {message.author} (roles: {[r.id for r in message.author.roles]}): {message.content}")
+            logger.info(f"Command from {message.author}: {message.content}")
         await self.process_commands(message)
 
     async def on_error(self, event_method: str, *args, **kwargs):
@@ -150,12 +131,24 @@ class Oak(commands.Bot):
         if isinstance(error, commands.CommandNotFound):
             return
         elif isinstance(error, (commands.MissingPermissions, commands.MissingRole, commands.MissingAnyRole, commands.CheckFailure)):
-            await ctx.send("❌ You don't have permission to use this command.")
+            await ctx.send("You don't have permission to use this command.")
         elif isinstance(error, commands.MissingRequiredArgument):
-            await ctx.send(f"❌ Missing required argument: `{error.param.name}`")
+            await ctx.send(f"Missing required argument: `{error.param.name}`")
         else:
             logger.error(f"Command error in {ctx.command}: {error}", exc_info=True)
-            await ctx.send("❌ An error occurred while executing the command.")
+            await ctx.send("An error occurred while executing the command.")
+
+    async def _on_app_command_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
+        """Global error handler for slash commands."""
+        logger.error(f"Slash command error in {interaction.command}: {error}", exc_info=True)
+        try:
+            message = "An error occurred while executing the command."
+            if interaction.response.is_done():
+                await interaction.followup.send(message, ephemeral=True)
+            else:
+                await interaction.response.send_message(message, ephemeral=True)
+        except discord.HTTPException:
+            pass
 
 def main():
     try:
