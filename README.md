@@ -227,6 +227,8 @@ The generated branch includes a database schema, `DEFAULT_CONFIG`, lifecycle hoo
 
 Set `database: false` in `branch.yml` if you don't need a database.
 
+For the full developer guide — config, database, views, modals, events, background tasks, and more — see **[GUIDE.md](GUIDE.md)**.
+
 ## Logging
 
 Logs go to both console and `logs/oak.log` with daily rotation (30-day retention). Discord.py's internal logging is suppressed to WARNING level.
