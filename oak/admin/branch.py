@@ -6,7 +6,6 @@ Provides: /reload, /load, /unload, /branches, /sync, /botinfo
 
 import discord
 from discord import app_commands
-from discord.ext import commands
 
 from ..branch import OakBranch
 from ..constants import EMBED_FIELD_VALUE_MAX

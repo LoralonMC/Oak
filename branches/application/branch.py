@@ -5,11 +5,9 @@ Manages staff application workflow with multi-page forms, background checks, and
 
 import discord
 from discord import app_commands
-from discord.ext import commands, tasks
+from discord.ext import tasks
 import aiosqlite
-import json
 from pathlib import Path
-from datetime import datetime, timedelta
 from oak import OakBranch
 from oak.context import BranchContext
 
@@ -17,8 +15,6 @@ from oak.context import BranchContext
 from .helpers import (
     get_application_config,
     get_application_questions,
-    get_reviewer_role_ids,
-    is_application_reviewer,
     get_db_path,
     get_embed_colors
 )
@@ -511,7 +507,6 @@ class Application(OakBranch):
     @app_commands.describe(user="The user whose application history you want to view")
     async def application_history(self, interaction: discord.Interaction, user: discord.Member):
         """View a user's application history (Staff only)"""
-        from .helpers import get_application_questions, paginate_application_embed
         from .views import ApplicationHistoryView
 
         try:
@@ -561,16 +556,6 @@ class Application(OakBranch):
             summary_embed.set_thumbnail(url=user.display_avatar.url)
 
             for app_index, status, submitted_at, answers_json, channel_id, denied_at, denial_reason in all_apps:
-                # Format status with emoji
-                status_emoji = {
-                    "pending": "pending",
-                    "accepted": "accepted",
-                    "denied": "denied",
-                    "cancelled": "cancelled",
-                    "abandoned": "abandoned",
-                    "in_progress": "in progress"
-                }.get(status, status)
-
                 field_value = f"**Status:** {status.title()}\n**Date:** {submitted_at[:10]}"
 
                 # Add denial reason if available

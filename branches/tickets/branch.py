@@ -17,7 +17,6 @@ from .helpers import (
     get_db_path,
     get_tickets_config,
     get_embed_colors,
-    get_staff_role_ids,
     is_staff,
     can_manage_ticket_category,
     hash_config,
@@ -375,7 +374,7 @@ class Tickets(OakBranch):
     @tasks.loop(minutes=1)
     async def check_reminders_task(self):
         """Check for due reminders and send notifications."""
-        from datetime import datetime, timedelta, timezone
+        from datetime import datetime, timezone
 
         try:
             now = datetime.now(timezone.utc)
@@ -460,7 +459,7 @@ class Tickets(OakBranch):
                         try:
                             dm_embed = discord.Embed(
                                 title=f"🔔 Ticket Reminder: {thread.name}",
-                                description=f"This is a reminder to check on your ticket.",
+                                description="This is a reminder to check on your ticket.",
                                 color=get_embed_colors()["open"]
                             )
                             dm_embed.add_field(
@@ -1167,7 +1166,7 @@ class Tickets(OakBranch):
                     initial_reminder_at = datetime.now(timezone.utc) + timedelta(seconds=initial_reminder_seconds)
 
                 try:
-                    cursor = await db.execute(
+                    await db.execute(
                         """INSERT INTO ticket_reminders
                         (ticket_thread_id, user_id, initial_reminder_at, last_reminded_at, dm_enabled, active)
                         VALUES (?, ?, ?, ?, ?, 1)""",
@@ -1179,7 +1178,6 @@ class Tickets(OakBranch):
                             1 if dm else 0
                         )
                     )
-                    reminder_id = cursor.lastrowid
                     await db.commit()
                 except aiosqlite.IntegrityError:
                     await interaction.followup.send(
