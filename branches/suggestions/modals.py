@@ -44,32 +44,40 @@ class StatusModal(ui.Modal, title="Reason for Action"):
         color_denied = colors["denied"]
 
         async with aiosqlite.connect(get_db_path()) as db:
-            # Atomic check-and-update: verify status is still Pending before updating
+            # Atomic update: only change status if still Pending
             cursor = await db.execute(
-                "SELECT user_id, content, likes, dislikes, status FROM suggestions WHERE message_id = ?",
+                "UPDATE suggestions SET status = ?, reason = ? WHERE message_id = ? AND status = 'Pending'",
+                (self.status, self.reason.value, self.message_id),
+            )
+            if cursor.rowcount == 0:
+                # Either not found or already processed — check which
+                check = await db.execute(
+                    "SELECT status FROM suggestions WHERE message_id = ?",
+                    (self.message_id,),
+                )
+                existing = await check.fetchone()
+                if not existing:
+                    await interaction.followup.send("This suggestion could not be found in the database.", ephemeral=True)
+                else:
+                    await interaction.followup.send(
+                        f"This suggestion has already been **{existing[0].lower()}** and cannot be changed.",
+                        ephemeral=True,
+                    )
+                return
+            await db.commit()
+
+            # Fetch data for embed update
+            cursor = await db.execute(
+                "SELECT user_id, content, likes, dislikes FROM suggestions WHERE message_id = ?",
                 (self.message_id,),
             )
             row = await cursor.fetchone()
             if not row:
-                await interaction.followup.send("This suggestion could not be found in the database.", ephemeral=True)
                 return
 
-            user_id, content, likes, dislikes, current_status = row
-            likes = json.loads(likes)
-            dislikes = json.loads(dislikes)
-
-            if current_status != "Pending":
-                await interaction.followup.send(
-                    f"This suggestion has already been **{current_status.lower()}** and cannot be changed.",
-                    ephemeral=True,
-                )
-                return
-
-            await db.execute(
-                "UPDATE suggestions SET status = ?, reason = ? WHERE message_id = ?",
-                (self.status, self.reason.value, self.message_id),
-            )
-            await db.commit()
+            user_id, content, likes_json, dislikes_json = row
+            likes = json.loads(likes_json) if likes_json else []
+            dislikes = json.loads(dislikes_json) if dislikes_json else []
 
         # Fetch the suggestion message from the stored channel_id (not the ephemeral interaction channel)
         try:
@@ -112,7 +120,7 @@ class StatusModal(ui.Modal, title="Reason for Action"):
         unix_timestamp = int(time.time())
         discord_timestamp = f"<t:{unix_timestamp}:f>"
         reason_text = f"{sanitized_reason}\n\n— {moderator.mention} ({discord_timestamp})"
-        embed.add_field(name=f"📝 Reason for {self.status}", value=reason_text, inline=False)
+        embed.add_field(name=f"📝 Reason for {self.status}", value=truncate(reason_text), inline=False)
 
         view = SuggestionVoteView()
         await message.edit(embed=embed, view=view)
