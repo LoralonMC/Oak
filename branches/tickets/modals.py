@@ -62,13 +62,15 @@ class TicketQuestionsModal(discord.ui.Modal):
 
         # Create text inputs from config (max 5 due to Discord limit)
         for i, question in enumerate(questions_config[:5]):
+            is_required = question.get("required", True)
+            default_min = 1 if is_required else 0
             text_input = discord.ui.TextInput(
                 label=question.get("label", f"Question {i+1}")[:45],  # Discord limit: 45 chars
                 style=discord.TextStyle.paragraph,
                 placeholder=question.get("placeholder", "")[:100],  # Discord limit: 100 chars
-                required=question.get("required", True),
+                required=is_required,
                 max_length=question.get("max_length", 1000),
-                min_length=question.get("min_length", 1)
+                min_length=question.get("min_length", default_min)
             )
             self.text_inputs.append(text_input)
             self.add_item(text_input)
@@ -86,3 +88,11 @@ class TicketQuestionsModal(discord.ui.Modal):
                     "❌ An error occurred while creating your ticket.",
                     ephemeral=True
                 )
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        logger.error(f"Error in TicketQuestionsModal: {error}", exc_info=True)
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.send_message("An error occurred.", ephemeral=True)
+        except Exception:
+            pass

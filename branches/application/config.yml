@@ -37,9 +37,6 @@ settings:
   # Required link role ID (optional, set to 0 to disable account linking requirement)
   required_link_role_id: 0  # CONFIGURE THIS (or 0 to disable)
 
-  # Guild ID
-  guild_id: 0  # CONFIGURE THIS - Your Discord server ID
-
   # Inactivity and cleanup settings
   inactivity:
     enabled: true  # Enable automatic inactivity warnings and cleanup

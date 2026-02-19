@@ -12,8 +12,6 @@ from .helpers import (
     get_tickets_config,
     get_db_path,
     get_embed_colors,
-    get_staff_role_ids,
-    is_staff,
     can_manage_ticket_category,
     can_bypass_duplicate_check,
     sanitize_name,
@@ -32,6 +30,11 @@ _last_ticket_creation: dict[int, float] = {}
 
 def _cleanup_rate_limits(cooldown_seconds: int) -> None:
     """Remove expired entries from the rate limit dict."""
+    # Hard cap: if the dict grows too large, clear it entirely to prevent memory leak
+    if len(_last_ticket_creation) > 1000:
+        _last_ticket_creation.clear()
+        return
+
     now = time.time()
     expired = [uid for uid, ts in _last_ticket_creation.items() if now - ts > cooldown_seconds]
     for uid in expired:
@@ -41,9 +44,10 @@ def _cleanup_rate_limits(cooldown_seconds: int) -> None:
 class TicketPanelView(discord.ui.View):
     """View for the ticket creation panel with category buttons."""
 
-    def __init__(self):
+    def __init__(self, *, legacy: bool = False):
         super().__init__(timeout=None)
         self.config = get_tickets_config()
+        self.legacy = legacy
         self._build_buttons()
 
     def _build_buttons(self):
@@ -73,7 +77,7 @@ class TicketPanelView(discord.ui.View):
                 label=cat_config.get("label", cat_key.replace('_', ' ').title()),
                 emoji=cat_config.get("emoji"),
                 style=button_style,
-                custom_id=f"ticket_create_{cat_key}"
+                custom_id=f"ticket_create_{cat_key}" if self.legacy else f"oak:tickets:create:{cat_key}"
             )
             button.callback = self._create_button_callback(cat_key, cat_config)
             self.add_item(button)
@@ -95,7 +99,6 @@ class TicketPanelView(discord.ui.View):
 
             if cooldown_seconds > 0:
                 _cleanup_rate_limits(cooldown_seconds)
-                global _last_ticket_creation
                 now = time.time()
                 last_creation = _last_ticket_creation.get(interaction.user.id, 0)
                 time_since_last = now - last_creation
@@ -166,7 +169,6 @@ class TicketPanelView(discord.ui.View):
 
             # Re-check rate limit (user might have created another ticket while filling out modal)
             if cooldown_seconds > 0:
-                global _last_ticket_creation
                 now = time.time()
                 last_creation = _last_ticket_creation.get(interaction.user.id, 0)
                 time_since_last = now - last_creation
@@ -258,28 +260,41 @@ class TicketPanelView(discord.ui.View):
                 logger.error(f"Failed to add user to thread: {e}")
 
             # Save to database
-            async with aiosqlite.connect(get_db_path()) as db:
+            try:
+                async with aiosqlite.connect(get_db_path()) as db:
+                    try:
+                        await db.execute(
+                            """INSERT INTO tickets
+                            (thread_id, user_id, category, ticket_number, status, created_at)
+                            VALUES (?, ?, ?, ?, 'open', datetime('now'))""",
+                            (thread.id, interaction.user.id, category_key, ticket_number)
+                        )
+                        await db.commit()
+
+                        # Update rate limit timestamp on successful ticket creation
+                        if cooldown_seconds > 0:
+                            _last_ticket_creation[interaction.user.id] = time.time()
+
+                    except aiosqlite.IntegrityError:
+                        # Race condition - user created ticket between check and creation
+                        await thread.delete(reason="Duplicate ticket (race condition)")
+                        await interaction.followup.send(
+                            "❌ You already have an open ticket in this category. Please try again.",
+                            ephemeral=True
+                        )
+                        return
+            except Exception as e:
+                # DB insert failed - clean up the orphaned thread
+                logger.error(f"DB insert failed for ticket, deleting orphaned thread {thread.id}: {e}", exc_info=True)
                 try:
-                    await db.execute(
-                        """INSERT INTO tickets
-                        (thread_id, user_id, category, ticket_number, status, created_at)
-                        VALUES (?, ?, ?, ?, 'open', datetime('now'))""",
-                        (thread.id, interaction.user.id, category_key, ticket_number)
-                    )
-                    await db.commit()
-
-                    # Update rate limit timestamp on successful ticket creation
-                    if cooldown_seconds > 0:
-                        _last_ticket_creation[interaction.user.id] = time.time()
-
-                except aiosqlite.IntegrityError:
-                    # Race condition - user created ticket between check and creation
-                    await thread.delete(reason="Duplicate ticket (race condition)")
-                    await interaction.followup.send(
-                        "❌ You already have an open ticket in this category. Please try again.",
-                        ephemeral=True
-                    )
-                    return
+                    await thread.delete(reason="Orphan cleanup: DB insert failed")
+                except discord.HTTPException as del_err:
+                    logger.error(f"Failed to delete orphaned thread {thread.id}: {del_err}")
+                await interaction.followup.send(
+                    "❌ An error occurred while saving your ticket. Please try again.",
+                    ephemeral=True
+                )
+                return
 
             # Prepare welcome message with role pings
             welcome_message = category_config.get("welcome_message", "Your ticket has been created!")
@@ -356,7 +371,11 @@ class TicketPanelView(discord.ui.View):
                             await log_channel.send(embed=log_embed)
                         except discord.HTTPException as e:
                             logger.error(f"Failed to log ticket creation: {e}")
-                asyncio.create_task(log_ticket())
+                def _log_ticket_done(task):
+                    if task.exception():
+                        logger.error(f"Error in log_ticket task: {task.exception()}", exc_info=task.exception())
+
+                asyncio.create_task(log_ticket()).add_done_callback(_log_ticket_done)
 
         except Exception as e:
             logger.error(f"Error creating ticket: {e}", exc_info=True)
@@ -369,17 +388,20 @@ class TicketPanelView(discord.ui.View):
 class ConfirmCloseView(discord.ui.View):
     """Confirmation view for closing tickets."""
 
-    def __init__(self, close_callback):
+    def __init__(self, close_callback, author_id: int):
         super().__init__(timeout=60)
         self.close_callback = close_callback
+        self.author_id = author_id
 
     @discord.ui.button(
         label="Yes, Close Ticket",
-        style=discord.ButtonStyle.danger,
-        custom_id="confirm_close_yes"
+        style=discord.ButtonStyle.danger
     )
     async def confirm_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Confirm ticket closure."""
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("Only the person who initiated the close can confirm.", ephemeral=True)
+            return
         await self.close_callback(interaction, reason=None)
         # Disable buttons
         for item in self.children:
@@ -391,11 +413,13 @@ class ConfirmCloseView(discord.ui.View):
 
     @discord.ui.button(
         label="Cancel",
-        style=discord.ButtonStyle.secondary,
-        custom_id="confirm_close_no"
+        style=discord.ButtonStyle.secondary
     )
     async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Cancel ticket closure."""
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("Only the person who initiated the close can confirm.", ephemeral=True)
+            return
         await interaction.response.send_message(
             "❌ Ticket closure cancelled.",
             ephemeral=True
@@ -409,11 +433,21 @@ class ConfirmCloseView(discord.ui.View):
             pass
 
 
+_TICKET_CONTROL_ID_MAP = {
+    "ticket_close": "oak:tickets:close",
+    "ticket_close_reason": "oak:tickets:close-reason",
+}
+
+
 class TicketControlView(discord.ui.View):
     """View with close buttons for ticket management."""
 
-    def __init__(self):
+    def __init__(self, *, legacy: bool = False):
         super().__init__(timeout=None)
+        if not legacy:
+            for child in self.children:
+                if hasattr(child, 'custom_id') and child.custom_id in _TICKET_CONTROL_ID_MAP:
+                    child.custom_id = _TICKET_CONTROL_ID_MAP[child.custom_id]
 
     @discord.ui.button(
         label="Close Ticket",
@@ -423,7 +457,7 @@ class TicketControlView(discord.ui.View):
     async def close_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Close ticket without reason - shows confirmation first."""
         # Show confirmation view
-        confirm_view = ConfirmCloseView(close_callback=self._close_ticket)
+        confirm_view = ConfirmCloseView(close_callback=self._close_ticket, author_id=interaction.user.id)
         await interaction.response.send_message(
             "⚠️ Are you sure you want to close this ticket?",
             view=confirm_view,
@@ -527,15 +561,22 @@ class TicketControlView(discord.ui.View):
             )
             return
 
-        # Update database only after successfully closing thread
+        # Update database and cancel reminders atomically after successfully closing thread
         async with aiosqlite.connect(get_db_path()) as db:
-            await db.execute(
+            cursor = await db.execute(
                 """UPDATE tickets
                 SET status = 'closed', closed_by = ?, close_reason = ?, closed_at = datetime('now')
-                WHERE thread_id = ?""",
+                WHERE thread_id = ? AND status = 'open'""",
                 (interaction.user.id, reason, thread.id)
             )
+            if cursor.rowcount == 0:
+                logger.warning(f"Ticket {thread.id} was already closed by another user")
+            await db.execute(
+                "UPDATE ticket_reminders SET active = 0 WHERE ticket_thread_id = ? AND active = 1",
+                (thread.id,)
+            )
             await db.commit()
+            logger.info(f"Closed ticket {thread.id} and cancelled reminders")
 
         # Log to log channel
         config = get_tickets_config()
@@ -558,25 +599,244 @@ class TicketControlView(discord.ui.View):
                 except discord.HTTPException as e:
                     logger.error(f"Failed to log ticket closure: {e}")
 
-        # Cancel any active reminders for this ticket
-        try:
-            async with aiosqlite.connect(get_db_path()) as db:
-                await db.execute(
-                    "UPDATE ticket_reminders SET active = 0 WHERE ticket_thread_id = ? AND active = 1",
-                    (thread.id,)
+
+async def _stop_reminder(interaction: discord.Interaction, reminder_id: int):
+    """Stop a reminder by ID. Shared logic for DynamicItem and legacy views."""
+    try:
+        async with aiosqlite.connect(get_db_path()) as db:
+            cursor = await db.execute(
+                "SELECT user_id FROM ticket_reminders WHERE id = ?",
+                (reminder_id,)
+            )
+            row = await cursor.fetchone()
+
+            if not row:
+                await interaction.response.send_message(
+                    "❌ Reminder not found.",
+                    ephemeral=True
                 )
-                await db.commit()
-                logger.info(f"Cancelled reminders for ticket {thread.id}")
-        except Exception as e:
-            logger.error(f"Failed to cancel reminders: {e}")
+                return
+
+            if row[0] != interaction.user.id:
+                await interaction.response.send_message(
+                    "❌ You can only stop your own reminders.",
+                    ephemeral=True
+                )
+                return
+
+            await db.execute(
+                "UPDATE ticket_reminders SET active = 0 WHERE id = ?",
+                (reminder_id,)
+            )
+            await db.commit()
+
+        # Send acknowledgement BEFORE attempting message deletion
+        await interaction.response.send_message("🔕 Reminder stopped.", ephemeral=True)
+
+        try:
+            await interaction.message.delete()
+            logger.info(f"Deleted reminder message after user {interaction.user.id} stopped reminder {reminder_id}")
+        except discord.HTTPException as e:
+            logger.error(f"Failed to delete reminder message: {e}")
+
+    except Exception as e:
+        logger.error(f"Error stopping reminder: {e}")
+        if not interaction.response.is_done():
+            await interaction.response.send_message(
+                "❌ Failed to stop reminder.",
+                ephemeral=True
+            )
 
 
-class ReminderControlView(discord.ui.View):
-    """View with Stop and Snooze buttons for ticket reminders."""
+async def _snooze_reminder(interaction: discord.Interaction, reminder_id: int, seconds: int):
+    """Snooze a reminder by ID. Shared logic for DynamicItem and legacy views."""
+    try:
+        from datetime import datetime, timedelta, timezone
+
+        async with aiosqlite.connect(get_db_path()) as db:
+            cursor = await db.execute(
+                "SELECT user_id FROM ticket_reminders WHERE id = ?",
+                (reminder_id,)
+            )
+            row = await cursor.fetchone()
+
+            if not row:
+                await interaction.response.send_message(
+                    "❌ Reminder not found.",
+                    ephemeral=True
+                )
+                return
+
+            if row[0] != interaction.user.id:
+                await interaction.response.send_message(
+                    "❌ You can only snooze your own reminders.",
+                    ephemeral=True
+                )
+                return
+
+            new_time = datetime.now(timezone.utc) - timedelta(seconds=86400 - seconds)
+
+            await db.execute(
+                "UPDATE ticket_reminders SET last_reminded_at = ? WHERE id = ?",
+                (new_time.strftime('%Y-%m-%d %H:%M:%S'), reminder_id)
+            )
+            await db.commit()
+
+        if seconds < 3600:
+            duration = f"{seconds // 60}m"
+        elif seconds < 86400:
+            duration = f"{seconds // 3600}h"
+        else:
+            duration = f"{seconds // 86400}d"
+
+        # Send acknowledgement BEFORE attempting message deletion
+        await interaction.response.send_message(f"⏰ Reminder snoozed for {duration}.", ephemeral=True)
+
+        try:
+            await interaction.message.delete()
+            logger.info(f"Deleted reminder message after user {interaction.user.id} snoozed reminder {reminder_id} for {seconds}s")
+        except discord.HTTPException as e:
+            logger.error(f"Failed to delete reminder message: {e}")
+
+    except Exception as e:
+        logger.error(f"Error snoozing reminder: {e}")
+        if not interaction.response.is_done():
+            await interaction.response.send_message(
+                "❌ Failed to snooze reminder.",
+                ephemeral=True
+            )
+
+
+# --- DynamicItem reminder buttons (namespaced, survive bot restart) ---
+
+class ReminderStopButton(discord.ui.DynamicItem[discord.ui.Button],
+                          template=r'^oak:tickets:reminder-stop:(?P<id>\d+)$'):
+    """Dynamic stop button that encodes reminder_id in the custom_id."""
 
     def __init__(self, reminder_id: int):
-        super().__init__(timeout=None)
+        super().__init__(discord.ui.Button(
+            label="Stop Reminders",
+            style=discord.ButtonStyle.danger,
+            custom_id=f"oak:tickets:reminder-stop:{reminder_id}"
+        ))
         self.reminder_id = reminder_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(reminder_id=int(match['id']))
+
+    async def callback(self, interaction: discord.Interaction):
+        await _stop_reminder(interaction, self.reminder_id)
+
+
+class ReminderSnooze1hButton(discord.ui.DynamicItem[discord.ui.Button],
+                              template=r'^oak:tickets:snooze-1h:(?P<id>\d+)$'):
+    """Dynamic snooze 1h button that encodes reminder_id in the custom_id."""
+
+    def __init__(self, reminder_id: int):
+        super().__init__(discord.ui.Button(
+            label="Snooze 1h",
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"oak:tickets:snooze-1h:{reminder_id}"
+        ))
+        self.reminder_id = reminder_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(reminder_id=int(match['id']))
+
+    async def callback(self, interaction: discord.Interaction):
+        await _snooze_reminder(interaction, self.reminder_id, 3600)
+
+
+class ReminderSnooze6hButton(discord.ui.DynamicItem[discord.ui.Button],
+                              template=r'^oak:tickets:snooze-6h:(?P<id>\d+)$'):
+    """Dynamic snooze 6h button that encodes reminder_id in the custom_id."""
+
+    def __init__(self, reminder_id: int):
+        super().__init__(discord.ui.Button(
+            label="Snooze 6h",
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"oak:tickets:snooze-6h:{reminder_id}"
+        ))
+        self.reminder_id = reminder_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(reminder_id=int(match['id']))
+
+    async def callback(self, interaction: discord.Interaction):
+        await _snooze_reminder(interaction, self.reminder_id, 21600)
+
+
+class ReminderSnooze1dButton(discord.ui.DynamicItem[discord.ui.Button],
+                              template=r'^oak:tickets:snooze-1d:(?P<id>\d+)$'):
+    """Dynamic snooze 1d button that encodes reminder_id in the custom_id."""
+
+    def __init__(self, reminder_id: int):
+        super().__init__(discord.ui.Button(
+            label="Snooze 1d",
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"oak:tickets:snooze-1d:{reminder_id}"
+        ))
+        self.reminder_id = reminder_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(reminder_id=int(match['id']))
+
+    async def callback(self, interaction: discord.Interaction):
+        await _snooze_reminder(interaction, self.reminder_id, 86400)
+
+
+def build_reminder_view(reminder_id: int) -> discord.ui.View:
+    """Build a View with all 4 DynamicItem reminder buttons."""
+    view = discord.ui.View(timeout=None)
+    view.add_item(ReminderStopButton(reminder_id))
+    view.add_item(ReminderSnooze1hButton(reminder_id))
+    view.add_item(ReminderSnooze6hButton(reminder_id))
+    view.add_item(ReminderSnooze1dButton(reminder_id))
+    return view
+
+
+# --- Legacy reminder view for old messages with static custom_ids ---
+
+async def _lookup_legacy_reminder_id(interaction: discord.Interaction) -> int | None:
+    """Look up reminder_id from the message that was interacted with."""
+    try:
+        async with aiosqlite.connect(get_db_path()) as db:
+            cursor = await db.execute(
+                "SELECT id FROM ticket_reminders WHERE last_reminder_message_id = ? AND active = 1",
+                (interaction.message.id,)
+            )
+            row = await cursor.fetchone()
+            if row:
+                return row[0]
+    except Exception as e:
+        logger.error(f"Failed to look up legacy reminder: {e}")
+    return None
+
+
+class LegacyReminderView(discord.ui.View):
+    """Backwards-compat view for old reminder messages with static custom_ids."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def _resolve_or_fail(self, interaction: discord.Interaction) -> int | None:
+        """Resolve reminder_id or send error."""
+        reminder_id = await _lookup_legacy_reminder_id(interaction)
+        if reminder_id is None:
+            logger.warning(
+                f"Legacy reminder lookup failed: message_id={interaction.message.id} "
+                f"channel_id={interaction.channel.id}"
+            )
+            await interaction.response.send_message(
+                "This reminder is from an old message and can no longer be resolved. "
+                "Please set a new reminder.",
+                ephemeral=True
+            )
+        return reminder_id
 
     @discord.ui.button(
         label="Stop Reminders",
@@ -584,52 +844,9 @@ class ReminderControlView(discord.ui.View):
         custom_id="reminder_stop"
     )
     async def stop_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        """Stop all reminders for this ticket."""
-        try:
-            async with aiosqlite.connect(get_db_path()) as db:
-                # Verify user owns this reminder
-                cursor = await db.execute(
-                    "SELECT user_id FROM ticket_reminders WHERE id = ?",
-                    (self.reminder_id,)
-                )
-                row = await cursor.fetchone()
-
-                if not row:
-                    await interaction.response.send_message(
-                        "❌ Reminder not found.",
-                        ephemeral=True
-                    )
-                    return
-
-                if row[0] != interaction.user.id:
-                    await interaction.response.send_message(
-                        "❌ You can only stop your own reminders.",
-                        ephemeral=True
-                    )
-                    return
-
-                # Deactivate reminder
-                await db.execute(
-                    "UPDATE ticket_reminders SET active = 0 WHERE id = ?",
-                    (self.reminder_id,)
-                )
-                await db.commit()
-
-            # Delete the reminder message
-            try:
-                await interaction.message.delete()
-                logger.info(f"Deleted reminder message after user {interaction.user.id} stopped reminder {self.reminder_id}")
-            except discord.HTTPException as e:
-                logger.error(f"Failed to delete reminder message: {e}")
-                # Fallback: just acknowledge
-                await interaction.response.send_message("🔕 Reminder stopped.", ephemeral=True)
-
-        except Exception as e:
-            logger.error(f"Error stopping reminder: {e}")
-            await interaction.response.send_message(
-                "❌ Failed to stop reminder.",
-                ephemeral=True
-            )
+        reminder_id = await self._resolve_or_fail(interaction)
+        if reminder_id is not None:
+            await _stop_reminder(interaction, reminder_id)
 
     @discord.ui.button(
         label="Snooze 1h",
@@ -637,8 +854,9 @@ class ReminderControlView(discord.ui.View):
         custom_id="reminder_snooze_1h"
     )
     async def snooze_1h_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        """Snooze reminder for 1 hour."""
-        await self._snooze_reminder(interaction, 3600)
+        reminder_id = await self._resolve_or_fail(interaction)
+        if reminder_id is not None:
+            await _snooze_reminder(interaction, reminder_id, 3600)
 
     @discord.ui.button(
         label="Snooze 6h",
@@ -646,8 +864,9 @@ class ReminderControlView(discord.ui.View):
         custom_id="reminder_snooze_6h"
     )
     async def snooze_6h_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        """Snooze reminder for 6 hours."""
-        await self._snooze_reminder(interaction, 21600)
+        reminder_id = await self._resolve_or_fail(interaction)
+        if reminder_id is not None:
+            await _snooze_reminder(interaction, reminder_id, 21600)
 
     @discord.ui.button(
         label="Snooze 1d",
@@ -655,75 +874,6 @@ class ReminderControlView(discord.ui.View):
         custom_id="reminder_snooze_1d"
     )
     async def snooze_1d_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        """Snooze reminder for 1 day."""
-        await self._snooze_reminder(interaction, 86400)
-
-    async def _snooze_reminder(self, interaction: discord.Interaction, seconds: int):
-        """
-        Snooze a reminder for the specified number of seconds.
-
-        Args:
-            interaction: Discord interaction
-            seconds: Number of seconds to snooze
-        """
-        try:
-            from datetime import datetime, timedelta, timezone
-
-            async with aiosqlite.connect(get_db_path()) as db:
-                # Verify user owns this reminder
-                cursor = await db.execute(
-                    "SELECT user_id FROM ticket_reminders WHERE id = ?",
-                    (self.reminder_id,)
-                )
-                row = await cursor.fetchone()
-
-                if not row:
-                    await interaction.response.send_message(
-                        "❌ Reminder not found.",
-                        ephemeral=True
-                    )
-                    return
-
-                if row[0] != interaction.user.id:
-                    await interaction.response.send_message(
-                        "❌ You can only snooze your own reminders.",
-                        ephemeral=True
-                    )
-                    return
-
-                # Calculate new reminder time
-                # Work backwards: next reminder should fire in 'seconds' time
-                # Since check is "last_reminded_at + 24h <= now", we need:
-                # last_reminded_at = now - (24h - snooze_duration)
-                new_time = datetime.now(timezone.utc) - timedelta(seconds=86400 - seconds)
-
-                # Update last_reminded_at to snooze
-                await db.execute(
-                    "UPDATE ticket_reminders SET last_reminded_at = ? WHERE id = ?",
-                    (new_time.strftime('%Y-%m-%d %H:%M:%S'), self.reminder_id)
-                )
-                await db.commit()
-
-            # Format snooze duration
-            if seconds < 3600:
-                duration = f"{seconds // 60}m"
-            elif seconds < 86400:
-                duration = f"{seconds // 3600}h"
-            else:
-                duration = f"{seconds // 86400}d"
-
-            # Delete the reminder message
-            try:
-                await interaction.message.delete()
-                logger.info(f"Deleted reminder message after user {interaction.user.id} snoozed reminder {self.reminder_id} for {seconds}s")
-            except discord.HTTPException as e:
-                logger.error(f"Failed to delete reminder message: {e}")
-                # Fallback: just acknowledge
-                await interaction.response.send_message(f"⏰ Reminder snoozed for {duration}.", ephemeral=True)
-
-        except Exception as e:
-            logger.error(f"Error snoozing reminder: {e}")
-            await interaction.response.send_message(
-                "❌ Failed to snooze reminder.",
-                ephemeral=True
-            )
+        reminder_id = await self._resolve_or_fail(interaction)
+        if reminder_id is not None:
+            await _snooze_reminder(interaction, reminder_id, 86400)

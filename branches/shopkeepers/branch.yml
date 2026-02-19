@@ -1,0 +1,6 @@
+id: shopkeepers
+name: Shopkeepers
+version: "1.0.0"
+description: Market analysis for Minecraft trade data
+main: branch.Shopkeepers
+database: true

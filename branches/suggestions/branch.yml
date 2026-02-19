@@ -1,0 +1,6 @@
+id: suggestions
+name: Suggestions
+version: "1.0.0"
+description: User suggestions with voting and management
+main: branch.Suggestions
+database: true

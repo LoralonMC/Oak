@@ -63,6 +63,9 @@ def is_staff(interaction: discord.Interaction, staff_role_ids: list = None) -> b
     Returns:
         True if user is staff, False otherwise
     """
+    if interaction.guild is None:
+        return False
+
     if staff_role_ids is None:
         staff_role_ids = get_staff_role_ids()
 
@@ -89,6 +92,9 @@ def can_manage_ticket_category(interaction: discord.Interaction, category: str) 
     Returns:
         True if user can manage this category, False otherwise
     """
+    if interaction.guild is None:
+        return False
+
     # Administrators always have access
     if interaction.user.guild_permissions.administrator:
         return True
@@ -123,6 +129,9 @@ def can_bypass_duplicate_check(interaction: discord.Interaction) -> bool:
     Returns:
         True if user can bypass duplicate check, False otherwise
     """
+    if interaction.guild is None:
+        return False
+
     config = get_tickets_config()
     bypass_role_ids = config.get("settings", {}).get("bypass_duplicate_check_role_ids", [])
 
@@ -138,6 +147,8 @@ def sanitize_name(name: str, user_id: int = None) -> str:
     """
     Sanitize username for use in thread names.
 
+    Supports Unicode characters (accented letters, CJK, etc.).
+
     Args:
         name: The name to sanitize
         user_id: User ID for fallback (optional)
@@ -145,8 +156,17 @@ def sanitize_name(name: str, user_id: int = None) -> str:
     Returns:
         Sanitized name safe for Discord thread names
     """
-    # Remove special characters, keep alphanumeric, -, _
-    sanitized = re.sub(r'[^a-zA-Z0-9\-_]', '', name)
+    # Convert spaces to hyphens first
+    sanitized = name.replace(' ', '-')
+
+    # Remove special characters, keep word characters (Unicode-aware) and hyphens
+    sanitized = re.sub(r'[^\w\-]', '', sanitized)
+
+    # Collapse multiple consecutive hyphens into one
+    sanitized = re.sub(r'-+', '-', sanitized)
+
+    # Strip leading/trailing hyphens
+    sanitized = sanitized.strip('-')
 
     # Limit length to 100 characters (Discord's thread name limit)
     sanitized = sanitized[:100]
@@ -272,6 +292,8 @@ def validate_config(config: dict) -> tuple:
         errors.append("staff_role_ids must be a list")
     elif not staff_roles:
         errors.append("No staff roles configured")
+    elif staff_roles == [0]:
+        errors.append("staff_role_ids contains placeholder value [0] - replace with actual role IDs")
 
     # Validate categories
     categories = settings.get('categories', {})
@@ -439,6 +461,10 @@ def parse_time_string(time_str: str) -> int:
         value = int(match.group(1))
         unit = match.group(2)
 
+        # Reject zero durations
+        if value == 0:
+            return None
+
         # Enforce reasonable limits (max 30 days)
         if unit == 'm':  # minutes
             if value > 43200:  # 30 days in minutes
@@ -457,6 +483,9 @@ def parse_time_string(time_str: str) -> int:
     match = re.match(r'^(\d+)$', time_str)
     if match:
         value = int(match.group(1))
+        # Reject zero durations
+        if value == 0:
+            return None
         if value > 43200:  # 30 days in minutes
             return None
         return value * 60  # Assume minutes

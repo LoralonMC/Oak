@@ -1,10 +1,11 @@
+"""Link branch — displays account linking instructions."""
+
 import discord
 from discord.ext import commands
-from pathlib import Path
-import logging
-logger = logging.getLogger(__name__)
 
-# Default configuration
+from oak import OakBranch
+from oak.context import BranchContext
+
 DEFAULT_CONFIG = {
     "enabled": True,
     "version": "1.0.0",
@@ -19,40 +20,26 @@ DEFAULT_CONFIG = {
                 "3. Send the code you receive to the Discord bot\n\n"
                 "Once linked, your Discord roles will sync with your in-game ranks."
             ),
-            "color": 0xA180D0  # Purple color
+            "color": 0xA180D0,
         }
-    }
+    },
 }
 
-class Link(commands.Cog):
+
+class Link(OakBranch):
     """Discord to Minecraft account linking information."""
 
-    def __init__(self, bot: commands.Bot) -> None:
-        self.bot = bot
-
-        # Load config
-        self.config = self.load_config()
-
-        # Load embed settings
-        embed_settings = self.config.get("settings", {}).get("embed", {})
-        self.embed_title: str = embed_settings.get("title", DEFAULT_CONFIG["settings"]["embed"]["title"])
-        self.embed_description: str = embed_settings.get("description", DEFAULT_CONFIG["settings"]["embed"]["description"])
-        self.embed_color: int = embed_settings.get("color", DEFAULT_CONFIG["settings"]["embed"]["color"])
-
-        logger.info("Link branch initialized")
-
-    def load_config(self) -> dict:
-        """Load config from config.yml in this branch's folder."""
-        from utils import load_branch_config
-        config_path = Path(__file__).parent / "config.yml"
-        return load_branch_config(config_path, DEFAULT_CONFIG, "Link")
+    def __init__(self, ctx: BranchContext):
+        super().__init__(ctx)
 
     @commands.command(name="link")
+    @commands.guild_only()
+    @commands.cooldown(1, 10, commands.BucketType.user)
     async def link_command(self, ctx: commands.Context) -> None:
         """Display account linking instructions."""
         embed = discord.Embed(
-            title=self.embed_title,
-            description=self.embed_description,
-            color=self.embed_color
+            title=self.setting("embed", "title", default="Account Linking Guide"),
+            description=self.setting("embed", "description", default=""),
+            color=self.setting("embed", "color", default=0xA180D0),
         )
         await ctx.send(embed=embed)

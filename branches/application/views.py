@@ -24,11 +24,42 @@ STATUS_EMOJI = {
 }
 
 
+_CONTINUE_ID_MAP = {
+    "continue_application": "oak:application:continue",
+}
+
+_POST_SUBMISSION_ID_MAP = {
+    "admin_read": "oak:application:read",
+    "admin_manage": "oak:application:manage",
+}
+
+_MANAGE_ID_MAP = {
+    "admin_accept": "oak:application:accept",
+    "admin_move": "oak:application:move",
+    "admin_decline": "oak:application:decline",
+    "admin_bgcheck": "oak:application:bgcheck",
+    "admin_view_history": "oak:application:history",
+}
+
+_START_CANCEL_ID_MAP = {
+    "start_application": "oak:application:start",
+    "cancel_application": "oak:application:cancel",
+}
+
+_APP_BUTTON_ID_MAP = {
+    "apply_button": "oak:application:apply",
+}
+
+
 class ContinueView(View):
     """View with Continue button for multi-page applications."""
 
-    def __init__(self, step: int = 0, answers: list = None, get_config_func=None, get_questions_func=None, get_db_path_func=None):
+    def __init__(self, step: int = 0, answers: list = None, get_config_func=None, get_questions_func=None, get_db_path_func=None, *, legacy: bool = False):
         super().__init__(timeout=None)
+        if not legacy:
+            for child in self.children:
+                if hasattr(child, 'custom_id') and child.custom_id in _CONTINUE_ID_MAP:
+                    child.custom_id = _CONTINUE_ID_MAP[child.custom_id]
         self.step = step
         self.answers = answers if answers is not None else []
         self.get_config = get_config_func
@@ -38,13 +69,41 @@ class ContinueView(View):
     @button(label="Continue", style=discord.ButtonStyle.green, custom_id="continue_application")
     async def continue_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         from .modals import ApplicationModal
+        from .helpers import get_application_config, get_application_questions, get_db_path
+
+        # Post-restart recovery: callback functions may be None after bot restart
+        config_func = self.get_config if self.get_config else get_application_config
+        questions_func = self.get_questions if self.get_questions else get_application_questions
+        db_path_func = self.get_db_path if self.get_db_path else get_db_path
+
+        step = self.step
+        answers = self.answers
+
+        # If answers are empty (lost after restart), recover partial answers from DB
+        if not answers and db_path_func:
+            try:
+                async with aiosqlite.connect(db_path_func()) as db:
+                    async with db.execute(
+                        "SELECT answers FROM applications WHERE channel_id = ?",
+                        (interaction.channel.id,)
+                    ) as cursor:
+                        row = await cursor.fetchone()
+                    if row and row[0]:
+                        answers = json.loads(row[0])
+                        # Calculate which modal step to resume from
+                        questions_per_page = 5
+                        step = len(answers) // questions_per_page
+                        logger.info(f"Recovered {len(answers)} partial answers from DB, resuming at step {step}")
+            except Exception as e:
+                logger.error(f"Failed to recover partial answers from DB: {e}")
+
         await interaction.response.send_modal(
             ApplicationModal(
-                step=self.step,
-                answers=self.answers,
-                get_config_func=self.get_config,
-                get_questions_func=self.get_questions,
-                get_db_path_func=self.get_db_path
+                step=step,
+                answers=answers,
+                get_config_func=config_func,
+                get_questions_func=questions_func,
+                get_db_path_func=db_path_func
             )
         )
 
@@ -52,8 +111,12 @@ class ContinueView(View):
 class PostSubmissionView(View):
     """View with Read and Manage buttons for submitted applications."""
 
-    def __init__(self, get_db_path_func=None):
+    def __init__(self, get_db_path_func=None, *, legacy: bool = False):
         super().__init__(timeout=None)
+        if not legacy:
+            for child in self.children:
+                if hasattr(child, 'custom_id') and child.custom_id in _POST_SUBMISSION_ID_MAP:
+                    child.custom_id = _POST_SUBMISSION_ID_MAP[child.custom_id]
         self.get_db_path = get_db_path_func
 
     @button(label="Read", style=discord.ButtonStyle.gray, custom_id="admin_read")
@@ -75,7 +138,8 @@ class PostSubmissionView(View):
 
             applicant_id, answers_json = row
             answers = json.loads(answers_json)
-            applicant = interaction.guild.get_member(applicant_id) or interaction.user
+            # get_member may return None if the user left the server
+            applicant = interaction.guild.get_member(applicant_id)
 
             embeds = paginate_application_embed(applicant, answers, get_application_questions)
 
@@ -149,31 +213,78 @@ class PostSubmissionView(View):
 class ManageView(View):
     """View with management actions for applications (Accept, Decline, Background Check, etc.)."""
 
-    def __init__(self, get_db_path_func=None):
+    def __init__(self, get_db_path_func=None, *, legacy: bool = False):
         super().__init__(timeout=None)
+        if not legacy:
+            for child in self.children:
+                if hasattr(child, 'custom_id') and child.custom_id in _MANAGE_ID_MAP:
+                    child.custom_id = _MANAGE_ID_MAP[child.custom_id]
         self.get_db_path = get_db_path_func
+
+    async def _check_staff(self, interaction: discord.Interaction) -> bool:
+        """Check if the interacting user has staff permissions.
+
+        Returns True if authorized, False otherwise (sends ephemeral denial message).
+        """
+        from .helpers import is_staff
+        if not is_staff(interaction.user):
+            await interaction.response.send_message(
+                embed=discord.Embed(
+                    description="You do not have permission to manage applications.",
+                    color=get_embed_colors()["error"]
+                ),
+                ephemeral=True
+            )
+            return False
+        return True
 
     @button(label="Accept", style=discord.ButtonStyle.success, custom_id="admin_accept")
     async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Accept button - accepts the application."""
+        if not await self._check_staff(interaction):
+            return
+
+        # Defer first since acceptance involves multiple slow operations
+        await interaction.response.defer(ephemeral=True)
+
         async with aiosqlite.connect(self.get_db_path()) as db:
             async with db.execute(
-                "SELECT user_id FROM applications WHERE channel_id = ?",
+                "SELECT user_id, status FROM applications WHERE channel_id = ?",
                 (interaction.channel.id,)
             ) as cursor:
                 row = await cursor.fetchone()
 
             if not row:
-                await interaction.response.send_message("No application data found.", ephemeral=True)
+                await interaction.followup.send("No application data found.", ephemeral=True)
                 return
 
-            applicant_id = row[0]
+            applicant_id, current_status = row
 
-            # Update application status to accepted
-            await db.execute(
-                "UPDATE applications SET status = 'accepted' WHERE channel_id = ?",
+            # Only accept applications that are currently pending
+            if current_status != 'pending':
+                await interaction.followup.send(
+                    embed=discord.Embed(
+                        description=f"Cannot accept: application status is **{current_status}**, expected **pending**.",
+                        color=get_embed_colors()["error"]
+                    ),
+                    ephemeral=True
+                )
+                return
+
+            # Use WHERE status = 'pending' to prevent double-acceptance race condition
+            cursor = await db.execute(
+                "UPDATE applications SET status = 'accepted' WHERE channel_id = ? AND status = 'pending'",
                 (interaction.channel.id,)
             )
+            if cursor.rowcount == 0:
+                await interaction.followup.send(
+                    embed=discord.Embed(
+                        description="Application was already processed by another reviewer.",
+                        color=get_embed_colors()["warning"]
+                    ),
+                    ephemeral=True
+                )
+                return
             await db.commit()
 
         applicant = interaction.guild.get_member(applicant_id)
@@ -184,7 +295,7 @@ class ManageView(View):
             try:
                 await applicant.send(
                     embed=discord.Embed(
-                        title="🎉 Congratulations! You've Been Accepted.",
+                        title="Congratulations! You've Been Accepted.",
                         description=(
                             "Your application has been **accepted**!\n\n"
                             "A staff member will reach out to arrange your next steps. Welcome aboard, and thank you for your interest in helping our community!\n\n"
@@ -200,7 +311,7 @@ class ManageView(View):
         await interaction.channel.send(
             embed=discord.Embed(
                 title="Application Accepted",
-                description=f"🎉 <@{applicant_id}>, your application has been accepted!\nA staff member will reach out to arrange your next steps.",
+                description=f"<@{applicant_id}>, your application has been accepted!\nA staff member will reach out to arrange your next steps.",
                 color=get_embed_colors()["success"]
             )
         )
@@ -215,33 +326,49 @@ class ManageView(View):
         else:
             await interaction.channel.send(
                 embed=discord.Embed(
-                    description=f"✅ <@{applicant_id}> has been notified via DM.",
+                    description=f"<@{applicant_id}> has been notified via DM.",
                     color=get_embed_colors()["success"]
                 )
             )
 
-        await interaction.response.send_message("Application accepted!", ephemeral=True)
+        await interaction.followup.send("Application accepted!", ephemeral=True)
 
     @button(label="Move to Accepted", style=discord.ButtonStyle.blurple, custom_id="admin_move")
     async def move(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Move button - moves channel to accepted category."""
+        if not await self._check_staff(interaction):
+            return
+
         from .helpers import get_application_config
 
         config = get_application_config()
         accepted_category_id = config.get("settings", {}).get("accepted_category_id", 0)
+
+        if not accepted_category_id:
+            await interaction.response.send_message(
+                embed=discord.Embed(
+                    description="accepted_category_id is not configured.",
+                    color=get_embed_colors()["error"]
+                ),
+                ephemeral=True
+            )
+            return
+
         new_cat = discord.utils.get(interaction.guild.categories, id=accepted_category_id)
-        await interaction.channel.edit(category=new_cat)
-        await interaction.response.send_message("Moved to Accepted category.", ephemeral=True)
+        if not new_cat:
+            await interaction.response.send_message(
+                embed=discord.Embed(
+                    description=f"Accepted category (ID: {accepted_category_id}) not found in this server.",
+                    color=get_embed_colors()["error"]
+                ),
+                ephemeral=True
+            )
+            return
 
-    @button(label="Decline", style=discord.ButtonStyle.danger, custom_id="admin_decline")
-    async def decline(self, interaction: discord.Interaction, button: discord.ui.Button):
-        """Decline button - opens decline reason modal."""
-        from .modals import DeclineReasonModal
-
-        # Get applicant_id
+        # Verify application status is 'accepted' before moving
         async with aiosqlite.connect(self.get_db_path()) as db:
             async with db.execute(
-                "SELECT user_id FROM applications WHERE channel_id = ?",
+                "SELECT status FROM applications WHERE channel_id = ?",
                 (interaction.channel.id,)
             ) as cursor:
                 row = await cursor.fetchone()
@@ -250,12 +377,60 @@ class ManageView(View):
             await interaction.response.send_message("No application data found.", ephemeral=True)
             return
 
-        applicant_id = row[0]
+        if row[0] != 'accepted':
+            await interaction.response.send_message(
+                embed=discord.Embed(
+                    description=f"Cannot move: application status is **{row[0]}**, expected **accepted**.",
+                    color=get_embed_colors()["error"]
+                ),
+                ephemeral=True
+            )
+            return
+
+        await interaction.channel.edit(category=new_cat)
+        await interaction.response.send_message("Moved to Accepted category.", ephemeral=True)
+
+    @button(label="Decline", style=discord.ButtonStyle.danger, custom_id="admin_decline")
+    async def decline(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Decline button - opens decline reason modal."""
+        if not await self._check_staff(interaction):
+            return
+
+        from .modals import DeclineReasonModal
+
+        # Get applicant_id and check status
+        async with aiosqlite.connect(self.get_db_path()) as db:
+            async with db.execute(
+                "SELECT user_id, status FROM applications WHERE channel_id = ?",
+                (interaction.channel.id,)
+            ) as cursor:
+                row = await cursor.fetchone()
+
+        if not row:
+            await interaction.response.send_message("No application data found.", ephemeral=True)
+            return
+
+        applicant_id, current_status = row
+
+        # Only allow declining pending applications
+        if current_status != 'pending':
+            await interaction.response.send_message(
+                embed=discord.Embed(
+                    description=f"Cannot decline: application status is **{current_status}**, expected **pending**.",
+                    color=get_embed_colors()["error"]
+                ),
+                ephemeral=True
+            )
+            return
+
         await interaction.response.send_modal(DeclineReasonModal(applicant_id, get_db_path_func=self.get_db_path))
 
     @button(label="Background Check", style=discord.ButtonStyle.secondary, custom_id="admin_bgcheck")
     async def bgcheck(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Background Check button - displays playtime and punishment history."""
+        if not await self._check_staff(interaction):
+            return
+
         from .background_check import fetch_playtime_embed
         from .helpers import get_application_config
 
@@ -294,9 +469,18 @@ class ManageView(View):
             linked_threads = []
 
             if isinstance(punishment_channel, discord.ForumChannel):
+                # Search cached (active) threads
                 for thread in punishment_channel.threads:
                     if mc_name and mc_name.lower() in thread.name.lower():
                         linked_threads.append(thread)
+
+                # Also search archived threads
+                try:
+                    async for thread in punishment_channel.archived_threads(limit=100):
+                        if mc_name and mc_name.lower() in thread.name.lower():
+                            linked_threads.append(thread)
+                except discord.HTTPException as e:
+                    logger.warning(f"Failed to fetch archived threads: {e}")
 
             if linked_threads:
                 embed.add_field(
@@ -325,7 +509,9 @@ class ManageView(View):
     @button(label="View History", style=discord.ButtonStyle.secondary, custom_id="admin_view_history")
     async def view_history(self, interaction: discord.Interaction, button: discord.ui.Button):
         """View History button - shows user's previous applications."""
-        from .helpers import get_application_questions
+        if not await self._check_staff(interaction):
+            return
+
 
         # Get current applicant's user_id
         async with aiosqlite.connect(self.get_db_path()) as db:
@@ -366,7 +552,7 @@ class ManageView(View):
         # Create summary embed
         applicant = interaction.guild.get_member(applicant_id)
         summary_embed = discord.Embed(
-            title=f"📜 Application History: {applicant.display_name if applicant else 'Unknown User'}",
+            title=f"Application History: {applicant.display_name if applicant else 'Unknown User'}",
             description=f"Found **{len(previous_apps)}** previous application(s). Select one below to view full details.",
             color=get_embed_colors()["info"]
         )
@@ -376,7 +562,7 @@ class ManageView(View):
 
         for app_index, status, submitted_at, answers_json, channel_id, denied_at, denial_reason in previous_apps:
             # Format status with emoji
-            emoji = STATUS_EMOJI.get(status, "❓")
+            emoji = STATUS_EMOJI.get(status, "?")
 
             field_value = f"**Status:** {emoji} {status.title()}\n**Date:** {submitted_at[:10]}"
 
@@ -428,7 +614,7 @@ class ApplicationHistoryView(View):
         self.select_menu = discord.ui.Select(
             placeholder="Select an application to view full details...",
             options=options,
-            custom_id="history_select"
+            custom_id="oak:application:hist-select"
         )
         self.select_menu.callback = self.select_callback
         self.add_item(self.select_menu)
@@ -490,28 +676,41 @@ class StatusChangeView(View):
         self.app_index = app_index
         self.get_db_path = get_db_path_func
 
-    @button(label="Pending", style=discord.ButtonStyle.secondary, custom_id="status_pending", emoji="⏳")
+    @button(label="Pending", style=discord.ButtonStyle.secondary, emoji="⏳")
     async def set_pending(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._update_status(interaction, "pending")
 
-    @button(label="Accepted", style=discord.ButtonStyle.success, custom_id="status_accepted", emoji="✅")
+    @button(label="Accepted", style=discord.ButtonStyle.success, emoji="✅")
     async def set_accepted(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._update_status(interaction, "accepted")
 
-    @button(label="Denied", style=discord.ButtonStyle.danger, custom_id="status_denied", emoji="❌")
+    @button(label="Denied", style=discord.ButtonStyle.danger, emoji="❌")
     async def set_denied(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._update_status(interaction, "denied")
 
-    @button(label="Cancelled", style=discord.ButtonStyle.secondary, custom_id="status_cancelled", emoji="🚫")
+    @button(label="Cancelled", style=discord.ButtonStyle.secondary, emoji="🚫")
     async def set_cancelled(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._update_status(interaction, "cancelled")
 
-    @button(label="Abandoned", style=discord.ButtonStyle.secondary, custom_id="status_abandoned", emoji="⚠️")
+    @button(label="Abandoned", style=discord.ButtonStyle.secondary, emoji="⚠️")
     async def set_abandoned(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._update_status(interaction, "abandoned")
 
     async def _update_status(self, interaction: discord.Interaction, new_status: str):
         """Update application status in database without sending notifications."""
+        from .helpers import is_staff
+
+        # Staff permission check
+        if not is_staff(interaction.user):
+            await interaction.response.send_message(
+                embed=discord.Embed(
+                    description="You do not have permission to change application status.",
+                    color=get_embed_colors()["error"]
+                ),
+                ephemeral=True
+            )
+            return
+
         try:
             async with aiosqlite.connect(self.get_db_path()) as db:
                 # Update status for this specific application
@@ -520,6 +719,8 @@ class StatusChangeView(View):
                     (new_status, self.app_index)
                 )
                 await db.commit()
+
+            logger.info(f"Staff {interaction.user} changed app #{self.app_index} status to {new_status}")
 
             await interaction.response.send_message(
                 embed=discord.Embed(
@@ -545,8 +746,12 @@ class StatusChangeView(View):
 class StartCancelView(View):
     """View for starting or cancelling an application."""
 
-    def __init__(self, get_config_func=None, get_questions_func=None, get_db_path_func=None):
+    def __init__(self, get_config_func=None, get_questions_func=None, get_db_path_func=None, *, legacy: bool = False):
         super().__init__(timeout=None)
+        if not legacy:
+            for child in self.children:
+                if hasattr(child, 'custom_id') and child.custom_id in _START_CANCEL_ID_MAP:
+                    child.custom_id = _START_CANCEL_ID_MAP[child.custom_id]
         self.get_config = get_config_func
         self.get_questions = get_questions_func
         self.get_db_path = get_db_path_func
@@ -566,6 +771,41 @@ class StartCancelView(View):
 
     @button(label="Cancel", style=discord.ButtonStyle.red, custom_id="cancel_application")
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        from .helpers import get_db_path as _get_db_path
+        db_path_func = self.get_db_path if self.get_db_path else _get_db_path
+
+        # Verify the cancelling user is actually the applicant
+        try:
+            async with aiosqlite.connect(db_path_func()) as db:
+                async with db.execute(
+                    "SELECT user_id FROM applications WHERE channel_id = ?",
+                    (interaction.channel.id,)
+                ) as cursor:
+                    row = await cursor.fetchone()
+
+                if not row:
+                    await interaction.response.send_message("No application data found.", ephemeral=True)
+                    return
+
+                if row[0] != interaction.user.id:
+                    await interaction.response.send_message(
+                        embed=discord.Embed(
+                            description="Only the applicant can cancel their own application.",
+                            color=get_embed_colors()["error"]
+                        ),
+                        ephemeral=True
+                    )
+                    return
+
+                # Update DB status to cancelled before deleting the channel
+                await db.execute(
+                    "UPDATE applications SET status = 'cancelled' WHERE channel_id = ?",
+                    (interaction.channel.id,)
+                )
+                await db.commit()
+        except Exception as e:
+            logger.error(f"Error during cancel DB update: {e}")
+
         await interaction.response.send_message(
             embed=discord.Embed(
                 title="Application Cancelled",
@@ -574,14 +814,22 @@ class StartCancelView(View):
             ),
             ephemeral=True
         )
-        await interaction.channel.delete()
+
+        try:
+            await interaction.channel.delete(reason=f"Application cancelled by {interaction.user}")
+        except discord.HTTPException as e:
+            logger.error(f"Failed to delete cancelled application channel: {e}")
 
 
 class ApplicationButtonView(View):
     """View with the main Apply button."""
 
-    def __init__(self, handle_application_start_func):
+    def __init__(self, handle_application_start_func, *, legacy: bool = False):
         super().__init__(timeout=None)
+        if not legacy:
+            for child in self.children:
+                if hasattr(child, 'custom_id') and child.custom_id in _APP_BUTTON_ID_MAP:
+                    child.custom_id = _APP_BUTTON_ID_MAP[child.custom_id]
         self._creating_users = set()
         self.handle_application_start = handle_application_start_func
 

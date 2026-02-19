@@ -8,15 +8,15 @@ from discord import app_commands
 from discord.ext import commands, tasks
 import aiosqlite
 import asyncio
-import logging
-from pathlib import Path
-from database import init_branch_database
+import time
+
+from oak import OakBranch
+from oak.context import BranchContext
 
 from .helpers import (
     get_db_path,
     get_tickets_config,
     get_embed_colors,
-    get_staff_role_ids,
     is_staff,
     can_manage_ticket_category,
     hash_config,
@@ -24,11 +24,17 @@ from .helpers import (
     format_log_embed,
     get_next_ticket_number
 )
-from .views import TicketPanelView, TicketControlView
+from .views import (
+    TicketPanelView,
+    TicketControlView,
+    LegacyReminderView,
+    ReminderStopButton,
+    ReminderSnooze1hButton,
+    ReminderSnooze6hButton,
+    ReminderSnooze1dButton,
+    build_reminder_view,
+)
 
-logger = logging.getLogger(__name__)
-
-# Database schema for tickets
 TICKETS_SCHEMA = """
 CREATE TABLE IF NOT EXISTS tickets (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -86,70 +92,79 @@ ON ticket_reminders(ticket_thread_id, user_id) WHERE active = 1;
 """
 
 
-class Tickets(commands.Cog):
+class Tickets(OakBranch):
     """Thread-based support ticket system."""
 
-    def __init__(self, bot):
-        self.bot = bot
+    def __init__(self, ctx: BranchContext):
+        super().__init__(ctx)
         self.db_path = get_db_path()
         self.config = get_tickets_config()
 
-        # Validate config
         is_valid, errors = validate_config(self.config)
         if not is_valid:
-            logger.error(f"Tickets config validation failed: {errors}")
+            self.log.error(f"Tickets config validation failed: {errors}")
             for error in errors:
-                logger.error(f"  - {error}")
+                self.log.error(f"  - {error}")
 
-        # Cache settings
         settings = self.config.get("settings", {})
         self.ticket_panel_channel_id = settings.get("ticket_panel_channel_id", 0)
         self.log_channel_id = settings.get("log_channel_id", 0)
         self.staff_role_ids = settings.get("staff_role_ids", [])
 
-        # Anti-archive settings
         anti_archive = settings.get("anti_archive", {})
         self.anti_archive_enabled = anti_archive.get("enabled", True)
         self.anti_archive_interval = anti_archive.get("check_interval_minutes", 30)
 
-        logger.info(f"Tickets branch initialized (db: {self.db_path})")
+        if self.staff_role_ids == [0]:
+            self.log.warning("staff_role_ids contains placeholder value [0] - replace with actual role IDs")
 
-    async def cog_load(self):
+        self._thread_update_times: dict[int, float] = {}
+        self._registered_views: list = []
+
+        self.log.info(f"Tickets branch initialized (db: {self.db_path})")
+
+    async def on_enable(self):
         """Initialize database and register persistent views."""
-        await init_branch_database(self.db_path, TICKETS_SCHEMA, "Tickets")
+        if self.db:
+            await self.db.initialize(TICKETS_SCHEMA)
 
-        # Run migrations for existing databases
         await self._run_migrations()
 
-        # Reload config values (important for hot-reload support)
         self.config = get_tickets_config()
         settings = self.config.get("settings", {})
         self.ticket_panel_channel_id = settings.get("ticket_panel_channel_id", 0)
         self.log_channel_id = settings.get("log_channel_id", 0)
         self.staff_role_ids = settings.get("staff_role_ids", [])
 
-        # Reload anti-archive settings
         anti_archive = settings.get("anti_archive", {})
         self.anti_archive_enabled = anti_archive.get("enabled", True)
         self.anti_archive_interval = anti_archive.get("check_interval_minutes", 30)
 
-        # Register persistent views
-        logger.info("Registering persistent views for Tickets")
-        self.bot.add_view(TicketPanelView())
-        self.bot.add_view(TicketControlView())
-        # Note: ReminderControlView is created with reminder_id, so we register it when sending reminders
+        self.log.info("Registering persistent views for Tickets")
+        panel_view = TicketPanelView()
+        panel_view_legacy = TicketPanelView(legacy=True)
+        control_view = TicketControlView()
+        control_view_legacy = TicketControlView(legacy=True)
+        legacy_reminder_view = LegacyReminderView()
+        self.bot.add_view(panel_view_legacy)
+        self.bot.add_view(panel_view)
+        self.bot.add_view(control_view_legacy)
+        self.bot.add_view(control_view)
+        self.bot.add_view(legacy_reminder_view)
+        self._registered_views = [panel_view_legacy, panel_view, control_view_legacy, control_view, legacy_reminder_view]
+        self.bot.add_dynamic_items(
+            ReminderStopButton, ReminderSnooze1hButton,
+            ReminderSnooze6hButton, ReminderSnooze1dButton
+        )
 
-        # Start anti-archive task if enabled
         if self.anti_archive_enabled:
             self.anti_archive_task.change_interval(minutes=self.anti_archive_interval)
             self.anti_archive_task.start()
-            logger.info(f"Anti-archive task started (interval: {self.anti_archive_interval} minutes)")
+            self.log.info(f"Anti-archive task started (interval: {self.anti_archive_interval} minutes)")
 
-        # Start reminder check task
         self.check_reminders_task.start()
-        logger.info("Reminder check task started (interval: 1 minute)")
+        self.log.info("Reminder check task started (interval: 1 minute)")
 
-    @commands.Cog.listener()
     async def on_ready(self):
         """Validate panel after bot is connected and channel cache is populated."""
         await self.validate_panel()
@@ -158,27 +173,29 @@ class Tickets(commands.Cog):
         """Run database migrations for existing databases."""
         try:
             async with aiosqlite.connect(self.db_path) as db:
-                # Check if last_reminder_message_id column exists
                 cursor = await db.execute("PRAGMA table_info(ticket_reminders)")
                 columns = [row[1] async for row in cursor]
 
                 if 'last_reminder_message_id' not in columns:
-                    logger.info("Running migration: Adding last_reminder_message_id column to ticket_reminders")
+                    self.log.info("Running migration: Adding last_reminder_message_id column to ticket_reminders")
                     await db.execute(
                         "ALTER TABLE ticket_reminders ADD COLUMN last_reminder_message_id INTEGER"
                     )
                     await db.commit()
-                    logger.info("Migration completed successfully")
+                    self.log.info("Migration completed successfully")
         except Exception as e:
-            logger.error(f"Error running migrations: {e}", exc_info=True)
+            self.log.error(f"Error running migrations: {e}", exc_info=True)
 
-    async def cog_unload(self):
-        """Stop background tasks."""
+    async def on_disable(self):
+        """Stop background tasks and remove persistent views."""
         if self.anti_archive_task.is_running():
             self.anti_archive_task.cancel()
         if self.check_reminders_task.is_running():
             self.check_reminders_task.cancel()
-        logger.info("Tickets branch unloaded")
+        for view in self._registered_views:
+            view.stop()
+        self._registered_views.clear()
+        self.log.info("Tickets branch unloaded")
 
     async def validate_panel(self):
         """Validate that panel message exists and is up to date."""
@@ -196,52 +213,46 @@ class Tickets(commands.Cog):
                 if row:
                     message_id, channel_id, stored_hash = row
 
-                    # Check if config changed
                     if current_hash != stored_hash:
-                        logger.info("Config changed, panel needs update")
+                        self.log.info("Config changed, panel needs update")
                         needs_update = True
 
-                        # Try to delete old panel
                         channel = self.bot.get_channel(channel_id)
                         if channel:
                             try:
                                 old_message = await channel.fetch_message(message_id)
                                 await old_message.delete()
-                                logger.info(f"Deleted old panel message {message_id}")
+                                self.log.info(f"Deleted old panel message {message_id}")
                             except discord.NotFound:
-                                logger.warning(f"Old panel message {message_id} not found")
+                                self.log.warning(f"Old panel message {message_id} not found")
                             except discord.HTTPException as e:
-                                logger.error(f"Failed to delete old panel: {e}")
+                                self.log.error(f"Failed to delete old panel: {e}")
 
-                        # Remove from database
                         await db.execute("DELETE FROM panel_messages WHERE message_id = ?", (message_id,))
                         await db.commit()
                     else:
-                        # Verify message still exists
                         channel = self.bot.get_channel(channel_id)
                         if channel:
                             try:
                                 await channel.fetch_message(message_id)
-                                logger.info(f"Panel message validated: {message_id}")
+                                self.log.info(f"Panel message validated: {message_id}")
                             except discord.NotFound:
-                                logger.warning(f"Panel message {message_id} not found - will recreate")
+                                self.log.warning(f"Panel message {message_id} not found - will recreate")
                                 needs_update = True
                                 await db.execute("DELETE FROM panel_messages WHERE message_id = ?", (message_id,))
                                 await db.commit()
                 else:
                     needs_update = True
 
-                # Create new panel if needed
                 if needs_update:
                     await self.create_panel()
 
         except Exception as e:
-            logger.error(f"Error validating panel: {e}", exc_info=True)
+            self.log.error(f"Error validating panel: {e}", exc_info=True)
 
     async def create_panel(self):
         """Create the ticket panel message."""
         try:
-            # Delete all existing panels before creating new one
             async with aiosqlite.connect(self.db_path) as db:
                 cursor = await db.execute("SELECT message_id, channel_id FROM panel_messages")
                 old_panels = [row async for row in cursor]
@@ -253,17 +264,16 @@ class Tickets(commands.Cog):
                             old_message = await channel.fetch_message(message_id)
                             await old_message.delete()
                         except discord.NotFound:
-                            pass  # Already deleted
+                            pass
                         except discord.HTTPException as e:
-                            logger.error(f"Failed to delete old panel {message_id}: {e}")
+                            self.log.error(f"Failed to delete old panel {message_id}: {e}")
 
-                # Clear all panel records
                 await db.execute("DELETE FROM panel_messages")
                 await db.commit()
 
             channel = self.bot.get_channel(self.ticket_panel_channel_id)
             if not channel:
-                logger.error(f"Ticket panel channel {self.ticket_panel_channel_id} not found")
+                self.log.error(f"Ticket panel channel {self.ticket_panel_channel_id} not found")
                 return
 
             panel_config = self.config.get("settings", {}).get("panel", {})
@@ -277,7 +287,6 @@ class Tickets(commands.Cog):
                 color=color
             )
 
-            # Add category information
             categories = self.config.get("settings", {}).get("categories", {})
             enabled_cats = [
                 (key, cat) for key, cat in categories.items()
@@ -292,7 +301,6 @@ class Tickets(commands.Cog):
                     desc = cat.get("description", "")
                     category_list.append(f"{emoji} **{label}**\n{desc}")
 
-                # Get configurable field name (can be empty string to hide)
                 panel_config = self.config.get("settings", {}).get("panel", {})
                 field_name = panel_config.get("categories_field_name", "Available Categories")
 
@@ -305,7 +313,6 @@ class Tickets(commands.Cog):
             view = TicketPanelView()
             message = await channel.send(embed=embed, view=view)
 
-            # Save to database
             current_hash = hash_config(self.config)
             async with aiosqlite.connect(self.db_path) as db:
                 await db.execute(
@@ -314,14 +321,20 @@ class Tickets(commands.Cog):
                 )
                 await db.commit()
 
-            logger.info(f"Created new panel message: {message.id}")
+            self.log.info(f"Created new panel message: {message.id}")
 
         except Exception as e:
-            logger.error(f"Error creating panel: {e}", exc_info=True)
+            self.log.error(f"Error creating panel: {e}", exc_info=True)
 
     @tasks.loop(minutes=30)
     async def anti_archive_task(self):
         """Periodically unarchive open ticket threads that were manually archived."""
+        # Cleanup stale entries from _thread_update_times
+        now = time.time()
+        stale = [tid for tid, ts in self._thread_update_times.items() if now - ts > 30]
+        for tid in stale:
+            del self._thread_update_times[tid]
+
         try:
             async with aiosqlite.connect(self.db_path) as db:
                 cursor = await db.execute(
@@ -337,7 +350,6 @@ class Tickets(commands.Cog):
                 try:
                     thread = self.bot.get_channel(thread_id)
                     if not thread:
-                        # Try fetching
                         for guild in self.bot.guilds:
                             try:
                                 thread = await guild.fetch_channel(thread_id)
@@ -352,37 +364,38 @@ class Tickets(commands.Cog):
                         if thread.archived:
                             await thread.edit(archived=False)
                             unarchived += 1
-                            await asyncio.sleep(1)  # Rate limit protection
+                            await asyncio.sleep(1)
 
                 except discord.HTTPException as e:
-                    logger.error(f"Failed to unarchive thread {thread_id}: {e}")
+                    self.log.error(f"Failed to unarchive thread {thread_id}: {e}")
                 except Exception as e:
-                    logger.error(f"Error processing thread {thread_id}: {e}")
+                    self.log.error(f"Error processing thread {thread_id}: {e}")
 
             if unarchived > 0:
-                logger.info(f"Anti-archive: unarchived {unarchived} ticket thread(s)")
+                self.log.info(f"Anti-archive: unarchived {unarchived} ticket thread(s)")
 
         except Exception as e:
-            logger.error(f"Error in anti-archive task: {e}", exc_info=True)
+            self.log.error(f"Error in anti-archive task: {e}", exc_info=True)
 
     @anti_archive_task.before_loop
     async def before_anti_archive_task(self):
         """Wait until bot is ready before starting task."""
         await self.bot.wait_until_ready()
 
+    @anti_archive_task.error
+    async def anti_archive_task_error(self, error):
+        """Log errors from the anti-archive task."""
+        self.log.error(f"Unhandled error in anti_archive_task: {error}", exc_info=True)
+
     @tasks.loop(minutes=1)
     async def check_reminders_task(self):
         """Check for due reminders and send notifications."""
-        from .views import ReminderControlView
-        from datetime import datetime, timedelta, timezone
+        from datetime import datetime, timezone
 
         try:
             now = datetime.now(timezone.utc)
 
             async with aiosqlite.connect(self.db_path) as db:
-                # Find reminders that are due
-                # 1. Initial reminder is due (initial_reminder_at <= now AND last_reminded_at IS NULL)
-                # 2. Daily reminder is due (last_reminded_at + 24h <= now)
                 cursor = await db.execute(
                     """SELECT id, ticket_thread_id, user_id, initial_reminder_at, last_reminded_at, dm_enabled, last_reminder_message_id
                     FROM ticket_reminders
@@ -401,10 +414,8 @@ class Tickets(commands.Cog):
 
             for reminder_id, thread_id, user_id, initial_reminder_at, last_reminded_at, dm_enabled, last_reminder_message_id in due_reminders:
                 try:
-                    # Get thread
                     thread = self.bot.get_channel(thread_id)
                     if not thread:
-                        # Try fetching
                         for guild in self.bot.guilds:
                             try:
                                 thread = await guild.fetch_channel(thread_id)
@@ -414,8 +425,7 @@ class Tickets(commands.Cog):
                                 continue
 
                     if not thread or not isinstance(thread, discord.Thread):
-                        logger.warning(f"Thread {thread_id} not found, deactivating reminder {reminder_id}")
-                        # Deactivate orphaned reminder
+                        self.log.warning(f"Thread {thread_id} not found, deactivating reminder {reminder_id}")
                         async with aiosqlite.connect(self.db_path) as db:
                             await db.execute(
                                 "UPDATE ticket_reminders SET active = 0 WHERE id = ?",
@@ -424,32 +434,28 @@ class Tickets(commands.Cog):
                             await db.commit()
                         continue
 
-                    # Get user
                     user = self.bot.get_user(user_id)
                     if not user:
                         try:
                             user = await self.bot.fetch_user(user_id)
                         except (discord.NotFound, discord.HTTPException):
-                            logger.warning(f"User {user_id} not found for reminder {reminder_id}")
+                            self.log.warning(f"User {user_id} not found for reminder {reminder_id}")
                             continue
 
-                    # Delete old reminder message if it exists
                     if last_reminder_message_id:
                         try:
                             old_message = await thread.fetch_message(last_reminder_message_id)
                             await old_message.delete()
-                            logger.info(f"Deleted old reminder message {last_reminder_message_id} for reminder {reminder_id}")
+                            self.log.info(f"Deleted old reminder message {last_reminder_message_id} for reminder {reminder_id}")
                         except discord.NotFound:
-                            logger.debug(f"Old reminder message {last_reminder_message_id} not found (already deleted)")
+                            self.log.debug(f"Old reminder message {last_reminder_message_id} not found (already deleted)")
                         except discord.HTTPException as e:
-                            logger.warning(f"Failed to delete old reminder message {last_reminder_message_id}: {e}")
+                            self.log.warning(f"Failed to delete old reminder message {last_reminder_message_id}: {e}")
 
-                    # Determine if this is initial or daily reminder
                     is_initial = last_reminded_at is None and initial_reminder_at is not None
                     reminder_type = "Initial" if is_initial else "Daily"
 
-                    # Send reminder in thread
-                    view = ReminderControlView(reminder_id)
+                    view = build_reminder_view(reminder_id)
                     embed = discord.Embed(
                         title=f"🔔 {reminder_type} Reminder",
                         description=f"{user.mention}, this is a reminder to check on this ticket.",
@@ -463,14 +469,13 @@ class Tickets(commands.Cog):
                     embed.set_footer(text="Use the buttons below to stop or snooze this reminder")
 
                     reminder_message = await thread.send(content=user.mention, embed=embed, view=view)
-                    logger.info(f"Sent {reminder_type.lower()} reminder for ticket {thread_id} to user {user_id}")
+                    self.log.info(f"Sent {reminder_type.lower()} reminder for ticket {thread_id} to user {user_id}")
 
-                    # Send DM if enabled
                     if dm_enabled:
                         try:
                             dm_embed = discord.Embed(
                                 title=f"🔔 Ticket Reminder: {thread.name}",
-                                description=f"This is a reminder to check on your ticket.",
+                                description="This is a reminder to check on your ticket.",
                                 color=get_embed_colors()["open"]
                             )
                             dm_embed.add_field(
@@ -479,13 +484,12 @@ class Tickets(commands.Cog):
                                 inline=False
                             )
                             await user.send(embed=dm_embed)
-                            logger.info(f"Sent DM reminder to user {user_id}")
+                            self.log.info(f"Sent DM reminder to user {user_id}")
                         except discord.Forbidden:
-                            logger.warning(f"Could not DM user {user_id} - DMs disabled")
+                            self.log.warning(f"Could not DM user {user_id} - DMs disabled")
                         except discord.HTTPException as e:
-                            logger.error(f"Failed to DM user {user_id}: {e}")
+                            self.log.error(f"Failed to DM user {user_id}: {e}")
 
-                    # Update last_reminded_at and last_reminder_message_id
                     async with aiosqlite.connect(self.db_path) as db:
                         await db.execute(
                             "UPDATE ticket_reminders SET last_reminded_at = ?, last_reminder_message_id = ? WHERE id = ?",
@@ -493,20 +497,23 @@ class Tickets(commands.Cog):
                         )
                         await db.commit()
 
-                    # Rate limit protection
                     await asyncio.sleep(1)
 
                 except Exception as e:
-                    logger.error(f"Error processing reminder {reminder_id}: {e}", exc_info=True)
+                    self.log.error(f"Error processing reminder {reminder_id}: {e}", exc_info=True)
 
         except Exception as e:
-            logger.error(f"Error in check_reminders_task: {e}", exc_info=True)
+            self.log.error(f"Error in check_reminders_task: {e}", exc_info=True)
 
     @check_reminders_task.before_loop
     async def before_check_reminders_task(self):
         """Wait until bot is ready before starting task."""
         await self.bot.wait_until_ready()
 
+    @check_reminders_task.error
+    async def check_reminders_task_error(self, error):
+        """Log errors from the check reminders task."""
+        self.log.error(f"Unhandled error in check_reminders_task: {error}", exc_info=True)
 
     @commands.Cog.listener()
     async def on_raw_thread_update(self, payload):
@@ -514,11 +521,17 @@ class Tickets(commands.Cog):
         if 'thread_metadata' not in payload.data:
             return
 
+        # Debounce: skip if the same thread was processed within 5 seconds
+        now = time.time()
+        last_update = self._thread_update_times.get(payload.thread_id, 0)
+        if now - last_update < 5:
+            return
+        self._thread_update_times[payload.thread_id] = now
+
         metadata = payload.data['thread_metadata']
         archived = metadata.get('archived', False)
         locked = metadata.get('locked', False)
 
-        # Check if this is a closed ticket that got unarchived
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute(
                 "SELECT status FROM tickets WHERE thread_id = ?",
@@ -527,28 +540,21 @@ class Tickets(commands.Cog):
             ticket = await cursor.fetchone()
 
             if not ticket:
-                return  # Not a ticket thread
+                return
 
             status = ticket[0]
 
-            # If ticket is closed in DB but thread is not fully closed (either not archived or not locked)
             if status == 'closed' and (not archived or not locked):
-                # Get ticket details
                 cursor = await db.execute(
                     "SELECT user_id, category FROM tickets WHERE thread_id = ?",
                     (payload.thread_id,)
                 )
                 ticket_data = await cursor.fetchone()
+                if not ticket_data:
+                    return
                 creator_id, category = ticket_data
 
-                # Update database
-                await db.execute(
-                    "UPDATE tickets SET status = 'open', reopened_by = NULL, closed_at = NULL WHERE thread_id = ?",
-                    (payload.thread_id,)
-                )
-                await db.commit()
-
-                # Get the thread and fully unlock it
+                # Resolve the thread
                 thread = self.bot.get_channel(payload.thread_id)
                 if not thread:
                     for guild in self.bot.guilds:
@@ -559,38 +565,102 @@ class Tickets(commands.Cog):
                         except (discord.NotFound, discord.HTTPException):
                             continue
 
-                if thread and isinstance(thread, discord.Thread):
-                    try:
-                        await thread.edit(archived=False, locked=False)
+                if not thread or not isinstance(thread, discord.Thread):
+                    return
 
-                        # Send reopen message
-                        from .views import TicketControlView
-                        reopen_embed = discord.Embed(
-                            title="🔓 Ticket Reopened",
-                            description="This ticket has been reopened.",
-                            color=get_embed_colors()["open"]
+                # Check if the unarchiver is authorized (admin, global staff, or category staff)
+                unarchiver = None
+                try:
+                    guild = thread.guild
+                    async for entry in guild.audit_logs(limit=5, action=discord.AuditLogAction.thread_update):
+                        if entry.target and entry.target.id == payload.thread_id:
+                            unarchiver = entry.user
+                            break
+                except (discord.Forbidden, discord.HTTPException) as e:
+                    self.log.warning(f"Could not check audit log for thread {payload.thread_id}: {e}")
+
+                # If we found an unarchiver, check authorization
+                if unarchiver and not unarchiver.bot:
+                    is_authorized = False
+
+                    # Check if admin
+                    member = thread.guild.get_member(unarchiver.id)
+                    if member:
+                        if member.guild_permissions.administrator:
+                            is_authorized = True
+
+                        # Check global staff roles
+                        if not is_authorized and any(role.id in self.staff_role_ids for role in member.roles):
+                            is_authorized = True
+
+                        # Check category-specific staff roles
+                        if not is_authorized:
+                            config = get_tickets_config()
+                            categories = config.get("settings", {}).get("categories", {})
+                            category_config = categories.get(category, {})
+                            cat_staff_roles = category_config.get("staff_roles", category_config.get("ping_roles", []))
+                            if any(role.id in cat_staff_roles for role in member.roles):
+                                is_authorized = True
+
+                    if not is_authorized:
+                        # Unauthorized reopen - re-archive and re-lock
+                        self.log.warning(
+                            f"Unauthorized reopen of ticket {payload.thread_id} by user {unarchiver.id}, re-archiving"
                         )
-                        await thread.send(embed=reopen_embed, view=TicketControlView())
+                        try:
+                            await thread.edit(archived=True, locked=True)
+                        except discord.HTTPException as e:
+                            self.log.error(f"Failed to re-archive unauthorized thread {payload.thread_id}: {e}")
+                        return
 
-                        # Log to log channel
-                        if self.log_channel_id:
-                            log_channel = thread.guild.get_channel(self.log_channel_id)
-                            if log_channel:
-                                log_embed = format_log_embed(
-                                    "reopened",
-                                    {
-                                        "category": category,
-                                        "thread_id": thread.id,
-                                        "creator_id": creator_id
-                                    }
-                                )
-                                try:
-                                    await log_channel.send(embed=log_embed)
-                                except discord.HTTPException as e:
-                                    logger.error(f"Failed to log ticket reopen: {e}")
-
+                elif unarchiver is None:
+                    # Audit log lookup failed — deny the reopen for safety
+                    self.log.error(
+                        f"Could not determine who unarchived closed ticket {payload.thread_id}; "
+                        "re-archiving (likely missing Audit Log permission)"
+                    )
+                    try:
+                        await thread.edit(archived=True, locked=True)
                     except discord.HTTPException as e:
-                        logger.error(f"Failed to reopen ticket {payload.thread_id}: {e}")
+                        self.log.error(f"Failed to re-archive thread {payload.thread_id}: {e}")
+                    return
+
+                # Authorized reopen - update DB and notify
+                await db.execute(
+                    "UPDATE tickets SET status = 'open', reopened_by = NULL, closed_at = NULL WHERE thread_id = ?",
+                    (payload.thread_id,)
+                )
+                await db.commit()
+
+                try:
+                    await thread.edit(archived=False, locked=False)
+
+                    from .views import TicketControlView
+                    reopen_embed = discord.Embed(
+                        title="🔓 Ticket Reopened",
+                        description="This ticket has been reopened.",
+                        color=get_embed_colors()["open"]
+                    )
+                    await thread.send(embed=reopen_embed, view=TicketControlView())
+
+                    if self.log_channel_id:
+                        log_channel = thread.guild.get_channel(self.log_channel_id)
+                        if log_channel:
+                            log_embed = format_log_embed(
+                                "reopened",
+                                {
+                                    "category": category,
+                                    "thread_id": thread.id,
+                                    "creator_id": creator_id
+                                }
+                            )
+                            try:
+                                await log_channel.send(embed=log_embed)
+                            except discord.HTTPException as e:
+                                self.log.error(f"Failed to log ticket reopen: {e}")
+
+                except discord.HTTPException as e:
+                    self.log.error(f"Failed to reopen ticket {payload.thread_id}: {e}")
 
     @app_commands.command(name="tickets", description="View your open tickets")
     async def list_tickets(self, interaction: discord.Interaction):
@@ -628,7 +698,7 @@ class Tickets(commands.Cog):
             await interaction.followup.send(embed=embed, ephemeral=True)
 
         except Exception as e:
-            logger.error(f"Error listing tickets: {e}", exc_info=True)
+            self.log.error(f"Error listing tickets: {e}", exc_info=True)
             await interaction.followup.send(
                 "❌ An error occurred while fetching your tickets.",
                 ephemeral=True
@@ -649,7 +719,6 @@ class Tickets(commands.Cog):
         thread = interaction.channel
 
         try:
-            # Get ticket from database
             async with aiosqlite.connect(self.db_path) as db:
                 cursor = await db.execute(
                     "SELECT user_id, category, status FROM tickets WHERE thread_id = ?",
@@ -666,7 +735,6 @@ class Tickets(commands.Cog):
 
                 creator_id, category, status = ticket
 
-                # Check if user can manage this category
                 if not can_manage_ticket_category(interaction, category):
                     await interaction.followup.send(
                         "❌ You don't have permission to reopen tickets in this category.",
@@ -681,7 +749,6 @@ class Tickets(commands.Cog):
                     )
                     return
 
-                # Update database
                 await db.execute(
                     """UPDATE tickets
                     SET status = 'open', reopened_by = ?, closed_at = NULL
@@ -690,13 +757,11 @@ class Tickets(commands.Cog):
                 )
                 await db.commit()
 
-            # Unarchive and unlock thread
             try:
                 await thread.edit(archived=False, locked=False)
             except discord.HTTPException as e:
-                logger.error(f"Failed to unarchive/unlock thread: {e}")
+                self.log.error(f"Failed to unarchive/unlock thread: {e}")
 
-            # Send reopen message
             reopen_embed = discord.Embed(
                 title="🔓 Ticket Reopened",
                 description=f"This ticket has been reopened by {interaction.user.mention}",
@@ -705,7 +770,6 @@ class Tickets(commands.Cog):
 
             await thread.send(embed=reopen_embed, view=TicketControlView())
 
-            # Log to log channel
             if self.log_channel_id:
                 log_channel = interaction.guild.get_channel(self.log_channel_id)
                 if log_channel:
@@ -721,7 +785,7 @@ class Tickets(commands.Cog):
                     try:
                         await log_channel.send(embed=log_embed)
                     except discord.HTTPException as e:
-                        logger.error(f"Failed to log ticket reopen: {e}")
+                        self.log.error(f"Failed to log ticket reopen: {e}")
 
             await interaction.followup.send(
                 "✅ Ticket reopened successfully.",
@@ -729,7 +793,7 @@ class Tickets(commands.Cog):
             )
 
         except Exception as e:
-            logger.error(f"Error reopening ticket: {e}", exc_info=True)
+            self.log.error(f"Error reopening ticket: {e}", exc_info=True)
             await interaction.followup.send(
                 "❌ An error occurred while reopening the ticket.",
                 ephemeral=True
@@ -751,7 +815,6 @@ class Tickets(commands.Cog):
         thread = interaction.channel
 
         try:
-            # Get ticket from database
             async with aiosqlite.connect(self.db_path) as db:
                 cursor = await db.execute(
                     "SELECT user_id, category, status FROM tickets WHERE thread_id = ?",
@@ -768,7 +831,6 @@ class Tickets(commands.Cog):
 
                 creator_id, category, status = ticket
 
-                # Check if user can manage this category
                 if not can_manage_ticket_category(interaction, category):
                     await interaction.followup.send(
                         "❌ You don't have permission to close tickets in this category.",
@@ -783,7 +845,6 @@ class Tickets(commands.Cog):
                     )
                     return
 
-            # Send closure message BEFORE archiving
             close_embed = discord.Embed(
                 title="🔒 Ticket Closed",
                 description=f"This ticket has been closed by {interaction.user.mention}",
@@ -795,23 +856,20 @@ class Tickets(commands.Cog):
 
             try:
                 await thread.send(embed=close_embed)
-                await asyncio.sleep(0.5)  # Wait for Discord to process
+                await asyncio.sleep(0.5)
             except discord.HTTPException as e:
-                logger.error(f"Failed to send close message: {e}")
+                self.log.error(f"Failed to send close message: {e}")
 
-            # Close thread (archived + locked) BEFORE updating database
-            # This ensures consistent state if the operation fails
             try:
                 await thread.edit(archived=True, locked=True)
             except discord.HTTPException as e:
-                logger.error(f"Failed to close thread: {e}")
+                self.log.error(f"Failed to close thread: {e}")
                 await interaction.followup.send(
                     "❌ Failed to close the ticket thread. Please check bot permissions and try again.",
                     ephemeral=True
                 )
                 return
 
-            # Update database only after successfully closing thread
             async with aiosqlite.connect(self.db_path) as db:
                 await db.execute(
                     """UPDATE tickets
@@ -819,9 +877,13 @@ class Tickets(commands.Cog):
                     WHERE thread_id = ?""",
                     (interaction.user.id, reason, thread.id)
                 )
+                await db.execute(
+                    "UPDATE ticket_reminders SET active = 0 WHERE ticket_thread_id = ? AND active = 1",
+                    (thread.id,)
+                )
                 await db.commit()
+                self.log.info(f"Closed ticket {thread.id} and cancelled reminders")
 
-            # Log to log channel
             if self.log_channel_id:
                 log_channel = interaction.guild.get_channel(self.log_channel_id)
                 if log_channel:
@@ -838,21 +900,10 @@ class Tickets(commands.Cog):
                     try:
                         await log_channel.send(embed=log_embed)
                     except discord.HTTPException as e:
-                        logger.error(f"Failed to log ticket closure: {e}")
-
-            # Cancel any active reminders
-            try:
-                async with aiosqlite.connect(self.db_path) as db:
-                    await db.execute(
-                        "UPDATE ticket_reminders SET active = 0 WHERE ticket_thread_id = ? AND active = 1",
-                        (thread.id,)
-                    )
-                    await db.commit()
-            except Exception as e:
-                logger.error(f"Failed to cancel reminders: {e}")
+                        self.log.error(f"Failed to log ticket closure: {e}")
 
         except Exception as e:
-            logger.error(f"Error closing ticket: {e}", exc_info=True)
+            self.log.error(f"Error closing ticket: {e}", exc_info=True)
             await interaction.followup.send(
                 "❌ An error occurred while closing the ticket.",
                 ephemeral=True
@@ -867,7 +918,6 @@ class Tickets(commands.Cog):
         config = get_tickets_config()
         categories = config.get("settings", {}).get("categories", {})
 
-        # Build list of choices from enabled categories
         choices = [
             app_commands.Choice(
                 name=cat_config.get("label", key.replace('_', ' ').title()),
@@ -877,14 +927,12 @@ class Tickets(commands.Cog):
             if cat_config.get("enabled", True)
         ]
 
-        # Filter by current input (case-insensitive)
         if current:
             choices = [
                 choice for choice in choices
                 if current.lower() in choice.name.lower() or current.lower() in choice.value.lower()
             ]
 
-        # Discord limit: 25 choices
         return choices[:25]
 
     @app_commands.command(name="addticket", description="Manually add a thread to the tickets database (Staff only)")
@@ -895,7 +943,6 @@ class Tickets(commands.Cog):
     @app_commands.autocomplete(category=category_autocomplete)
     async def add_ticket(self, interaction: discord.Interaction, category: str, user: discord.User = None):
         """Manually add a thread to the tickets database."""
-        # Check if staff
         if not is_staff(interaction, self.staff_role_ids):
             await interaction.response.send_message(
                 "❌ You don't have permission to use this command.",
@@ -915,7 +962,6 @@ class Tickets(commands.Cog):
         thread = interaction.channel
 
         try:
-            # Validate category exists in config
             config = get_tickets_config()
             categories = config.get("settings", {}).get("categories", {})
             if category not in categories:
@@ -933,7 +979,6 @@ class Tickets(commands.Cog):
                 )
                 return
 
-            # Check if ticket already exists
             async with aiosqlite.connect(self.db_path) as db:
                 cursor = await db.execute(
                     "SELECT id FROM tickets WHERE thread_id = ?",
@@ -948,7 +993,6 @@ class Tickets(commands.Cog):
                     )
                     return
 
-                # Determine user ID (works even if user left server)
                 if user:
                     user_id = user.id
                 elif thread.owner:
@@ -962,16 +1006,13 @@ class Tickets(commands.Cog):
                     )
                     return
 
-                # Determine status from thread state
                 status = "closed" if (thread.archived and thread.locked) else "open"
 
-                # Get next ticket number if category uses {number} in naming pattern
                 ticket_number = None
                 naming_pattern = category_config.get("naming_pattern", "")
                 if "{number}" in naming_pattern:
                     ticket_number = await get_next_ticket_number(category, db)
 
-                # Add to database
                 await db.execute(
                     """INSERT INTO tickets
                     (thread_id, user_id, category, ticket_number, status, created_at)
@@ -980,7 +1021,6 @@ class Tickets(commands.Cog):
                 )
                 await db.commit()
 
-            # Build confirmation message
             category_name = category.replace('_', ' ').title()
             ticket_identifier = f"#{ticket_number}" if ticket_number else f"ID:{user_id}"
             user_mention = user.mention if user else f"<@{user_id}>"
@@ -995,10 +1035,10 @@ class Tickets(commands.Cog):
                 ephemeral=True
             )
 
-            logger.info(f"Manually added ticket: {thread.id} ({category}) by staff {interaction.user.id}")
+            self.log.info(f"Manually added ticket: {thread.id} ({category}) by staff {interaction.user.id}")
 
         except Exception as e:
-            logger.error(f"Error adding ticket manually: {e}", exc_info=True)
+            self.log.error(f"Error adding ticket manually: {e}", exc_info=True)
             await interaction.followup.send(
                 "❌ An error occurred while adding the ticket to the database.",
                 ephemeral=True
@@ -1018,23 +1058,19 @@ class Tickets(commands.Cog):
 
         try:
             async with aiosqlite.connect(self.db_path) as db:
-                # Total tickets
                 cursor = await db.execute("SELECT COUNT(*) FROM tickets")
                 total = (await cursor.fetchone())[0]
 
-                # Status breakdown
                 cursor = await db.execute(
                     "SELECT status, COUNT(*) FROM tickets GROUP BY status"
                 )
                 status_counts = {row[0]: row[1] async for row in cursor}
 
-                # Category breakdown
                 cursor = await db.execute(
                     "SELECT category, COUNT(*) FROM tickets GROUP BY category ORDER BY COUNT(*) DESC LIMIT 5"
                 )
                 category_counts = [(row[0], row[1]) async for row in cursor]
 
-                # Average resolution time
                 cursor = await db.execute(
                     """SELECT AVG(julianday(closed_at) - julianday(created_at))
                     FROM tickets WHERE status = 'closed' AND closed_at IS NOT NULL"""
@@ -1081,7 +1117,7 @@ class Tickets(commands.Cog):
             await interaction.followup.send(embed=embed, ephemeral=True)
 
         except Exception as e:
-            logger.error(f"Error getting ticket stats: {e}", exc_info=True)
+            self.log.error(f"Error getting ticket stats: {e}", exc_info=True)
             await interaction.followup.send(
                 "❌ An error occurred while fetching statistics.",
                 ephemeral=True
@@ -1095,10 +1131,8 @@ class Tickets(commands.Cog):
     async def remind_me(self, interaction: discord.Interaction, time: str = None, dm: bool = False):
         """Set a reminder for this ticket."""
         from .helpers import parse_time_string
-        from .views import ReminderControlView
         from datetime import datetime, timedelta, timezone
 
-        # Must be in a ticket thread
         if not isinstance(interaction.channel, discord.Thread):
             await interaction.response.send_message(
                 "❌ This command can only be used in ticket threads.",
@@ -1111,7 +1145,6 @@ class Tickets(commands.Cog):
         try:
             thread = interaction.channel
 
-            # Check if this is actually a ticket
             async with aiosqlite.connect(self.db_path) as db:
                 cursor = await db.execute(
                     "SELECT user_id, status FROM tickets WHERE thread_id = ?",
@@ -1135,7 +1168,6 @@ class Tickets(commands.Cog):
                     )
                     return
 
-                # Check for existing active reminder for this user on this ticket
                 cursor = await db.execute(
                     "SELECT id FROM ticket_reminders WHERE ticket_thread_id = ? AND user_id = ? AND active = 1",
                     (thread.id, interaction.user.id)
@@ -1149,7 +1181,6 @@ class Tickets(commands.Cog):
                     )
                     return
 
-                # Parse time if provided
                 initial_reminder_seconds = None
                 initial_reminder_at = None
 
@@ -1162,12 +1193,10 @@ class Tickets(commands.Cog):
                         )
                         return
 
-                    # Calculate initial reminder time
                     initial_reminder_at = datetime.now(timezone.utc) + timedelta(seconds=initial_reminder_seconds)
 
-                # Create reminder
                 try:
-                    cursor = await db.execute(
+                    await db.execute(
                         """INSERT INTO ticket_reminders
                         (ticket_thread_id, user_id, initial_reminder_at, last_reminded_at, dm_enabled, active)
                         VALUES (?, ?, ?, ?, ?, 1)""",
@@ -1179,17 +1208,14 @@ class Tickets(commands.Cog):
                             1 if dm else 0
                         )
                     )
-                    reminder_id = cursor.lastrowid
                     await db.commit()
                 except aiosqlite.IntegrityError:
-                    # Race condition - reminder was created between check and insert
                     await interaction.followup.send(
                         "❌ You already have an active reminder for this ticket.",
                         ephemeral=True
                     )
                     return
 
-            # Build confirmation message
             msg_parts = ["✅ Reminder set!"]
 
             if time:
@@ -1203,10 +1229,10 @@ class Tickets(commands.Cog):
             msg_parts.append("\n*You'll receive reminder messages in this thread with buttons to stop or snooze.*")
 
             await interaction.followup.send("\n".join(msg_parts), ephemeral=True)
-            logger.info(f"User {interaction.user.id} set reminder for ticket {thread.id} (time={time}, dm={dm})")
+            self.log.info(f"User {interaction.user.id} set reminder for ticket {thread.id} (time={time}, dm={dm})")
 
         except Exception as e:
-            logger.error(f"Error creating reminder: {e}", exc_info=True)
+            self.log.error(f"Error creating reminder: {e}", exc_info=True)
             await interaction.followup.send(
                 "❌ An error occurred while creating the reminder.",
                 ephemeral=True
@@ -1215,7 +1241,6 @@ class Tickets(commands.Cog):
     @app_commands.command(name="stopreminder", description="Stop your reminder for this ticket")
     async def stop_reminder(self, interaction: discord.Interaction):
         """Stop a reminder for this ticket."""
-        # Must be in a ticket thread
         if not isinstance(interaction.channel, discord.Thread):
             await interaction.response.send_message(
                 "❌ This command can only be used in ticket threads.",
@@ -1229,7 +1254,6 @@ class Tickets(commands.Cog):
             thread = interaction.channel
 
             async with aiosqlite.connect(self.db_path) as db:
-                # Check if user has an active reminder for this ticket
                 cursor = await db.execute(
                     """SELECT id FROM ticket_reminders
                     WHERE ticket_thread_id = ? AND user_id = ? AND active = 1""",
@@ -1246,7 +1270,6 @@ class Tickets(commands.Cog):
 
                 reminder_id = reminder[0]
 
-                # Deactivate the reminder
                 await db.execute(
                     "UPDATE ticket_reminders SET active = 0 WHERE id = ?",
                     (reminder_id,)
@@ -1257,10 +1280,10 @@ class Tickets(commands.Cog):
                 "✅ Your reminder for this ticket has been stopped.",
                 ephemeral=True
             )
-            logger.info(f"User {interaction.user.id} stopped reminder {reminder_id} for ticket {thread.id}")
+            self.log.info(f"User {interaction.user.id} stopped reminder {reminder_id} for ticket {thread.id}")
 
         except Exception as e:
-            logger.error(f"Error stopping reminder: {e}", exc_info=True)
+            self.log.error(f"Error stopping reminder: {e}", exc_info=True)
             await interaction.followup.send(
                 "❌ An error occurred while stopping the reminder.",
                 ephemeral=True

@@ -7,7 +7,7 @@ import discord
 import yaml
 import logging
 from pathlib import Path
-from constants import (
+from oak.constants import (
     EMBED_MAX_FIELDS,
     EMBED_TOTAL_MAX,
     truncate_for_embed_field
@@ -38,7 +38,7 @@ def get_application_config():
     """Load application config from config.yml."""
     config_path = Path(__file__).parent / "config.yml"
     try:
-        with open(config_path, "r") as f:
+        with open(config_path, "r", encoding="utf-8") as f:
             config = yaml.safe_load(f) or {}
         return config
     except Exception as e:
@@ -68,7 +68,7 @@ def paginate_application_embed(applicant, answers, get_questions_func=None):
     Returns a list of embeds, paginated by Discord's field and character limits.
 
     Args:
-        applicant: Discord member who applied
+        applicant: Discord member who applied (may be None if user left the server)
         answers: List of application answers
         get_questions_func: Function to get questions (optional, uses default if None)
 
@@ -88,8 +88,14 @@ def paginate_application_embed(applicant, answers, get_questions_func=None):
         logger.warning(f"Application has {len(answers)} answers but {len(questions)} questions configured. Some questions will be skipped.")
 
     def make_embed(fields, page_num, total_pages):
+        # Handle applicant=None safely (user left the server)
+        if applicant:
+            title = f"Application from {applicant.mention}"
+        else:
+            title = "Application from Unknown Applicant"
+
         embed = discord.Embed(
-            title=f"Application from {applicant.mention if applicant else f'<@{applicant.id}>'}",
+            title=title,
             color=get_embed_colors()["info"]
         )
         if applicant:
@@ -104,7 +110,14 @@ def paginate_application_embed(applicant, answers, get_questions_func=None):
     # Gather fields for each embed, respecting Discord's field and character limits
     all_embeds = []
     i = 0
+    safety_counter = 0
+    max_iterations = total_items + 100  # Safety limit to prevent infinite loops
     while i < total_items:
+        safety_counter += 1
+        if safety_counter > max_iterations:
+            logger.error("Pagination safety limit reached, breaking to prevent infinite loop")
+            break
+
         fields = []
         char_count = 0
         fields_in_this_embed = 0
@@ -118,7 +131,8 @@ def paginate_application_embed(applicant, answers, get_questions_func=None):
             # Add size of this field (label + value + field overhead)
             added_chars = len(label) + len(value) + 50  # 50 is a fudge factor for formatting
 
-            if fields_in_this_embed >= EMBED_MAX_FIELDS or char_count + added_chars > EMBED_TOTAL_MAX:
+            # Always add at least one field per page to guarantee forward progress
+            if fields_in_this_embed > 0 and (fields_in_this_embed >= EMBED_MAX_FIELDS or char_count + added_chars > EMBED_TOTAL_MAX):
                 break
 
             fields.append((label, value))
@@ -143,24 +157,6 @@ def get_reviewer_role_ids():
     """Get reviewer role IDs from config."""
     config = get_application_config()
     return tuple(config.get("settings", {}).get("reviewer_role_ids", []))
-
-
-def is_application_reviewer():
-    """
-    Decorator to check if user has application reviewer permissions.
-
-    Returns:
-        commands.check decorator
-    """
-    from discord.ext import commands
-
-    async def predicate(ctx):
-        config = get_application_config()
-        reviewer_role_ids = config.get("settings", {}).get("reviewer_role_ids", [])
-        user_role_ids = [role.id for role in ctx.author.roles]
-        return any(role_id in reviewer_role_ids for role_id in user_role_ids)
-
-    return commands.check(predicate)
 
 
 def check_application_answer_quality(question: str, answer: str) -> tuple[bool, str]:

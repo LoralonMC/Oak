@@ -72,6 +72,10 @@ def is_admin(interaction: discord.Interaction, admin_role_ids: list = None) -> b
     if admin_role_ids is None:
         admin_role_ids = get_admin_role_ids()
 
+    # Guild check — DMs have no guild permissions
+    if interaction.guild is None:
+        return False
+
     # Administrators always have access
     if interaction.user.guild_permissions.administrator:
         return True
@@ -113,7 +117,13 @@ def format_price(emeralds: float | None) -> str:
         594        -> "1 CEMB 2 EMB"
         600        -> "1 CEMB 2 EMB 6 EM"
     """
-    if emeralds is None or emeralds <= 0:
+    if emeralds is None:
+        return "N/A"
+
+    if emeralds == 0:
+        return "Free"
+
+    if emeralds < 0:
         return "N/A"
 
     if emeralds < 0.01:
