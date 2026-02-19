@@ -7,7 +7,7 @@ import asyncio
 
 import discord
 from discord import app_commands
-from discord.ext import commands, tasks
+from discord.ext import tasks
 import aiosqlite
 from pathlib import Path
 
@@ -18,8 +18,6 @@ from oak.constants import EMBED_DESCRIPTION_MAX, truncate_for_embed_field
 from .helpers import (
     get_db_path,
     get_csv_directory,
-    get_embed_color,
-    get_admin_role_ids,
     is_admin,
     validate_config,
     format_price,
@@ -219,7 +217,7 @@ class Shopkeepers(OakBranch):
     async def _run_migrations(self):
         """Run database migrations for existing databases."""
         try:
-            async with aiosqlite.connect(self.db_path) as db:
+            async with aiosqlite.connect(self.db_path):
                 # Placeholder for future migrations
                 pass
         except Exception as e:

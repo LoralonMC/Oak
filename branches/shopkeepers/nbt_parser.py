@@ -155,7 +155,6 @@ def parse_item_metadata(material_type: str, metadata: str, plugin_identity_keys:
         potion_info = _extract_potion_type(metadata)
         if potion_info:
             potion_key, potion_display = potion_info
-            base_name = material_type.replace("_", " ").lower()
             item_key = f"minecraft:{material_type.lower()}:{potion_key}"
             if material_upper == "TIPPED_ARROW":
                 display_name = f"Arrow of {potion_display}"
@@ -696,9 +695,6 @@ def parse_shulker_contents(metadata: str) -> tuple[str, int] | None:
         container_content = container_match.group(1)
         # Parse items: {item:{count:64,id:"minecraft:gunpowder"},slot:0}
         # or with escaped quotes: {item:{count:64,id:""minecraft:gunpowder""},slot:0}
-        item_pattern = r'id:\s*"+"?minecraft:([^"]+)"+"?\s*\}?\s*,?\s*slot:\d+\}|id:\s*"+"?minecraft:([^"]+)"+"?'
-        count_pattern = r'count:\s*(\d+)'
-
         # Find all item entries
         entries = re.findall(r'\{item:\{([^}]+)\},slot:\d+\}', container_content)
         for entry in entries:

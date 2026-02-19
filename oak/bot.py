@@ -134,7 +134,8 @@ class OakBot(commands.Bot):
 
     async def on_message(self, message: discord.Message) -> None:
         if message.content.startswith(str(self.command_prefix)) and not message.author.bot:
-            logger.info(f"Command from {message.author}: {message.content[:50]}")
+            command_name = message.content.split(maxsplit=1)[0]
+            logger.info(f"Command from {message.author}: {command_name}")
         await self.process_commands(message)
 
     async def on_error(self, event_method: str, *args, **kwargs) -> None:

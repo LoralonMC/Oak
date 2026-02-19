@@ -10,7 +10,6 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
-from typing import Any
 
 from .constants import CUSTOM_ID_MAX_LENGTH, CUSTOM_ID_PREFIX
 from .errors import OakError
@@ -39,12 +38,19 @@ class InteractionRouter:
 
         parts = custom_id.split(":")
         # oak:branch:action or oak:branch:action:value
-        if len(parts) < 3:
+        if len(parts) not in (3, 4):
             return None
 
         branch = parts[1]
         action = parts[2]
-        value = parts[3] if len(parts) >= 4 else ""
+        value = parts[3] if len(parts) == 4 else ""
+
+        if not branch or not action:
+            return None
+        if ":" in branch or ":" in action:
+            return None
+        if value and not _VALUE_PATTERN.match(value):
+            return None
 
         return ParsedInteraction(branch=branch, action=action, value=value)
 

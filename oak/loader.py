@@ -10,7 +10,7 @@ import importlib
 import logging
 import sys
 from pathlib import Path
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING
 
 from .config import load_branch_config
 from .constants import BRANCH_MANIFEST_FILE
@@ -64,6 +64,16 @@ class BranchLoader:
 
             try:
                 manifest = BranchManifest.from_file(manifest_path)
+                if manifest.id in self._manifests:
+                    existing_path = self._paths[manifest.id]
+                    logger.error(
+                        "Duplicate branch id '%s' in %s and %s; skipping %s",
+                        manifest.id,
+                        existing_path,
+                        item,
+                        item,
+                    )
+                    continue
                 self._manifests[manifest.id] = manifest
                 self._paths[manifest.id] = item
             except Exception as e:
@@ -284,7 +294,6 @@ class BranchLoader:
         failed: list[tuple[str, str]] = []
 
         for branch_id in order:
-            manifest = self._manifests[branch_id]
             branch_dir = self._paths[branch_id]
 
             # Check enabled in config (peek at config.yml)
@@ -299,8 +308,13 @@ class BranchLoader:
                         skipped.append(branch_id)
                         logger.info(f"Skipped {branch_id} (disabled)")
                         continue
-                except Exception:
-                    pass  # proceed with loading, let it fail naturally
+                except Exception as e:
+                    logger.warning(
+                        "Failed to parse %s for branch '%s' while checking enabled flag: %s",
+                        config_path,
+                        branch_id,
+                        e,
+                    )
 
             try:
                 await self.load_branch(branch_id)

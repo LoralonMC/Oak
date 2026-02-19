@@ -512,7 +512,6 @@ class ManageView(View):
         if not await self._check_staff(interaction):
             return
 
-        from .helpers import get_application_questions
 
         # Get current applicant's user_id
         async with aiosqlite.connect(self.get_db_path()) as db:
