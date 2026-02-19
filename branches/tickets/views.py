@@ -12,8 +12,6 @@ from .helpers import (
     get_tickets_config,
     get_db_path,
     get_embed_colors,
-    get_staff_role_ids,
-    is_staff,
     can_manage_ticket_category,
     can_bypass_duplicate_check,
     sanitize_name,

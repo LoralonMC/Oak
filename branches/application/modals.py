@@ -7,7 +7,6 @@ import discord
 from discord.ui import Modal, TextInput
 from oak.utils import sanitize_text
 from oak.constants import (
-    MODAL_TITLE_MAX,
     MODAL_TEXT_INPUT_LABEL_MAX,
     MODAL_TEXT_INPUT_PLACEHOLDER_MAX,
     MODAL_TEXT_INPUT_VALUE_MAX
@@ -58,7 +57,7 @@ class ApplicationModal(Modal):
     async def on_submit(self, interaction: discord.Interaction):
         """Handle modal submission."""
         # Import here to avoid circular imports
-        from .views import ContinueView, PostSubmissionView
+        from .views import ContinueView
 
         # Validate all answers before proceeding
         validation_errors = []
