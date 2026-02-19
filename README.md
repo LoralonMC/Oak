@@ -1,544 +1,250 @@
-# Oak - Modular Discord Bot Framework
+# Oak
 
-A feature-rich, modular Discord bot framework providing suggestion management, staff applications, server status tracking, and more. Built with a flexible branch-based architecture inspired by Minecraft plugins and VSCode extensions.
+A modular Discord bot framework with a branch-based plugin architecture. Each feature lives in its own self-contained branch with independent config, database, and lifecycle — hot-reloadable without restarts.
 
-**GitHub:** https://github.com/LoralonMC/oak
-
-## Features
-
-- **Suggestion System**: Community suggestion voting with like/dislike buttons, discussion threads, and staff approval/denial workflow
-- **Staff Application System**: Comprehensive multi-page application forms with inactivity tracking, background checks (optional MySQL/Plan integration), and automated denial/acceptance workflow
-- **Support Ticket System**: Thread-based tickets with multiple categories (gameplay, billing, reports, appeals, bugs), staff management, and automatic anti-archive protection
-- **Server Status Tracking**: Auto-updating voice channels showing real-time Minecraft server player count and Discord member count
-- **Shopkeepers Market Analysis**: CSV trade log importer with price checking, market trends, economy sink/faucet analysis, player and shop leaderboards
-- **Account Linking Guide**: Simple command displaying instructions for linking Minecraft accounts via Discord
-- **Bot Management**: Admin slash commands for hot-reloading branches, viewing stats, and managing the bot
-- **Modular Architecture**: Hot-reload any branch and its config without restarting the bot
-- **Auto-Discovery**: New branches are automatically detected and loaded on startup
-
-## Architecture
-
-Oak uses a **modular, folder-based branch system** inspired by Minecraft Paper plugins and VSCode extensions:
-
-- Each branch is self-contained in its own folder
-- Each branch has its own `config.yml` file with settings
-- Hot-reload support - change configs and reload without restarting
-- Auto-discovery - just create a branch folder and restart the bot
-- Clean separation between global settings (`.env`) and branch-specific settings (`config.yml`)
-- Per-branch databases - each branch manages its own SQLite database
-
-### Terminology Note
-
-Oak uses **"branch"** terminology for its modular extensions (inspired by Git branches and tree branches). However, because Oak is built on Discord.py, you'll see references to Discord.py's native `commands.Cog` class and `bot.add_cog()` method in the code. These are Discord.py's implementation details - from a user and developer perspective, everything is a **"branch"**.
-
-**In practice:**
-- 📁 **User-facing**: "branches" (folders, commands, documentation)
-- 🔧 **Code-level**: `commands.Cog` (Discord.py's required base class)
-- 💬 **When talking about Oak**: Use "branch"
-- 💻 **When writing code**: Inherit from `commands.Cog` (required by Discord.py)
+Built for a Minecraft community server. Includes suggestion voting, staff applications, support tickets, server status tracking, market analysis, and account linking out of the box.
 
 ## Setup
 
 ### Requirements
 
-- Python 3.8 or higher
-- Discord Bot Token
-- MySQL database (optional, for Plan integration)
+- Python 3.10+
+- Discord bot token
+- MySQL database (optional, for Plan integration in the application branch)
 
 ### Installation
 
-1. **Clone or download the repository**
+1. Clone the repository
    ```bash
-   cd "Discord Bot"
+   git clone https://github.com/LoralonMC/Oak.git
+   cd Oak
    ```
 
-2. **Install dependencies**
+2. Install dependencies
    ```bash
    pip install -r requirements.txt
    ```
 
-3. **Configure environment variables**
-
-   Create a `.env` file in the root directory:
-   ```env
-   # Discord Bot Token (REQUIRED - Get from https://discord.com/developers/applications)
-   DISCORD_TOKEN=your_bot_token_here
-
-   # Guild ID (Your Discord server ID)
-   GUILD_ID=your_guild_id
-
-   # Note: Bot admin commands (/reload, /load, etc.) use Discord's built-in
-   # Administrator permission. No custom role configuration needed.
+3. Create `.env` from the example
+   ```bash
+   cp .env.example .env
    ```
+   Edit `.env` and fill in your bot token and guild ID.
 
-4. **Configure branches**
+4. Configure branches — edit `config.yml` in each branch folder to set channel IDs, role IDs, etc.
 
-   Each branch has its own `config.yml` file. Edit these to set channel IDs, role IDs, etc:
-
-   - `branches/application/config.yml` - Application system settings
-   - `branches/suggestions/config.yml` - Suggestion system settings
-   - `branches/status_channels/config.yml` - Status channel settings
-   - `branches/link/config.yml` - Link command settings
-   - `branches/shopkeepers/config.yml` - Shopkeepers market analysis settings
-
-5. **Run the bot**
+5. Run the bot
    ```bash
    python bot.py
    ```
 
-## Project Structure
+## Architecture
+
+Oak uses a **branch-based plugin system** inspired by Minecraft Paper plugins:
+
+- Every branch extends `OakBranch` and lives in its own `branches/<name>/` folder
+- A `branch.yml` manifest declares metadata (id, version, main class, database flag)
+- A `config.yml` holds runtime settings (channel IDs, role IDs, feature flags)
+- Branches are auto-discovered on startup and can be hot-reloaded via `/reload`
+- Each branch gets its own SQLite database (WAL mode, write-locked), event bus handle, and logger
+
+### Branch lifecycle
+
+| Hook | When |
+|------|------|
+| `on_enable()` | Branch loaded — initialize DB schema, register views, start tasks |
+| `on_ready()` | Bot fully connected to Discord (fires once) |
+| `on_disable()` | Branch unloaded — cancel tasks, release resources |
+
+### Project structure
 
 ```
 Oak/
-├── bot.py                     # Main bot entry point
-├── config.py                  # Global configuration loader
-├── database.py                # Database utility functions
-├── utils.py                   # Utility functions (validation, sanitization)
-├── constants.py               # Discord API limits and framework constants
-├── requirements.txt           # Python dependencies
-├── create_branch.py           # Utility to create new branches
-├── .env                       # Environment variables (with placeholders)
-├── .gitignore                 # Git ignore file
-├── logs/                      # Log files directory (auto-created)
-├── core/
-│   ├── __init__.py
-│   └── branch_loader.py       # Auto-discovery and hot-reload system
-└── branches/
-    ├── __init__.py
-    ├── admin/                 # Bot management commands
-    │   ├── __init__.py
-    │   └── branch.py
-    ├── application/           # Staff application system
-    │   ├── __init__.py
-    │   ├── branch.py
-    │   └── config.yml
-    ├── suggestions/           # Suggestion voting system
-    │   ├── __init__.py
-    │   ├── branch.py
-    │   └── config.yml
-    ├── status_channels/       # Server status voice channels
-    │   ├── __init__.py
-    │   ├── branch.py
-    │   └── config.yml
-    ├── link/                  # Account linking guide
-    │   ├── __init__.py
-    │   ├── branch.py
-    │   └── config.yml
-    ├── shopkeepers/           # Market analysis system
-    │   ├── __init__.py
-    │   ├── branch.py
+├── bot.py                        # Entry point (logging, OakBot, run)
+├── .env.example                  # Environment variable template
+├── requirements.txt
+├── create_branch.py              # Scaffold a new branch
+├── oak/                          # Framework core
+│   ├── __init__.py               # Public API (OakBot, OakBranch, etc.)
+│   ├── bot.py                    # OakBot — setup, shutdown, error handling
+│   ├── branch.py                 # OakBranch — base class for all branches
+│   ├── loader.py                 # BranchLoader — discover, load, reload, unload
+│   ├── manifest.py               # branch.yml parser
+│   ├── config.py                 # OakConfig (.env) + branch config loader (deep merge)
+│   ├── context.py                # BranchContext — dependency injection container
+│   ├── database.py               # BranchDatabase — per-branch SQLite (WAL + write lock)
+│   ├── events.py                 # EventBus + BranchEventHandle
+│   ├── interactions.py           # InteractionRouter + BranchInteractionHandle
+│   ├── constants.py              # Discord API limits, utility functions
+│   ├── errors.py                 # Framework exceptions
+│   ├── utils.py                  # Shared utilities (sanitization, truncation)
+│   └── admin/                    # Built-in admin branch (always loaded)
+│       ├── branch.py             # /reload, /load, /unload, /branches, /sync, /botinfo
+│       └── branch.yml
+└── branches/                     # User branches (auto-discovered)
+    ├── suggestions/
+    │   ├── branch.yml            # Manifest
+    │   ├── branch.py             # OakBranch subclass
+    │   ├── config.yml            # Runtime settings
+    │   ├── handlers.py
     │   ├── helpers.py
-    │   ├── importer.py
-    │   ├── nbt_parser.py
-    │   ├── views.py
-    │   └── config.yml
-    └── tickets/               # Support ticket system
-        ├── __init__.py
-        ├── branch.py
-        └── config.yml
-
-Note: Branch databases (data.db files) are automatically created when branches first load.
-They are git-ignored and not included in the repository.
+    │   ├── modals.py
+    │   └── views.py
+    ├── application/
+    ├── tickets/
+    ├── shopkeepers/
+    ├── status_channels/
+    └── link/
 ```
 
-## Bot Admin Commands
+Branch databases (`data.db`) are auto-created on first load and git-ignored.
 
-These commands require Administrator permission in Discord:
+### Branch manifest (`branch.yml`)
 
-- `/reload <branch>` - Reload a branch and its config (hot-reload without restart)
-- `/load <branch>` - Load a previously unloaded branch
-- `/unload <branch>` - Unload a branch (disable without deleting)
-- `/branches` - List all currently loaded branches
-- `/reloadall` - Reload all loaded branches at once
-- `/botinfo` - Display bot statistics and information
-
-**Features:**
-- Branch name autocomplete for easy selection
-- Ephemeral responses (only you see them)
-- Built-in parameter validation
-
-**Example:**
-```
-/reload suggestions
-/load application
-/branches
-```
-
-## Creating New Branches
-
-Use the included `create_branch.py` script to generate a new branch:
-
-```bash
-python create_branch.py polls "Community voting system"
-```
-
-This creates:
-```
-branches/polls/
-├── __init__.py       # Package setup
-├── branch.py         # Main branch code (with template)
-├── config.yml        # Configuration file
-└── data.db           # Database (auto-created on first run)
-```
-
-The branch will be automatically discovered on next bot restart, or use `/load polls`.
-
-**Note:** The generated template includes database functionality. If your branch doesn't need a database, simply comment out the database initialization in the `cog_load()` method and database-related code.
-
-> **About `cog_load()`**: This is a Discord.py Cog lifecycle method that's automatically called when your branch loads. It's the perfect place to initialize databases, register views, or set up background tasks.
-
-## Branch Features
-
-### Suggestions System
-**Location:** `branches/suggestions/`
-
-**What it does:**
-When users post a message in the designated suggestions channel, the bot automatically:
-1. Deletes the original message
-2. Creates a professional embed with the suggestion content
-3. Adds interactive voting buttons (👍 Like, 👎 Dislike, ⚙️ Manage)
-4. Creates a discussion thread for community feedback
-5. Tracks all votes in the database
-
-**Staff Management Features:**
-Staff members with configured manager roles can:
-- **Approve** suggestions with a custom reason (embed turns green)
-- **Deny** suggestions with a custom reason (embed turns red)
-- **Delete** suggestions entirely
-- View real-time vote statistics
-- All actions update the embed and notify the original author
-
-**Features:**
-- Input validation (min/max length)
-- Duplicate vote prevention
-- Vote toggling (click again to remove vote)
-- Persistent buttons (work after bot restart)
-- Configurable embed colors and messages
-
-### Application System
-**Location:** `branches/application/`
-
-**What it does:**
-A complete staff application workflow system. Users click an "Apply for Staff" button which:
-1. Creates a private application channel (only visible to applicant + reviewers)
-2. Presents a multi-page form system (Discord modals with 5 questions per page)
-3. Saves progress after each page (can continue later)
-4. Validates answers for quality
-5. Notifies staff when application is submitted
-
-**Staff Review Tools:**
-- **Read Applications**: View full application with pagination (handles Discord's field limits)
-- **Accept**: Moves channel to "accepted" category, notifies applicant
-- **Deny**: Sends reason to applicant, optionally deletes channel after delay
-- **Background Checks** (optional): Query Minecraft playtime via MySQL/Plan plugin
-- **Punishment History** (optional): Check forum for prior warnings/bans
-- **Application History**: View user's past applications with `/apphistory`
-
-**Automated Management:**
-- **Inactivity Warnings**: Warns applicants after 3 days of inactivity
-- **Auto-Abandon**: Closes applications after 7 days of inactivity
-- **Duplicate Prevention**: Users can only have one active application
-- **Statistics Tracking**: Track processing times, acceptance rates, etc.
-
-**Slash Commands:**
-- `/appstats` - View detailed application statistics
-- `/apphistory <user>` - View a user's complete application history
-
-**Configuration:**
-- 17 customizable application questions (edit in `config.yml`)
-- Configurable position name and channel naming
-- Optional MySQL/Plan integration for Minecraft servers
-- Customizable inactivity thresholds and messages
-- Optional account linking requirement
-
-### Tickets System
-**Location:** `branches/tickets/`
-
-**What it does:**
-A thread-based support ticket system with multiple categories. Users click a button to select their issue type, which:
-1. Creates a private thread in a configured channel
-2. Adds the user and pings relevant staff roles
-3. Sends a customized welcome message for that category
-4. Provides ticket control buttons (Close, Reopen)
-
-**Ticket Categories (fully configurable):**
-- 🎮 **Ingame Support**: Gameplay help and questions
-- 💳 **Billing Support**: Purchase/donation issues
-- ⚠️ **Player Reports**: Report rule-breaking players
-- 🔓 **Punishment Appeals**: Appeal bans or warnings
-- 🐛 **Bug Reports**: Report technical issues
-
-**Features:**
-- **Unique Numbering**: Each category has sequential ticket numbers (e.g., `ingame-01`, `billing-02`)
-- **Flexible Naming**: Use `{number}` for sequential, `{nickname}` for user-specific names
-- **Staff Management**: Close tickets with custom reasons, reopen if needed
-- **Anti-Archive**: Automatically unarchives closed tickets that get reopened
-- **Activity Tracking**: View user's ticket history with `/tickets` command
-- **Statistics**: Detailed ticket stats with `/ticketstats` command
-- **Logging**: Optional ticket event logging to a dedicated channel
-- **Privacy Controls**: Configure which categories allow adding other users
-
-**Slash Commands:**
-- `/ticketstats` - View ticket statistics (total, by category, resolution times)
-- `/tickets` - View your open tickets
-
-**Configuration:**
-- Define unlimited custom categories with unique settings
-- Per-category staff role pings
-- Custom welcome messages per category
-- Configurable panel embed and button layout
-
-### Status Channels
-**Location:** `branches/status_channels/`
-
-**What it does:**
-Automatically updates voice channel names every 6 minutes with live statistics:
-- **Player Count**: Minecraft server online players (e.g., "Online: 15/100")
-- **Member Count**: Total Discord server members (e.g., "Total Members: 1,234")
-
-**Features:**
-- Uses `mcstatus` library to query Minecraft Java servers
-- Graceful error handling (continues on server offline)
-- Rate limit protection with retry logic
-- Anti-spike jitter (±10% randomization to avoid synchronized API calls)
-- Customizable format strings for both counters
-
-**Configuration:**
-- Minecraft server host and port
-- Channel IDs for player count and member count
-- Custom format strings (supports number formatting)
-
-### Link Command
-**Location:** `branches/link/`
-
-**What it does:**
-Displays instructions for linking Minecraft accounts to Discord.
-
-**Features:**
-- Simple `!link` command
-- Customizable embed (title, description, color)
-- Explains the linking process step-by-step
-
-**Use Case:**
-For Minecraft servers using Discord linking plugins (e.g., DiscordSRV, Plan) where players need to link their accounts to get roles synchronized.
-
-### Shopkeepers Market Analysis
-**Location:** `branches/shopkeepers/`
-
-**What it does:**
-A CSV-based trade log importer and market analysis system for Minecraft Shopkeepers plugin data. Automatically imports trade logs and provides price checking, economy analysis, and leaderboards.
-
-**How it works:**
-1. The Shopkeepers Minecraft plugin generates CSV trade logs for every shop transaction
-2. The branch auto-imports these CSVs every 30 minutes (configurable)
-3. An NBT metadata parser identifies items (vanilla, enchanted, custom plugin items, potions, shulker boxes)
-4. Trades are deduplicated via SHA-256 fingerprinting to prevent double-counting on re-import
-5. A price summary table tracks daily averages for fast lookups
-
-**Public Commands:**
-- `/price <item> [days]` - Check average, min, max price with daily price chart (1-365 days)
-- `/top [sort_by]` - View top traded items (by trade count, volume, or value)
-- `/search <query>` - Search for items by name with price info
-- `/player <name>` - View trade stats for a player (spending, favorite items, recent trades)
-- `/shop <owner>` - View trade stats for a shop owner (revenue, top items, recent trades)
-- `/trending [period] [direction]` - Items with biggest price changes (compares recent half vs prior half)
-- `/shops [sort_by]` - Top shop owner leaderboard (by revenue, trade count, or unique items)
-- `/players [sort_by]` - Top player leaderboard (by spending, trade count, or unique items)
-
-**Admin Commands:**
-- `/shopkeepers_import` - Manually trigger CSV import
-- `/shopkeepers_stats` - View database statistics (total trades, items, files, etc.)
-- `/economy [period]` - Economy sink/faucet analysis (emerald flow through admin shops)
-- `/sinks [period]` - Detailed breakdown of items players buy from admin shops
-- `/faucets [period]` - Detailed breakdown of items players sell to admin shops
-
-**Features:**
-- **Automatic Import**: Background task imports new CSV data on a configurable interval
-- **Incremental Processing**: Only imports new lines from each CSV file, skips unchanged files
-- **NBT Parsing**: Identifies enchanted books, potions, tipped arrows, shulker boxes, and custom plugin items
-- **Dual Format Support**: Handles both legacy Bukkit NBT and modern 1.20.5+ component format
-- **Currency System**: Configurable multi-tier currency (Emeralds, Emerald Blocks, Compressed Emerald Blocks)
-- **Plugin Item Recognition**: Identifies items from ExecutableItems, ItemsAdder, PhoenixCrates, and other plugins
-- **Paginated Embeds**: All list commands use interactive Previous/Next buttons
-- **Admin Shop Exclusion**: Admin shop prices are excluded from market averages (fixed prices would skew data)
-
-**Configuration:**
-- CSV directory path (point to Shopkeepers plugin trade-logs folder)
-- Auto-import interval
-- Currency definitions with emerald values
-- Plugin identity keys for custom item recognition
-- UI settings (embed color, items per page, default lookback period)
-- Admin role IDs for economy commands
-
-### Admin Commands
-**Location:** `branches/admin/`
-
-**What it does:**
-Provides bot management slash commands (requires Discord Administrator permission).
-
-**Available Commands:**
-- `/reload <branch>` - Hot-reload a branch and its config without restarting
-- `/load <branch>` - Load a previously unloaded branch
-- `/unload <branch>` - Unload a branch temporarily
-- `/branches` - List all currently loaded branches
-- `/reloadall` - Reload all branches at once
-- `/botinfo` - Display bot statistics and information
-
-**Features:**
-- Branch name autocomplete for easy selection
-- Ephemeral responses (only you see them)
-- Protection against unloading critical branches
-- Detailed error messages
-
-## Configuration System
-
-### Global Settings (`.env`)
-- `DISCORD_TOKEN` - Bot authentication token
-- `GUILD_ID` - Discord server ID
-
-### Per-Branch Settings (`branches/<name>/config.yml`)
-Each branch has its own configuration file with:
-- `enabled` - Toggle branch on/off
-- `version` - Config version
-- `settings` - Branch-specific settings (channel IDs, role IDs, etc.)
-
-**Example** (`branches/suggestions/config.yml`):
 ```yaml
-enabled: true
+id: suggestions
+name: Suggestions
 version: "1.0.0"
+description: User suggestions with voting and management
+main: branch.Suggestions
+database: true
+```
+
+The `main` field is `module.ClassName` — the loader imports `branches.<folder>.<module>` and instantiates `<ClassName>`.
+
+### Configuration
+
+**Global** (`.env`): bot token, guild ID.
+
+**Per-branch** (`config.yml`): each branch defines a `DEFAULT_CONFIG` dict in its module. The framework deep-merges `config.yml` on top, so you only need to override what you change.
+
+```yaml
+# branches/suggestions/config.yml
+enabled: true
 settings:
   channel_id: 1374374186016964788
   manager_role_ids:
     - 937003755185012756
-    - 937003936156647514
-  validation:
-    min_length: 10
-    max_length: 4000
 ```
 
-### Hot-Reload
-Change a config file and reload the branch:
+Hot-reload any branch and its config:
 ```
 /reload suggestions
 ```
-No bot restart needed!
 
-## Permission System
+## Admin Commands
 
-The bot has **two separate permission levels**:
+Built-in commands (require Discord Administrator permission):
 
-### Bot Admin Permissions
-Uses Discord's built-in **Administrator permission**. Controls:
-- Bot management commands (/reload, /load, /unload, etc.)
-- Access to bot information
-- Anyone with Administrator permission in Discord can use these commands
+| Command | Description |
+|---------|-------------|
+| `/reload <branch>` | Hot-reload a branch and its config |
+| `/load <branch>` | Load a branch |
+| `/unload <branch>` | Unload a branch |
+| `/branches` | List loaded and discovered branches |
+| `/sync` | Force-sync slash commands to the guild |
+| `/botinfo` | Show bot stats |
 
-### Branch-Specific Permissions
-Defined in each branch's `config.yml`. Examples:
-- **Suggestions**: `manager_role_ids` - Who can approve/deny suggestions
-- **Applications**: `reviewer_role_ids` - Who can review applications
+All responses are ephemeral. Branch names autocomplete.
 
-This separation allows you to give different people access to bot management vs. feature management.
+## Branches
 
-## Database
+### Suggestions
 
-Oak uses a **per-branch database architecture** where each branch manages its own SQLite database:
-- **branches/suggestions/data.db** - Stores suggestions, votes, status, and reasons
-- **branches/application/data.db** - Stores application data, answers, and status
-- **branches/shopkeepers/data.db** - Stores imported trades, items, players, price summaries, and import tracking
+Community suggestion system with voting and staff moderation.
 
-Each database is automatically created and initialized when the branch loads for the first time. This makes each branch truly self-contained and portable.
+- Users post in the suggestions channel → bot creates an embed with vote buttons and a discussion thread
+- Like/dislike voting with duplicate prevention and vote toggling
+- Staff with manager roles can approve, deny, or delete suggestions
+- All actions update the embed and notify the original author
+- Persistent buttons survive bot restarts
+
+### Application
+
+Multi-page staff application workflow.
+
+- "Apply" button creates a private channel visible only to the applicant and reviewers
+- Modal forms collect answers across multiple pages (5 questions per page), with progress saved between pages
+- Answer quality validation prevents low-effort submissions
+- Staff tools: read full application (paginated), accept, deny with reason, background check (optional MySQL/Plan integration), view application history
+- Inactivity tracking: warns after 3 days, auto-abandons after 7 days
+- `/appstats` and `/apphistory <user>` slash commands
+
+### Tickets
+
+Thread-based support ticket system with categories.
+
+- Ticket panel with per-category buttons (gameplay, billing, reports, appeals, bugs — fully configurable)
+- Creates private threads with staff pings and welcome messages
+- Close with optional reason, reopen via command or thread unarchive (checks authorization via audit log)
+- Anti-archive background task keeps open tickets unarchived
+- Reminder system: `/remindme` sets initial + daily reminders with snooze/stop buttons that persist across restarts
+- Sequential ticket numbering per category
+- `/tickets`, `/ticketstats`, `/closeticket`, `/reopenticket`, `/addticket`
+
+### Shopkeepers
+
+CSV trade log importer and market analysis for the Minecraft Shopkeepers plugin.
+
+- Auto-imports CSV trade logs on a configurable interval (blocking I/O runs in a thread pool)
+- Incremental processing with SHA-256 deduplication
+- NBT parser identifies enchanted books, potions, tipped arrows, shulker boxes, and plugin items (ExecutableItems, ItemsAdder, etc.)
+- Dual format support: legacy Bukkit NBT and modern 1.20.5+ components
+- Admin shop prices excluded from market averages
+
+**Public commands:** `/price`, `/top`, `/search`, `/player`, `/shop`, `/trending`, `/shops`, `/players`
+**Admin commands:** `/shopkeepers_import`, `/shopkeepers_stats`, `/economy`, `/sinks`, `/faucets`
+
+### Status Channels
+
+Auto-updating voice channels with server statistics.
+
+- Updates every 11 minutes with jitter to avoid API rate limits
+- Minecraft player count via `mcstatus` (async DNS lookup + status query)
+- Discord member count
+- Configurable format strings with injection protection
+
+### Link
+
+Simple `!link` prefix command that displays instructions for linking Minecraft accounts to Discord. Includes a per-user cooldown (10 seconds).
+
+## Creating a New Branch
+
+```bash
+python create_branch.py my_feature "Description of my feature"
+```
+
+Creates:
+```
+branches/my_feature/
+├── __init__.py
+├── branch.yml        # Manifest
+├── branch.py         # OakBranch subclass with example commands
+└── config.yml        # Runtime config
+```
+
+The generated branch includes a database schema, `DEFAULT_CONFIG`, lifecycle hooks, and example commands. Load it with `/load my_feature` or restart the bot.
+
+Set `database: false` in `branch.yml` if you don't need a database.
 
 ## Logging
 
-Logs are stored in the `logs/` directory with files named `oak_YYYYMMDD.log` and include:
-- Bot startup and shutdown events
-- Branch loading/reloading
-- User actions (suggestions, applications)
-- Errors and warnings
-- Discord API issues
-
-Logs are also output to console for real-time monitoring.
-
-## Security Features
-
-- All secrets stored in `.env` file (`.env` includes placeholders for public release, use `.env.local` for actual secrets)
-- Input validation and sanitization
-- SQL injection prevention (parameterized queries)
-- Discord token never exposed in code
-- MySQL credentials in application config only (not global)
-
-## Development
-
-### Adding Features to Existing Branches
-
-1. Edit the branch file: `branches/<name>/branch.py`
-2. Add new settings to: `branches/<name>/config.yml`
-3. Reload the branch: `/reload <name>`
-
-### Creating New Branches
-
-1. Use the creation script:
-   ```bash
-   python create_branch.py my_feature "Description"
-   ```
-2. Edit `branches/my_feature/config.yml` - Set your channel IDs, role IDs, etc.
-3. Edit `branches/my_feature/branch.py` - Add your commands and logic
-4. If you don't need a database, comment out the database init in `cog_load()`
-5. Load the branch: `/load my_feature` (or restart bot)
-
-> **Tip**: `cog_load()` and `cog_unload()` are Discord.py Cog lifecycle methods. Keep them for resource initialization/cleanup even if you don't use a database.
-
-### Best Practices
-
-1. **Always use config files** - Never hardcode IDs or settings
-2. **Test in development** - Use a test server before production
-3. **Check logs** - Monitor logs in the `logs/` directory for errors
-4. **Use hot-reload** - Use `/reload <branch>` instead of restarting
-5. **Validate input** - Use utility functions from `utils.py`
-6. **Handle errors** - Use try-except blocks with logging
+Logs go to both console and `logs/oak.log` with daily rotation (30-day retention). Discord.py's internal logging is suppressed to WARNING level.
 
 ## Troubleshooting
 
-### Bot won't start
-- Check that `DISCORD_TOKEN` is set in `.env`
-- Verify all required environment variables are present
-- Check console output for specific errors
+**Bot won't start** — check `DISCORD_TOKEN` and `GUILD_ID` in `.env`.
 
-### Commands not working
-- Verify bot has proper Discord permissions in server settings
-- Check that role IDs in configs are correct
-- Use `/branches` to see if branch is loaded
+**Branch won't load** — check syntax with `python -m py_compile branches/<name>/branch.py`, verify `branch.yml` and `config.yml` are valid YAML, and check logs.
 
-### Branch won't load
-- Check syntax: `python -m py_compile branches/<name>/branch.py`
-- Review logs in the `logs/` directory
-- Verify `config.yml` is valid YAML
+**Commands not appearing** — run `/sync` to force-sync slash commands. Verify the branch is loaded with `/branches`.
 
-### Database errors
-- Check that the branch folder is writable
-- Review database initialization in logs
-- Each branch has its own `data.db` in its folder
-- Delete `branches/<name>/data.db` to rebuild that branch's database (loses data!)
-
-### MySQL/Plan integration not working
-- Verify credentials in `branches/application/config.yml`
-- Set `mysql.enabled: false` to disable if not using Plan
-- Check network connectivity to MySQL server
-
-## Support
-
-For issues or questions:
-1. Check the logs first (in the `logs/` directory)
-2. Review this README
-3. Check branch-specific config files
-4. Verify Discord bot permissions
-5. Open an issue on GitHub: https://github.com/LoralonMC/oak/issues
+**Database errors** — check that the branch folder is writable. Delete `branches/<name>/data.db` to rebuild (loses data).
 
 ## License
 
-MIT License - See LICENSE file for details
+MIT License — see LICENSE file for details.
 
 ---
 
-**Oak** - A modular Discord bot framework by [LoralonMC](https://github.com/LoralonMC)
+**Oak** — by [LoralonMC](https://github.com/LoralonMC)
