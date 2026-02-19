@@ -1,0 +1,6 @@
+id: application
+name: Application
+version: "1.0.0"
+description: Staff application system with multi-page modals
+main: branch.Application
+database: true

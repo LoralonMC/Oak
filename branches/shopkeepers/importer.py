@@ -4,6 +4,7 @@ Stateless import engine for CSV trade log files.
 All config is passed in as arguments from branch.py.
 """
 
+import asyncio
 import csv
 import hashlib
 import logging
@@ -47,6 +48,9 @@ _FILENAME_PATTERN = re.compile(r"^trades-(\d{4}-\d{2}-\d{2})\.csv$")
 # Max warnings logged per file before suppressing
 _MAX_WARNINGS_PER_FILE = 50
 
+# Max CSV file size (50 MB) — skip files larger than this
+_MAX_CSV_FILE_SIZE = 50 * 1024 * 1024
+
 
 @dataclass
 class ImportResult:
@@ -58,6 +62,17 @@ class ImportResult:
     duplicate_trades: int = 0
     new_items: int = 0
     errors: list[str] = field(default_factory=list)
+
+
+def _read_csv_file(filepath: str) -> list[list[str]]:
+    """Read all rows from a CSV file synchronously.
+
+    Returns a list of rows (each row is a list of strings).
+    This function runs in a thread to avoid blocking the event loop.
+    """
+    with open(filepath, "r", encoding="utf-8", newline="") as f:
+        reader = csv.reader(f)
+        return list(reader)
 
 
 async def import_all(
@@ -100,193 +115,210 @@ async def import_all(
 
         for filepath, trade_date, filename in csv_files:
             try:
+                # Check file size before importing
+                file_stat = await asyncio.to_thread(Path(filepath).stat)
+                if file_stat.st_size > _MAX_CSV_FILE_SIZE:
+                    logger.warning(
+                        f"Skipping {filename}: file size {file_stat.st_size / 1024 / 1024:.1f} MB exceeds "
+                        f"{_MAX_CSV_FILE_SIZE / 1024 / 1024:.0f} MB limit"
+                    )
+                    result.files_skipped += 1
+                    continue
+
                 if not await _needs_import(db, filepath, filename):
                     result.files_skipped += 1
                     continue
 
+                # Read all CSV rows in a thread to avoid blocking the event loop
+                all_rows = await asyncio.to_thread(_read_csv_file, filepath)
+
                 file_warnings = 0
                 file_new = 0
                 file_dup = 0
+                file_affected_dates: set[str] = set()
+                line_num = 0
 
-                with open(filepath, "r", encoding="utf-8", newline="") as f:
-                    reader = csv.reader(f)
-                    for line_num, row in enumerate(reader):
-                        # Skip header row
-                        if line_num == 0:
-                            continue
+                for line_num, row in enumerate(all_rows):
+                    # Skip header row
+                    if line_num == 0:
+                        continue
 
-                        # Validate column count
-                        if len(row) != EXPECTED_COLUMNS:
-                            if file_warnings < _MAX_WARNINGS_PER_FILE:
-                                logger.warning(
-                                    f"{filename}:{line_num}: expected {EXPECTED_COLUMNS} columns, got {len(row)} — skipping"
-                                )
-                                file_warnings += 1
-                            continue
-
-                        # Parse amounts with validation
-                        try:
-                            item1_amount = int(row[COL_ITEM1_AMOUNT])
-                        except (ValueError, IndexError):
-                            if file_warnings < _MAX_WARNINGS_PER_FILE:
-                                logger.warning(f"{filename}:{line_num}: invalid item1_amount — skipping")
-                                file_warnings += 1
-                            continue
-
-                        item2_amount = None
-                        if row[COL_ITEM2_TYPE]:
-                            try:
-                                item2_amount = int(row[COL_ITEM2_AMOUNT])
-                            except (ValueError, IndexError):
-                                if file_warnings < _MAX_WARNINGS_PER_FILE:
-                                    logger.warning(f"{filename}:{line_num}: invalid item2_amount — skipping")
-                                    file_warnings += 1
-                                continue
-
-                        try:
-                            result_amount = int(row[COL_RESULT_AMOUNT])
-                        except (ValueError, IndexError):
-                            if file_warnings < _MAX_WARNINGS_PER_FILE:
-                                logger.warning(f"{filename}:{line_num}: invalid result_amount — skipping")
-                                file_warnings += 1
-                            continue
-
-                        try:
-                            trade_count = int(row[COL_TRADE_COUNT])
-                        except (ValueError, IndexError):
-                            if file_warnings < _MAX_WARNINGS_PER_FILE:
-                                logger.warning(f"{filename}:{line_num}: invalid trade_count — skipping")
-                                file_warnings += 1
-                            continue
-
-                        # Upsert item1 (always present)
-                        item1_id = await _upsert_item(
-                            db, row[COL_ITEM1_TYPE], row[COL_ITEM1_METADATA],
-                            plugin_identity_keys, item_cache, currency_config, currency_map, result,
-                        )
-
-                        # Upsert item2 (only if present)
-                        item2_id = None
-                        if row[COL_ITEM2_TYPE]:
-                            item2_id = await _upsert_item(
-                                db, row[COL_ITEM2_TYPE], row[COL_ITEM2_METADATA],
-                                plugin_identity_keys, item_cache, currency_config, currency_map, result,
+                    # Validate column count
+                    if len(row) != EXPECTED_COLUMNS:
+                        if file_warnings < _MAX_WARNINGS_PER_FILE:
+                            logger.warning(
+                                f"{filename}:{line_num}: expected {EXPECTED_COLUMNS} columns, got {len(row)} — skipping"
                             )
+                            file_warnings += 1
+                        continue
 
-                        # Upsert result item - check for uniform shulker first
-                        actual_result_amount = result_amount
-                        result_material = row[COL_RESULT_TYPE]
-                        result_metadata = row[COL_RESULT_METADATA]
+                    # Parse amounts with validation
+                    try:
+                        item1_amount = int(row[COL_ITEM1_AMOUNT])
+                    except (ValueError, IndexError):
+                        if file_warnings < _MAX_WARNINGS_PER_FILE:
+                            logger.warning(f"{filename}:{line_num}: invalid item1_amount — skipping")
+                            file_warnings += 1
+                        continue
 
-                        # Check if this is a shulker box with uniform contents
-                        if result_material.upper().endswith("SHULKER_BOX") and result_metadata:
-                            shulker_contents = parse_shulker_contents(result_metadata)
-                            if shulker_contents:
-                                # Uniform shulker - expand to bulk trade of contents
-                                content_item_id, content_count = shulker_contents
-                                # content_item_id is like "minecraft:gunpowder"
-                                # Extract material type from it
-                                content_material = content_item_id.replace("minecraft:", "").upper()
-                                result_material = content_material
-                                result_metadata = ""  # No special metadata for bulk items
-                                # Total items = items per shulker * number of shulkers * trade count factor
-                                actual_result_amount = content_count * result_amount
-
-                        result_item_id = await _upsert_item(
-                            db, result_material, result_metadata,
-                            plugin_identity_keys, item_cache, currency_config, currency_map, result,
-                        )
-
-                        # Compute fingerprint from raw CSV values (not expanded
-                        # shulker amounts) so it stays stable across parser changes.
-                        row_fingerprint = _compute_fingerprint(
-                            trade_date, row[COL_TIME], row[COL_PLAYER_UUID], row[COL_SHOP_UUID],
-                            row[COL_ITEM1_TYPE], row[COL_ITEM1_AMOUNT],
-                            row[COL_ITEM2_TYPE], row[COL_ITEM2_AMOUNT],
-                            row[COL_RESULT_TYPE], row[COL_RESULT_AMOUNT],
-                            row[COL_TRADE_COUNT],
-                        )
-
-                        # Calculate emerald costs (use actual_result_amount for shulker expansion)
-                        emerald_cost_total, emerald_cost_per_unit = _calculate_emerald_cost(
-                            item1_id, item1_amount, item2_id, item2_amount,
-                            actual_result_amount, trade_count, currency_map,
-                        )
-
-                        # Parse coordinate fields
+                    item2_amount = None
+                    if row[COL_ITEM2_TYPE]:
                         try:
-                            shop_x = int(row[COL_SHOP_X])
-                            shop_y = int(row[COL_SHOP_Y])
-                            shop_z = int(row[COL_SHOP_Z])
+                            item2_amount = int(row[COL_ITEM2_AMOUNT])
                         except (ValueError, IndexError):
                             if file_warnings < _MAX_WARNINGS_PER_FILE:
-                                logger.warning(f"{filename}:{line_num}: invalid coordinates — skipping")
+                                logger.warning(f"{filename}:{line_num}: invalid item2_amount — skipping")
                                 file_warnings += 1
                             continue
 
-                        # Insert trade (OR IGNORE for fingerprint dedup)
-                        # Use actual_result_amount for shulker-expanded trades
-                        cursor = await db.execute(
-                            """INSERT OR IGNORE INTO trades (
-                                trade_date, trade_time, player_uuid, shop_uuid,
-                                shop_type, shop_world, shop_x, shop_y, shop_z,
-                                shop_owner_uuid,
-                                item1_id, item1_amount, item2_id, item2_amount,
-                                result_item_id, result_amount, trade_count,
-                                emerald_cost_total, emerald_cost_per_unit,
-                                source_file, source_line, row_fingerprint
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                            (
-                                trade_date, row[COL_TIME], row[COL_PLAYER_UUID], row[COL_SHOP_UUID],
-                                row[COL_SHOP_TYPE], row[COL_SHOP_WORLD], shop_x, shop_y, shop_z,
-                                row[COL_SHOP_OWNER_UUID] or None,
-                                item1_id, item1_amount, item2_id, item2_amount,
-                                result_item_id, actual_result_amount, trade_count,
-                                emerald_cost_total, emerald_cost_per_unit,
-                                filename, line_num, row_fingerprint,
-                            ),
-                        )
+                    try:
+                        result_amount = int(row[COL_RESULT_AMOUNT])
+                    except (ValueError, IndexError):
+                        if file_warnings < _MAX_WARNINGS_PER_FILE:
+                            logger.warning(f"{filename}:{line_num}: invalid result_amount — skipping")
+                            file_warnings += 1
+                        continue
 
-                        if cursor.rowcount > 0:
-                            file_new += 1
-                            affected_dates.add(trade_date)
-                        else:
-                            file_dup += 1
+                    try:
+                        trade_count = int(row[COL_TRADE_COUNT])
+                    except (ValueError, IndexError):
+                        if file_warnings < _MAX_WARNINGS_PER_FILE:
+                            logger.warning(f"{filename}:{line_num}: invalid trade_count — skipping")
+                            file_warnings += 1
+                        continue
 
-                        # Upsert player names (update even for duplicate trades to keep names current)
-                        player_uuid = row[COL_PLAYER_UUID]
-                        player_name = row[COL_PLAYER_NAME]
-                        if player_uuid and player_name:
-                            await db.execute(
-                                """INSERT INTO players (uuid, last_name, last_seen)
-                                   VALUES (?, ?, ?)
-                                   ON CONFLICT(uuid) DO UPDATE SET
-                                       last_name = excluded.last_name,
-                                       last_seen = MAX(last_seen, excluded.last_seen)""",
-                                (player_uuid, player_name, trade_date),
-                            )
-
-                        # Upsert shop owner names
-                        owner_uuid = row[COL_SHOP_OWNER_UUID]
-                        owner_name = row[COL_SHOP_OWNER_NAME]
-                        if owner_uuid and owner_name:
-                            await db.execute(
-                                """INSERT INTO players (uuid, last_name, last_seen)
-                                   VALUES (?, ?, ?)
-                                   ON CONFLICT(uuid) DO UPDATE SET
-                                       last_name = excluded.last_name,
-                                       last_seen = MAX(last_seen, excluded.last_seen)""",
-                                (owner_uuid, owner_name, trade_date),
-                            )
-
-                    # Update file record with final state (line_num is last line read)
-                    stat = Path(filepath).stat()
-                    await _update_file_record(
-                        db, filename, trade_date, line_num,
-                        stat.st_size, stat.st_mtime_ns,
+                    # Upsert item1 (always present)
+                    item1_id = await _upsert_item(
+                        db, row[COL_ITEM1_TYPE], row[COL_ITEM1_METADATA],
+                        plugin_identity_keys, item_cache, currency_config, currency_map, result,
                     )
 
+                    # Upsert item2 (only if present)
+                    item2_id = None
+                    if row[COL_ITEM2_TYPE]:
+                        item2_id = await _upsert_item(
+                            db, row[COL_ITEM2_TYPE], row[COL_ITEM2_METADATA],
+                            plugin_identity_keys, item_cache, currency_config, currency_map, result,
+                        )
+
+                    # Upsert result item - check for uniform shulker first
+                    actual_result_amount = result_amount
+                    result_material = row[COL_RESULT_TYPE]
+                    result_metadata = row[COL_RESULT_METADATA]
+
+                    # Check if this is a shulker box with uniform contents
+                    if result_material.upper().endswith("SHULKER_BOX") and result_metadata:
+                        shulker_contents = parse_shulker_contents(result_metadata)
+                        if shulker_contents:
+                            # Uniform shulker - expand to bulk trade of contents
+                            content_item_id, content_count = shulker_contents
+                            # content_item_id is like "minecraft:gunpowder"
+                            # Extract material type from it
+                            content_material = content_item_id.replace("minecraft:", "").upper()
+                            result_material = content_material
+                            result_metadata = ""  # No special metadata for bulk items
+                            # Total items = items per shulker * number of shulkers * trade count factor
+                            actual_result_amount = content_count * result_amount
+
+                    result_item_id = await _upsert_item(
+                        db, result_material, result_metadata,
+                        plugin_identity_keys, item_cache, currency_config, currency_map, result,
+                    )
+
+                    # Compute fingerprint from raw CSV values (not expanded
+                    # shulker amounts) so it stays stable across parser changes.
+                    row_fingerprint = _compute_fingerprint(
+                        trade_date, row[COL_TIME], row[COL_PLAYER_UUID], row[COL_SHOP_UUID],
+                        row[COL_ITEM1_TYPE], row[COL_ITEM1_AMOUNT],
+                        row[COL_ITEM2_TYPE], row[COL_ITEM2_AMOUNT],
+                        row[COL_RESULT_TYPE], row[COL_RESULT_AMOUNT],
+                        row[COL_TRADE_COUNT],
+                    )
+
+                    # Calculate emerald costs (use actual_result_amount for shulker expansion)
+                    emerald_cost_total, emerald_cost_per_unit = _calculate_emerald_cost(
+                        item1_id, item1_amount, item2_id, item2_amount,
+                        actual_result_amount, trade_count, currency_map,
+                    )
+
+                    # Parse coordinate fields
+                    try:
+                        shop_x = int(row[COL_SHOP_X])
+                        shop_y = int(row[COL_SHOP_Y])
+                        shop_z = int(row[COL_SHOP_Z])
+                    except (ValueError, IndexError):
+                        if file_warnings < _MAX_WARNINGS_PER_FILE:
+                            logger.warning(f"{filename}:{line_num}: invalid coordinates — skipping")
+                            file_warnings += 1
+                        continue
+
+                    # Insert trade (OR IGNORE for fingerprint dedup)
+                    # Use actual_result_amount for shulker-expanded trades
+                    cursor = await db.execute(
+                        """INSERT OR IGNORE INTO trades (
+                            trade_date, trade_time, player_uuid, shop_uuid,
+                            shop_type, shop_world, shop_x, shop_y, shop_z,
+                            shop_owner_uuid,
+                            item1_id, item1_amount, item2_id, item2_amount,
+                            result_item_id, result_amount, trade_count,
+                            emerald_cost_total, emerald_cost_per_unit,
+                            source_file, source_line, row_fingerprint
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            trade_date, row[COL_TIME], row[COL_PLAYER_UUID], row[COL_SHOP_UUID],
+                            row[COL_SHOP_TYPE], row[COL_SHOP_WORLD], shop_x, shop_y, shop_z,
+                            row[COL_SHOP_OWNER_UUID] or None,
+                            item1_id, item1_amount, item2_id, item2_amount,
+                            result_item_id, actual_result_amount, trade_count,
+                            emerald_cost_total, emerald_cost_per_unit,
+                            filename, line_num, row_fingerprint,
+                        ),
+                    )
+
+                    if cursor.rowcount > 0:
+                        file_new += 1
+                        file_affected_dates.add(trade_date)
+                    else:
+                        file_dup += 1
+
+                    # Upsert player names (update even for duplicate trades to keep names current)
+                    player_uuid = row[COL_PLAYER_UUID]
+                    player_name = row[COL_PLAYER_NAME]
+                    if player_uuid and player_name:
+                        await db.execute(
+                            """INSERT INTO players (uuid, last_name, last_seen)
+                               VALUES (?, ?, ?)
+                               ON CONFLICT(uuid) DO UPDATE SET
+                                   last_name = excluded.last_name,
+                                   last_seen = MAX(last_seen, excluded.last_seen)""",
+                            (player_uuid, player_name, trade_date),
+                        )
+
+                    # Upsert shop owner names
+                    owner_uuid = row[COL_SHOP_OWNER_UUID]
+                    owner_name = row[COL_SHOP_OWNER_NAME]
+                    if owner_uuid and owner_name:
+                        await db.execute(
+                            """INSERT INTO players (uuid, last_name, last_seen)
+                               VALUES (?, ?, ?)
+                               ON CONFLICT(uuid) DO UPDATE SET
+                                   last_name = excluded.last_name,
+                                   last_seen = MAX(last_seen, excluded.last_seen)""",
+                            (owner_uuid, owner_name, trade_date),
+                        )
+
+                # Update file record with final state (line_num is last line read)
+                stat = await asyncio.to_thread(Path(filepath).stat)
+                await _update_file_record(
+                    db, filename, trade_date, line_num,
+                    stat.st_size, stat.st_mtime_ns,
+                )
+
                 await db.commit()
+
+                # Only merge file's affected dates into global set after successful commit
+                affected_dates.update(file_affected_dates)
+
                 result.new_trades += file_new
                 result.duplicate_trades += file_dup
                 result.files_imported += 1
@@ -340,7 +372,7 @@ async def _needs_import(
     Returns True if the file is new or has changed since last import.
     Fingerprint-based dedup in the main loop handles any overlap.
     """
-    stat = Path(filepath).stat()
+    stat = await asyncio.to_thread(Path(filepath).stat)
 
     row = await db.execute_fetchall(
         "SELECT file_size, file_mtime_ns FROM imported_files WHERE filename = ?",

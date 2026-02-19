@@ -8,11 +8,10 @@ from discord import app_commands
 from discord.ext import commands, tasks
 import aiosqlite
 import json
-import logging
 from pathlib import Path
 from datetime import datetime, timedelta
-from database import init_branch_database
-from config import GUILD_ID
+from oak import OakBranch
+from oak.context import BranchContext
 
 # Import our modularized components
 from .helpers import (
@@ -31,10 +30,8 @@ from .views import (
     ManageView
 )
 
-logger = logging.getLogger(__name__)
-
 # Database schema for applications
-# NOTE: New columns (last_activity_at, warning_sent_at, denied_at, denial_dm_sent, denial_reason) are added via migration in cog_load
+# NOTE: New columns (last_activity_at, warning_sent_at, denied_at, denial_dm_sent, denial_reason) are added via migration in on_enable
 APPLICATIONS_SCHEMA = """
 CREATE TABLE IF NOT EXISTS applications (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -54,6 +51,11 @@ async def handle_application_start(interaction: discord.Interaction):
     """
     Handle the start of a new application.
 
+    Uses a 3-phase approach to avoid holding a DB connection during slow Discord API calls:
+      Phase 1: Check existing apps (short DB connection, close it)
+      Phase 2: Create Discord channel (no DB held)
+      Phase 3: Save to DB (new connection, atomic app_index assignment)
+
     Args:
         interaction: Discord interaction from the Apply button
     """
@@ -61,8 +63,8 @@ async def handle_application_start(interaction: discord.Interaction):
     guild = interaction.guild
 
     try:
+        # --- Phase 1: Check existing applications (short DB connection) ---
         async with aiosqlite.connect(get_db_path()) as db:
-            # Check for existing applications first
             async with db.execute(
                 "SELECT channel_id, status FROM applications WHERE user_id = ? AND status IN ('in_progress', 'pending')",
                 (user.id,)
@@ -85,107 +87,118 @@ async def handle_application_start(interaction: discord.Interaction):
                         # Channel was deleted but application still exists - clean it up
                         await db.execute("UPDATE applications SET status = 'cancelled' WHERE channel_id = ?", (channel_id,))
                         await db.commit()
-                        logger.info(f"Cleaned up orphaned application (channel {channel_id}) for user {user.id}")
+        # DB connection closed here
 
-            # Get next application index
-            async with db.execute("SELECT MAX(app_index) FROM applications") as cursor:
-                max_index = await cursor.fetchone()
-                next_index = (max_index[0] or 0) + 1
+        # --- Phase 2: Create Discord channel (no DB held - this is the slow Discord API call) ---
+        config = get_application_config()
+        application_category_id = config.get("settings", {}).get("application_category_id", 0)
+        channel_name_prefix = config.get("settings", {}).get("application", {}).get("channel_name_prefix", "application")
 
-            # Load config
-            config = get_application_config()
-            application_category_id = config.get("settings", {}).get("application_category_id", 0)
-            channel_name_prefix = config.get("settings", {}).get("application", {}).get("channel_name_prefix", "application")
+        # Create channel with proper permissions
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            guild.me: discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True,
+                manage_messages=True,
+                manage_channels=True
+            ),
+            user: discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True,
+                attach_files=False,  # Prevent spam/abuse
+                add_reactions=False
+            ),
+        }
 
-            # Create channel with proper permissions
-            overwrites = {
-                guild.default_role: discord.PermissionOverwrite(view_channel=False),
-                guild.me: discord.PermissionOverwrite(
+        # Add reviewer roles with management permissions
+        reviewer_role_ids = config.get("settings", {}).get("reviewer_role_ids", [])
+        for role_id in reviewer_role_ids:
+            role = guild.get_role(role_id)
+            if role:
+                overwrites[role] = discord.PermissionOverwrite(
                     view_channel=True,
                     send_messages=True,
                     read_message_history=True,
                     manage_messages=True,
-                    manage_channels=True
-                ),
-                user: discord.PermissionOverwrite(
-                    view_channel=True,
-                    send_messages=True,
-                    read_message_history=True,
-                    attach_files=False,  # Prevent spam/abuse
-                    add_reactions=False
-                ),
-            }
-
-            # Add reviewer roles with management permissions
-            reviewer_role_ids = config.get("settings", {}).get("reviewer_role_ids", [])
-            for role_id in reviewer_role_ids:
-                role = guild.get_role(role_id)
-                if role:
-                    overwrites[role] = discord.PermissionOverwrite(
-                        view_channel=True,
-                        send_messages=True,
-                        read_message_history=True,
-                        manage_messages=True,
-                        manage_threads=True
-                    )
-
-            category = discord.utils.get(guild.categories, id=application_category_id)
-            if not category:
-                logger.error(f"Application category {application_category_id} not found")
-                await interaction.followup.send(
-                    embed=discord.Embed(
-                        title="Configuration Error",
-                        description="Application system is not properly configured. Please contact an administrator.",
-                        color=get_embed_colors()["error"]
-                    ),
-                    ephemeral=True
+                    manage_threads=True
                 )
-                return
 
-            channel = await guild.create_text_channel(
-                name=f"{channel_name_prefix}-{next_index:02}",
-                category=category,
-                overwrites=overwrites,
-                reason=f"Application created by {user}"
+        category = discord.utils.get(guild.categories, id=application_category_id)
+        if not category:
+            await interaction.followup.send(
+                embed=discord.Embed(
+                    title="Configuration Error",
+                    description="Application system is not properly configured. Please contact an administrator.",
+                    color=get_embed_colors()["error"]
+                ),
+                ephemeral=True
             )
+            return
 
-            # Save to database with race condition handling
-            try:
+        # Use a temporary name; we'll know the real index after the atomic INSERT
+        channel = await guild.create_text_channel(
+            name=f"{channel_name_prefix}-new",
+            category=category,
+            overwrites=overwrites,
+            reason=f"Application created by {user}"
+        )
+
+        # --- Phase 3: Save to DB (new connection, atomic app_index assignment) ---
+        try:
+            async with aiosqlite.connect(get_db_path()) as db:
+                # Atomic app_index assignment: INSERT with subquery to avoid separate SELECT + INSERT race
                 await db.execute(
-                    "INSERT INTO applications (user_id, channel_id, app_index, answers, status, submitted_at, last_activity_at) VALUES (?, ?, ?, ?, ?, datetime('now'), datetime('now'))",
-                    (user.id, channel.id, next_index, "[]", "in_progress")
+                    """INSERT INTO applications (user_id, channel_id, app_index, answers, status, submitted_at, last_activity_at)
+                    VALUES (?, ?, (SELECT COALESCE(MAX(app_index), 0) + 1 FROM applications), ?, ?, datetime('now'), datetime('now'))""",
+                    (user.id, channel.id, "[]", "in_progress")
                 )
                 await db.commit()
-                logger.info(f"Created application #{next_index} for {user} (ID: {user.id}) in channel {channel.id}")
-            except aiosqlite.IntegrityError:
-                # Race condition: user already has an application
-                logger.warning(f"Duplicate application creation attempt for user {user.id}")
-                await channel.delete(reason="Duplicate application (race condition)")
 
-                # Find existing application
+                # Retrieve the assigned app_index for channel renaming
+                async with db.execute(
+                    "SELECT app_index FROM applications WHERE channel_id = ?",
+                    (channel.id,)
+                ) as cursor:
+                    idx_row = await cursor.fetchone()
+                    next_index = idx_row[0] if idx_row else 0
+
+            # Rename channel to include the real index
+            try:
+                await channel.edit(name=f"{channel_name_prefix}-{next_index:02}")
+            except discord.HTTPException:
+                pass  # Non-critical: channel works even with temp name
+
+        except aiosqlite.IntegrityError:
+            # Race condition: user already has an application
+            await channel.delete(reason="Duplicate application (race condition)")
+
+            # Find existing application
+            async with aiosqlite.connect(get_db_path()) as db:
                 async with db.execute(
                     "SELECT channel_id, status FROM applications WHERE user_id = ? AND status IN ('in_progress', 'pending')",
                     (user.id,)
                 ) as cursor:
                     existing = await cursor.fetchone()
 
-                if existing:
-                    existing_channel_id, existing_status = existing
-                    existing_channel = guild.get_channel(existing_channel_id)
-                    if existing_channel:
-                        await interaction.followup.send(
-                            embed=discord.Embed(
-                                title="Application Already Exists",
-                                description=f"You already have an application: {existing_channel.mention}\n\nStatus: **{existing_status.title()}**",
-                                color=get_embed_colors()["warning"]
-                            ),
-                            ephemeral=True
-                        )
-                        return
+            if existing:
+                existing_channel_id, existing_status = existing
+                existing_channel = guild.get_channel(existing_channel_id)
+                if existing_channel:
+                    await interaction.followup.send(
+                        embed=discord.Embed(
+                            title="Application Already Exists",
+                            description=f"You already have an application: {existing_channel.mention}\n\nStatus: **{existing_status.title()}**",
+                            color=get_embed_colors()["warning"]
+                        ),
+                        ephemeral=True
+                    )
+                    return
 
-                # If we get here, something went wrong
-                logger.error(f"Failed to handle race condition for user {user.id}")
-                raise
+            # If we get here, something went wrong
+            raise
 
         # Try to DM the user
         try:
@@ -199,21 +212,21 @@ async def handle_application_start(interaction: discord.Interaction):
                 description=":warning: Couldn't DM applicant. Please remind them to open DMs.",
                 color=get_embed_colors()["warning"]
             ))
-        except Exception as e:
-            logger.error(f"Error sending DM to applicant {user.id}: {e}")
+        except Exception:
+            pass
 
         # Send welcome message in application channel
         await channel.send(
             content=user.mention,
             embed=discord.Embed(
-                title="👋 Welcome to the Application Process",
+                title="Welcome to the Application Process",
                 description=(
                     "Use the buttons below to begin your application or cancel if you changed your mind.\n\n"
                     "**Before you start:**\n"
-                    "• Answer all questions honestly and thoroughly\n"
-                    "• This will take about 5-10 minutes\n"
-                    "• Your progress is saved after each page\n\n"
-                    "Good luck! 🍀"
+                    "- Answer all questions honestly and thoroughly\n"
+                    "- This will take about 5-10 minutes\n"
+                    "- Your progress is saved after each page\n\n"
+                    "Good luck!"
                 ),
                 color=get_embed_colors()["info"]
             ),
@@ -234,8 +247,7 @@ async def handle_application_start(interaction: discord.Interaction):
             ephemeral=True
         )
 
-    except discord.HTTPException as e:
-        logger.error(f"Discord API error creating application for {user.id}: {e}")
+    except discord.HTTPException:
         try:
             await interaction.followup.send(
                 embed=discord.Embed(
@@ -245,11 +257,10 @@ async def handle_application_start(interaction: discord.Interaction):
                 ),
                 ephemeral=True
             )
-        except Exception as err:
-            logger.error(f"Failed to send error response: {err}")
+        except Exception:
+            pass
 
-    except Exception as e:
-        logger.error(f"Unexpected error creating application for {user.id}: {e}", exc_info=True)
+    except Exception:
         try:
             await interaction.followup.send(
                 embed=discord.Embed(
@@ -259,24 +270,21 @@ async def handle_application_start(interaction: discord.Interaction):
                 ),
                 ephemeral=True
             )
-        except Exception as err:
-            logger.error(f"Failed to send error response: {err}")
+        except Exception:
+            pass
 
 
-class Application(commands.Cog):
+class Application(OakBranch):
     """Staff application management system."""
 
-    def __init__(self, bot):
-        self.bot = bot
+    def __init__(self, ctx: BranchContext):
+        super().__init__(ctx)
 
-        # Set database path
+        # Set database path for sub-modules that use aiosqlite directly
         self.db_path = str(Path(__file__).parent / "data.db")
 
-        # Load config
-        self.config = get_application_config()
-        settings = self.config.get("settings", {})
-
         # Cache frequently used settings
+        settings = self.config.get("settings", {})
         self.application_channel_id = settings.get("application_channel_id", 0)
         self.application_category_id = settings.get("application_category_id", 0)
         self.accepted_category_id = settings.get("accepted_category_id", 0)
@@ -295,14 +303,44 @@ class Application(commands.Cog):
         # Application button view
         self._application_button_view = ApplicationButtonView(handle_application_start_func=handle_application_start)
 
-        logger.info(f"Application branch initialized with config (db: {self.db_path})")
+        self.log.info(f"Application branch initialized with config (db: {self.db_path})")
 
-    async def cog_load(self):
-        """Initialize database when branch is loaded."""
-        await init_branch_database(self.db_path, APPLICATIONS_SCHEMA, "Application")
+    async def on_enable(self):
+        """Initialize database and register persistent views."""
+        await self.db.initialize(APPLICATIONS_SCHEMA)
+
+        # Warn if reviewer_role_ids is still the placeholder value
+        reviewer_role_ids = self.config.get("settings", {}).get("reviewer_role_ids", [])
+        if reviewer_role_ids == [0]:
+            self.log.warning(
+                "reviewer_role_ids is set to [0] (placeholder). "
+                "Application reviews will not work until valid role IDs are configured."
+            )
 
         # Run database migration for new columns
         await self._migrate_database()
+
+        # Register persistent views (both legacy and namespaced)
+        self.log.info("Registering persistent views for Application")
+        self.bot.add_view(ApplicationButtonView(handle_application_start_func=handle_application_start, legacy=True))
+        self.bot.add_view(self._application_button_view)
+        self.bot.add_view(StartCancelView(
+            get_config_func=get_application_config,
+            get_questions_func=get_application_questions,
+            get_db_path_func=get_db_path,
+            legacy=True,
+        ))
+        self.bot.add_view(StartCancelView(
+            get_config_func=get_application_config,
+            get_questions_func=get_application_questions,
+            get_db_path_func=get_db_path,
+        ))
+        self.bot.add_view(ContinueView(legacy=True))
+        self.bot.add_view(ContinueView())
+        self.bot.add_view(PostSubmissionView(get_db_path_func=get_db_path, legacy=True))
+        self.bot.add_view(PostSubmissionView(get_db_path_func=get_db_path))
+        self.bot.add_view(ManageView(get_db_path_func=get_db_path, legacy=True))
+        self.bot.add_view(ManageView(get_db_path_func=get_db_path))
 
         # Start inactivity check task if enabled
         inactivity_config = self.config.get("settings", {}).get("inactivity", {})
@@ -310,7 +348,7 @@ class Application(commands.Cog):
             check_interval = inactivity_config.get("check_interval_hours", 12)
             self.check_inactive_applications.change_interval(hours=check_interval)
             self.check_inactive_applications.start()
-            logger.info(f"Inactivity check task started (interval: {check_interval} hours)")
+            self.log.info(f"Inactivity check task started (interval: {check_interval} hours)")
 
     async def _migrate_database(self):
         """Migrate database schema to add new columns if they don't exist."""
@@ -322,7 +360,7 @@ class Application(commands.Cog):
 
                 # Add last_activity_at if it doesn't exist
                 if 'last_activity_at' not in columns:
-                    logger.info("Migrating database: Adding last_activity_at column")
+                    self.log.info("Migrating database: Adding last_activity_at column")
                     # SQLite ALTER TABLE doesn't support CURRENT_TIMESTAMP default, so we use NULL and update
                     await db.execute("""
                         ALTER TABLE applications
@@ -339,76 +377,62 @@ class Application(commands.Cog):
                         ON applications(last_activity_at)
                     """)
                     await db.commit()
-                    logger.info("Migration complete: last_activity_at column and index added")
+                    self.log.info("Migration complete: last_activity_at column and index added")
 
                 # Add warning_sent_at if it doesn't exist
                 if 'warning_sent_at' not in columns:
-                    logger.info("Migrating database: Adding warning_sent_at column")
+                    self.log.info("Migrating database: Adding warning_sent_at column")
                     await db.execute("""
                         ALTER TABLE applications
                         ADD COLUMN warning_sent_at TIMESTAMP
                     """)
                     await db.commit()
-                    logger.info("Migration complete: warning_sent_at column added")
+                    self.log.info("Migration complete: warning_sent_at column added")
 
                 # Add denied_at if it doesn't exist
                 if 'denied_at' not in columns:
-                    logger.info("Migrating database: Adding denied_at column")
+                    self.log.info("Migrating database: Adding denied_at column")
                     await db.execute("""
                         ALTER TABLE applications
                         ADD COLUMN denied_at TIMESTAMP
                     """)
                     await db.commit()
-                    logger.info("Migration complete: denied_at column added")
+                    self.log.info("Migration complete: denied_at column added")
 
                 # Add denial_dm_sent if it doesn't exist
                 if 'denial_dm_sent' not in columns:
-                    logger.info("Migrating database: Adding denial_dm_sent column")
+                    self.log.info("Migrating database: Adding denial_dm_sent column")
                     await db.execute("""
                         ALTER TABLE applications
                         ADD COLUMN denial_dm_sent INTEGER DEFAULT 0
                     """)
                     await db.commit()
-                    logger.info("Migration complete: denial_dm_sent column added")
+                    self.log.info("Migration complete: denial_dm_sent column added")
 
                 # Add denial_reason if it doesn't exist
                 if 'denial_reason' not in columns:
-                    logger.info("Migrating database: Adding denial_reason column")
+                    self.log.info("Migrating database: Adding denial_reason column")
                     await db.execute("""
                         ALTER TABLE applications
                         ADD COLUMN denial_reason TEXT
                     """)
                     await db.commit()
-                    logger.info("Migration complete: denial_reason column added")
+                    self.log.info("Migration complete: denial_reason column added")
 
         except Exception as e:
-            logger.error(f"Error migrating database: {e}", exc_info=True)
+            self.log.error(f"Error migrating database: {e}", exc_info=True)
             raise
 
-    async def cog_unload(self):
-        """Stop background tasks when cog is unloaded."""
+    async def on_disable(self):
+        """Stop background tasks when branch is unloaded."""
         if self.check_inactive_applications.is_running():
             self.check_inactive_applications.cancel()
-        logger.info("Application branch unloaded")
+        self.log.info("Application branch unloaded")
 
-    @commands.Cog.listener()
     async def on_ready(self):
-        """Register persistent views when bot is ready."""
-        logger.info("Application branch loaded - Registering persistent views")
-
-        # Register persistent views
-        self.bot.add_view(self._application_button_view)
-        self.bot.add_view(StartCancelView(
-            get_config_func=get_application_config,
-            get_questions_func=get_application_questions,
-            get_db_path_func=get_db_path
-        ))
-        self.bot.add_view(ContinueView())
-        self.bot.add_view(PostSubmissionView(get_db_path_func=get_db_path))
-        self.bot.add_view(ManageView(get_db_path_func=get_db_path))
-
+        """Ensure application message exists when bot is ready."""
         await self.ensure_application_message()
-        logger.info("Application branch ready")
+        self.log.info("Application branch ready")
 
     @app_commands.command(name="appstats", description="Show application statistics")
     @app_commands.default_permissions(administrator=True)
@@ -423,7 +447,7 @@ class Application(commands.Cog):
             if not any(role_id in reviewer_role_ids for role_id in user_role_ids):
                 await interaction.response.send_message(
                     embed=discord.Embed(
-                        description="❌ You don't have permission to use this command.",
+                        description="You don't have permission to use this command.",
                         color=get_embed_colors()["error"]
                     ),
                     ephemeral=True
@@ -461,7 +485,7 @@ class Application(commands.Cog):
                     avg_processing = avg_days[0] if avg_days and avg_days[0] else 0
 
             embed = discord.Embed(
-                title="📊 Application Statistics",
+                title="Application Statistics",
                 color=get_embed_colors()["info"]
             )
 
@@ -479,7 +503,7 @@ class Application(commands.Cog):
             await interaction.response.send_message(embed=embed, ephemeral=True)
 
         except Exception as e:
-            logger.error(f"Error getting application stats: {e}")
+            self.log.error(f"Error getting application stats: {e}")
             await interaction.response.send_message("Failed to retrieve statistics.", ephemeral=True)
 
     @app_commands.command(name="apphistory", description="View a user's application history")
@@ -499,7 +523,7 @@ class Application(commands.Cog):
             if not any(role_id in reviewer_role_ids for role_id in user_role_ids):
                 await interaction.response.send_message(
                     embed=discord.Embed(
-                        description="❌ You don't have permission to use this command.",
+                        description="You don't have permission to use this command.",
                         color=get_embed_colors()["error"]
                     ),
                     ephemeral=True
@@ -530,7 +554,7 @@ class Application(commands.Cog):
 
             # Create summary embed
             summary_embed = discord.Embed(
-                title=f"📜 Application History: {user.display_name}",
+                title=f"Application History: {user.display_name}",
                 description=f"Found **{len(all_apps)}** application(s). Use the dropdown to view full details.",
                 color=get_embed_colors()["info"]
             )
@@ -539,15 +563,15 @@ class Application(commands.Cog):
             for app_index, status, submitted_at, answers_json, channel_id, denied_at, denial_reason in all_apps:
                 # Format status with emoji
                 status_emoji = {
-                    "pending": "⏳",
-                    "accepted": "✅",
-                    "denied": "❌",
-                    "cancelled": "🚫",
-                    "abandoned": "💤",
-                    "in_progress": "📝"
-                }.get(status, "❓")
+                    "pending": "pending",
+                    "accepted": "accepted",
+                    "denied": "denied",
+                    "cancelled": "cancelled",
+                    "abandoned": "abandoned",
+                    "in_progress": "in progress"
+                }.get(status, status)
 
-                field_value = f"**Status:** {status_emoji} {status.title()}\n**Date:** {submitted_at[:10]}"
+                field_value = f"**Status:** {status.title()}\n**Date:** {submitted_at[:10]}"
 
                 # Add denial reason if available
                 if status == "denied" and denial_reason:
@@ -567,7 +591,7 @@ class Application(commands.Cog):
             )
 
         except Exception as e:
-            logger.error(f"Error getting application history: {e}")
+            self.log.error(f"Error getting application history: {e}")
             await interaction.response.send_message("Failed to retrieve application history.", ephemeral=True)
 
     async def ensure_application_message(self):
@@ -575,29 +599,29 @@ class Application(commands.Cog):
         try:
             channel = self.bot.get_channel(self.application_channel_id)
             if not channel:
-                logger.warning(f"Application channel {self.application_channel_id} not found")
+                self.log.warning(f"Application channel {self.application_channel_id} not found")
                 return
 
-            history = [m async for m in channel.history(limit=10)]
+            history = [m async for m in channel.history(limit=50)]
             if not any(m.author == self.bot.user and m.components for m in history):
                 await channel.send(
                     embed=discord.Embed(
-                        title="👮 Staff Application",
+                        title="Staff Application",
                         description=(
                             "Interested in becoming staff? Click below to start your application!\n\n"
                             "**Requirements:**\n"
-                            "• Be an active member of the community\n"
-                            "• Have a good understanding of server rules\n"
-                            "• Be willing to help other players\n"
-                            "• Have time to dedicate to staff duties"
+                            "- Be an active member of the community\n"
+                            "- Have a good understanding of server rules\n"
+                            "- Be willing to help other players\n"
+                            "- Have time to dedicate to staff duties"
                         ),
                         color=get_embed_colors()["info"]
                     ),
                     view=self._application_button_view
                 )
-                logger.info("Created new application button message")
+                self.log.info("Created new application button message")
         except Exception as e:
-            logger.error(f"Error ensuring application message: {e}")
+            self.log.error(f"Error ensuring application message: {e}")
 
     @tasks.loop(hours=12)
     async def check_inactive_applications(self):
@@ -619,13 +643,15 @@ class Application(commands.Cog):
                 await db.commit()
 
                 # Find applications that need warnings (inactive for warning_days, no warning sent yet)
+                # Exclude apps that should already be abandoned (inactive >= abandon_days)
                 async with db.execute("""
                     SELECT user_id, channel_id, last_activity_at
                     FROM applications
                     WHERE status = 'in_progress'
                     AND warning_sent_at IS NULL
                     AND julianday('now') - julianday(last_activity_at) >= ?
-                """, (warning_days,)) as cursor:
+                    AND julianday('now') - julianday(last_activity_at) < ?
+                """, (warning_days, abandon_days)) as cursor:
                     apps_needing_warning = [row async for row in cursor]
 
                 # Find applications that should be abandoned (inactive for abandon_days)
@@ -649,10 +675,10 @@ class Application(commands.Cog):
             denied_to_cleanup = await self._check_denied_apps_cleanup()
 
             if apps_needing_warning or apps_to_abandon or denied_to_cleanup:
-                logger.info(f"Inactivity check: Processed {len(apps_needing_warning)} warnings, {len(apps_to_abandon)} abandonments, and {denied_to_cleanup} denied app cleanups")
+                self.log.info(f"Inactivity check: Processed {len(apps_needing_warning)} warnings, {len(apps_to_abandon)} abandonments, and {denied_to_cleanup} denied app cleanups")
 
         except Exception as e:
-            logger.error(f"Error in check_inactive_applications: {e}", exc_info=True)
+            self.log.error(f"Error in check_inactive_applications: {e}", exc_info=True)
 
     @check_inactive_applications.before_loop
     async def before_check_inactive_applications(self):
@@ -662,16 +688,16 @@ class Application(commands.Cog):
     async def _send_inactivity_warning(self, user_id: int, channel_id: int, warning_days: int, abandon_days: int):
         """Send inactivity warning to user via DM and in channel."""
         try:
-            guild = self.bot.get_guild(GUILD_ID)
+            guild = self.bot.get_guild(self.bot.guild_id)
             if not guild:
-                logger.error(f"Guild {GUILD_ID} not found")
+                self.log.error(f"Guild {self.bot.guild_id} not found")
                 return
 
             user = guild.get_member(user_id)
             channel = guild.get_channel(channel_id)
 
             if not channel:
-                logger.warning(f"Channel {channel_id} not found for warning")
+                self.log.warning(f"Channel {channel_id} not found for warning")
                 return
 
             days_remaining = abandon_days - warning_days
@@ -682,7 +708,7 @@ class Application(commands.Cog):
 
             # DM warning config
             dm_config = inactivity_config.get("warning_dm", {})
-            dm_title = dm_config.get("title", "⚠️ Application Inactivity Warning")
+            dm_title = dm_config.get("title", "Application Inactivity Warning")
             dm_description = dm_config.get("description",
                 "Your application has been inactive for **{warning_days} days**.\n\n"
                 "**Please continue your application within the next {days_remaining} days** "
@@ -709,18 +735,18 @@ class Application(commands.Cog):
                 try:
                     await user.send(embed=warning_embed)
                     dm_sent = True
-                    logger.info(f"Sent inactivity warning DM to user {user_id}")
+                    self.log.info(f"Sent inactivity warning DM to user {user_id}")
                 except discord.Forbidden:
-                    logger.warning(f"Could not DM user {user_id} - DMs closed")
+                    self.log.warning(f"Could not DM user {user_id} - DMs closed")
                 except discord.HTTPException as e:
-                    logger.error(f"Failed to DM user {user_id}: {e}")
+                    self.log.error(f"Failed to DM user {user_id}: {e}")
 
             # Send warning in channel
             if channel:
                 try:
                     # Channel warning config
                     channel_config = inactivity_config.get("warning_channel", {})
-                    channel_title = channel_config.get("title", "⚠️ Inactivity Warning")
+                    channel_title = channel_config.get("title", "Inactivity Warning")
                     channel_description = channel_config.get("description",
                         "{user_mention}, your application has been inactive for **{warning_days} days**.\n\n"
                         "**Please continue within {days_remaining} days** or this application will be closed.\n\n"
@@ -745,9 +771,9 @@ class Application(commands.Cog):
                         channel_warning.set_footer(text=channel_footer)
 
                     await channel.send(content=f"<@{user_id}>", embed=channel_warning)
-                    logger.info(f"Sent inactivity warning in channel {channel_id}")
+                    self.log.info(f"Sent inactivity warning in channel {channel_id}")
                 except discord.HTTPException as e:
-                    logger.error(f"Failed to send warning in channel {channel_id}: {e}")
+                    self.log.error(f"Failed to send warning in channel {channel_id}: {e}")
 
             # Mark warning as sent
             async with aiosqlite.connect(get_db_path()) as db:
@@ -758,14 +784,14 @@ class Application(commands.Cog):
                 await db.commit()
 
         except Exception as e:
-            logger.error(f"Error sending inactivity warning: {e}", exc_info=True)
+            self.log.error(f"Error sending inactivity warning: {e}", exc_info=True)
 
     async def _abandon_application(self, user_id: int, channel_id: int):
         """Mark application as abandoned and delete channel."""
         try:
-            guild = self.bot.get_guild(GUILD_ID)
+            guild = self.bot.get_guild(self.bot.guild_id)
             if not guild:
-                logger.error(f"Guild {GUILD_ID} not found")
+                self.log.error(f"Guild {self.bot.guild_id} not found")
                 return
 
             user = guild.get_member(user_id)
@@ -787,7 +813,7 @@ class Application(commands.Cog):
                     inactivity_config = config.get("settings", {}).get("inactivity", {})
                     abandon_config = inactivity_config.get("abandon_dm", {})
 
-                    abandon_title = abandon_config.get("title", "❌ Application Abandoned")
+                    abandon_title = abandon_config.get("title", "Application Abandoned")
                     abandon_description = abandon_config.get("description",
                         "Your application has been automatically closed due to inactivity.\n\n"
                         "You can start a new application at any time by clicking the application button again."
@@ -800,22 +826,22 @@ class Application(commands.Cog):
                             color=get_embed_colors()["error"]
                         )
                     )
-                    logger.info(f"Sent abandonment DM to user {user_id}")
+                    self.log.info(f"Sent abandonment DM to user {user_id}")
                 except discord.Forbidden:
-                    logger.warning(f"Could not DM user {user_id} about abandonment")
+                    self.log.warning(f"Could not DM user {user_id} about abandonment")
                 except discord.HTTPException as e:
-                    logger.error(f"Failed to DM user {user_id}: {e}")
+                    self.log.error(f"Failed to DM user {user_id}: {e}")
 
             # Delete channel
             if channel:
                 try:
                     await channel.delete(reason=f"Application abandoned due to inactivity (user: {user_id})")
-                    logger.info(f"Deleted abandoned application channel {channel_id} for user {user_id}")
+                    self.log.info(f"Deleted abandoned application channel {channel_id} for user {user_id}")
                 except discord.HTTPException as e:
-                    logger.error(f"Failed to delete channel {channel_id}: {e}")
+                    self.log.error(f"Failed to delete channel {channel_id}: {e}")
 
         except Exception as e:
-            logger.error(f"Error abandoning application: {e}", exc_info=True)
+            self.log.error(f"Error abandoning application: {e}", exc_info=True)
 
     async def _check_denied_apps_cleanup(self):
         """Check for denied applications where DM failed and clean them up after configured time."""
@@ -844,9 +870,9 @@ class Application(commands.Cog):
             if not apps_to_delete:
                 return 0
 
-            guild = self.bot.get_guild(GUILD_ID)
+            guild = self.bot.get_guild(self.bot.guild_id)
             if not guild:
-                logger.error(f"Guild {GUILD_ID} not found")
+                self.log.error(f"Guild {self.bot.guild_id} not found")
                 return 0
 
             deleted_count = 0
@@ -855,13 +881,13 @@ class Application(commands.Cog):
                 if channel:
                     try:
                         await channel.delete(reason=f"Denied application auto-cleanup (DM failed, {auto_delete_hours}h elapsed)")
-                        logger.info(f"Auto-deleted denied application channel {channel_id} for user {user_id} (DM failed, waited {auto_delete_hours}h)")
+                        self.log.info(f"Auto-deleted denied application channel {channel_id} for user {user_id} (DM failed, waited {auto_delete_hours}h)")
                         deleted_count += 1
                     except discord.HTTPException as e:
-                        logger.error(f"Failed to auto-delete denied channel {channel_id}: {e}")
+                        self.log.error(f"Failed to auto-delete denied channel {channel_id}: {e}")
 
             return deleted_count
 
         except Exception as e:
-            logger.error(f"Error checking denied apps cleanup: {e}", exc_info=True)
+            self.log.error(f"Error checking denied apps cleanup: {e}", exc_info=True)
             return 0

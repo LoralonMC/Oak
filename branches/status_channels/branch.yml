@@ -1,0 +1,5 @@
+id: status_channels
+name: Status Channels
+version: "1.0.0"
+description: Updates voice channels with server status information
+main: branch.StatusChannels

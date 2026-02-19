@@ -26,6 +26,9 @@ class PaginatedEmbedView(discord.ui.View):
         if interaction.user.id != self.author_id:
             await interaction.response.send_message("This isn't your query.", ephemeral=True)
             return
+        if self.current_page <= 0:
+            await interaction.response.defer()
+            return
         self.current_page -= 1
         self._update_buttons()
         await interaction.response.edit_message(embed=self.pages[self.current_page], view=self)
@@ -34,6 +37,9 @@ class PaginatedEmbedView(discord.ui.View):
     async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.author_id:
             await interaction.response.send_message("This isn't your query.", ephemeral=True)
+            return
+        if self.current_page >= len(self.pages) - 1:
+            await interaction.response.defer()
             return
         self.current_page += 1
         self._update_buttons()

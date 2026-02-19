@@ -1,0 +1,6 @@
+id: tickets
+name: Tickets
+version: "1.0.0"
+description: Thread-based support ticket system with category management
+main: branch.Tickets
+database: true

@@ -1,30 +1,28 @@
-"""
-Suggestions Handlers
-Handles button interactions for the suggestions system.
-"""
+"""Suggestions handlers — button interaction logic."""
+
+import json
+import logging
 
 import discord
 from discord import Interaction
+
 import aiosqlite
-import json
-import logging
+
 from .helpers import get_db_path, get_manager_role_ids
-from .views import ManageSuggestionView, DummyView
+from .views import ManageSuggestionView, SuggestionVoteView
 
 logger = logging.getLogger(__name__)
 
 
 async def handle_vote_button(interaction: Interaction, vote_type: str):
-    """
-    Handle like/dislike button clicks.
-
-    Args:
-        interaction: Discord interaction from button click
-        vote_type: Either "like" or "dislike"
-    """
+    """Handle like/dislike button clicks."""
     message_id = interaction.message.id
 
     try:
+        if not interaction.message.embeds:
+            await interaction.response.send_message("No embed found on this message.", ephemeral=True)
+            return
+
         async with aiosqlite.connect(get_db_path()) as db:
             cursor = await db.execute("SELECT likes, dislikes, status FROM suggestions WHERE message_id = ?", (message_id,))
             row = await cursor.fetchone()
@@ -57,32 +55,31 @@ async def handle_vote_button(interaction: Interaction, vote_type: str):
         embed = interaction.message.embeds[0]
         embed.set_field_at(1, name="📊 Statistics", value=f"**{len(likes)}** Likes\n**{len(dislikes)}** Dislikes\nStatus: **{status}**", inline=True)
 
-        view = DummyView()
-
-        await interaction.message.edit(embed=embed, view=view)
-        await interaction.response.defer()
+        view = SuggestionVoteView()
+        await interaction.response.edit_message(embed=embed, view=view)
 
     except discord.HTTPException as e:
         logger.error(f"Failed to edit message or respond: {e}")
         try:
-            await interaction.response.send_message("Failed to update vote.", ephemeral=True)
+            if not interaction.response.is_done():
+                await interaction.response.send_message("Failed to update vote.", ephemeral=True)
         except Exception as err:
             logger.error(f"Failed to send error response: {err}")
     except Exception as e:
         logger.error(f"Error handling vote button: {e}")
         try:
-            await interaction.response.send_message("An error occurred.", ephemeral=True)
+            if not interaction.response.is_done():
+                await interaction.response.send_message("An error occurred.", ephemeral=True)
         except Exception as err:
             logger.error(f"Failed to send error response: {err}")
 
 
 async def handle_manage_button(interaction: Interaction):
-    """
-    Handle manage button click.
+    """Handle manage button click."""
+    if not interaction.guild:
+        await interaction.response.send_message("This can only be used in a server.", ephemeral=True)
+        return
 
-    Args:
-        interaction: Discord interaction from manage button
-    """
     message_id = interaction.message.id
     user_role_ids = [role.id for role in interaction.user.roles]
     manager_role_ids = get_manager_role_ids()
@@ -99,5 +96,5 @@ async def handle_manage_button(interaction: Interaction):
             await interaction.response.send_message("This suggestion could not be found in the database.", ephemeral=True)
             return
 
-    view = ManageSuggestionView(message_id)
+    view = ManageSuggestionView(message_id, channel_id=interaction.channel_id)
     await interaction.response.send_message("Manage this suggestion:", view=view, ephemeral=True)

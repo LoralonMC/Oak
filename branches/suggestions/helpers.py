@@ -1,12 +1,11 @@
-"""
-Suggestions Helper Functions
-Shared utility functions for the suggestions system.
-"""
+"""Suggestions helper functions."""
 
-import yaml
 import logging
 from pathlib import Path
-from constants import EMBED_FIELD_VALUE_MAX, truncate_for_embed_field
+
+import yaml
+
+from oak.constants import EMBED_FIELD_VALUE_MAX, truncate_for_embed_field
 
 logger = logging.getLogger(__name__)
 
@@ -20,9 +19,8 @@ def get_suggestions_config():
     """Load suggestions config from config.yml."""
     config_path = Path(__file__).parent / "config.yml"
     try:
-        with open(config_path, "r") as f:
+        with open(config_path, "r", encoding="utf-8") as f:
             config = yaml.safe_load(f) or {}
-        logger.debug("Loaded suggestions config")
         return config
     except Exception as e:
         logger.error(f"Failed to load suggestions config: {e}")
@@ -49,4 +47,4 @@ def get_manager_role_ids():
 
 def truncate(text: str, limit: int = EMBED_FIELD_VALUE_MAX) -> str:
     """Truncate text for embed fields."""
-    return truncate_for_embed_field(text, '…')
+    return truncate_for_embed_field(text, "…", max_length=limit)

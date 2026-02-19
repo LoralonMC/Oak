@@ -9,10 +9,11 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 import aiosqlite
-import logging
 from pathlib import Path
-from typing import Any
-from database import init_branch_database
+
+from oak import OakBranch
+from oak.context import BranchContext
+from oak.constants import EMBED_DESCRIPTION_MAX, truncate_for_embed_field
 
 from .helpers import (
     get_db_path,
@@ -26,8 +27,6 @@ from .helpers import (
 )
 from .importer import import_all
 from .views import PaginatedEmbedView
-
-logger = logging.getLogger(__name__)
 
 # Default configuration for this branch
 DEFAULT_CONFIG = {
@@ -160,79 +159,50 @@ CREATE INDEX IF NOT EXISTS idx_players_last_name ON players(last_name COLLATE NO
 """
 
 
-class Shopkeepers(commands.Cog):
+class Shopkeepers(OakBranch):
     """CSV-based trade log importer and price analysis system."""
 
-    def __init__(self, bot):
-        self.bot = bot
+    def __init__(self, ctx: BranchContext):
+        super().__init__(ctx)
         self.db_path = get_db_path()
-
-        # Load config
-        self.config = self.load_config()
 
         # Validate config
         is_valid, errors = validate_config(self.config)
         if not is_valid:
-            logger.error(f"Shopkeepers config validation failed: {errors}")
+            self.log.error(f"Shopkeepers config validation failed: {errors}")
             for error in errors:
-                logger.error(f"  - {error}")
+                self.log.error(f"  - {error}")
 
         # Cache settings
-        settings = self.config.get("settings", {})
-        self.csv_directory = get_csv_directory(self.config)
-        self.currencies = settings.get("currencies", [])
-        self.plugin_identity_keys = settings.get("plugin_identity_keys", [])
+        self.csv_directory = self.setting("csv_directory", default="") or get_csv_directory(self.config)
+        self.currencies = self.setting("currencies", default=[])
+        self.plugin_identity_keys = self.setting("plugin_identity_keys", default=[])
 
         # UI settings
-        ui = settings.get("ui", {})
-        self.embed_color = ui.get("embed_color", 0x50C878)
-        self.trades_per_page = ui.get("trades_per_page", 8)
-        self.top_entries = ui.get("top_entries", 10)
-        self.price_history_days = ui.get("price_history_days", 30)
+        self.embed_color = self.setting("ui", "embed_color", default=0x50C878)
+        self.trades_per_page = self.setting("ui", "trades_per_page", default=8)
+        self.top_entries = self.setting("ui", "top_entries", default=10)
+        self.price_history_days = self.setting("ui", "price_history_days", default=30)
 
         # Admin settings
-        self.admin_role_ids = settings.get("admin_role_ids", [])
+        self.admin_role_ids = self.setting("admin_role_ids", default=[])
 
         # Auto-import settings
-        auto_import = settings.get("auto_import", {})
-        self.auto_import_enabled = auto_import.get("enabled", True)
-        self.auto_import_interval = auto_import.get("interval_minutes", 30)
+        self.auto_import_enabled = self.setting("auto_import", "enabled", default=True)
+        self.auto_import_interval = self.setting("auto_import", "interval_minutes", default=30)
 
         self._auto_import_task = None
         self._import_lock = asyncio.Lock()
 
-        logger.info(f"Shopkeepers branch initialized (db: {self.db_path})")
+        self.log.info(f"Shopkeepers branch initialized (db: {self.db_path})")
 
-    def load_config(self) -> dict[str, Any]:
-        """Load config from config.yml in this branch's folder."""
-        from utils import load_branch_config
-        config_path = Path(__file__).parent / "config.yml"
-        return load_branch_config(config_path, DEFAULT_CONFIG, "Shopkeepers")
-
-    async def cog_load(self):
+    async def on_enable(self):
         """Initialize database, run migrations, sync currencies."""
-        await init_branch_database(self.db_path, SHOPKEEPERS_SCHEMA, "Shopkeepers")
+        if self.db:
+            await self.db.initialize(SHOPKEEPERS_SCHEMA)
 
         # Run migrations for existing databases
         await self._run_migrations()
-
-        # Reload config values (important for hot-reload support)
-        self.config = self.load_config()
-        settings = self.config.get("settings", {})
-        self.csv_directory = get_csv_directory(self.config)
-        self.currencies = settings.get("currencies", [])
-        self.plugin_identity_keys = settings.get("plugin_identity_keys", [])
-        self.admin_role_ids = settings.get("admin_role_ids", [])
-
-        ui = settings.get("ui", {})
-        self.embed_color = ui.get("embed_color", 0x50C878)
-        self.trades_per_page = ui.get("trades_per_page", 8)
-        self.top_entries = ui.get("top_entries", 10)
-        self.price_history_days = ui.get("price_history_days", 30)
-
-        auto_import = settings.get("auto_import", {})
-        self.auto_import_enabled = auto_import.get("enabled", True)
-        self.auto_import_interval = auto_import.get("interval_minutes", 30)
 
         # Sync currency flags in items table
         await self._sync_currencies()
@@ -242,9 +212,9 @@ class Shopkeepers(commands.Cog):
             self.auto_import_task.change_interval(minutes=self.auto_import_interval)
             self.auto_import_task.start()
             self._auto_import_task = self.auto_import_task
-            logger.info(f"Auto-import task started (interval: {self.auto_import_interval} minutes)")
+            self.log.info(f"Auto-import task started (interval: {self.auto_import_interval} minutes)")
 
-        logger.info("Shopkeepers branch loaded")
+        self.log.info("Shopkeepers branch loaded")
 
     async def _run_migrations(self):
         """Run database migrations for existing databases."""
@@ -253,7 +223,7 @@ class Shopkeepers(commands.Cog):
                 # Placeholder for future migrations
                 pass
         except Exception as e:
-            logger.error(f"Error running migrations: {e}", exc_info=True)
+            self.log.error(f"Error running migrations: {e}", exc_info=True)
 
     async def _sync_currencies(self):
         """
@@ -295,15 +265,15 @@ class Shopkeepers(commands.Cog):
                     )
 
                 await db.commit()
-                logger.info(f"Currency sync complete ({len(currency_keys)} currencies configured)")
+                self.log.info(f"Currency sync complete ({len(currency_keys)} currencies configured)")
         except Exception as e:
-            logger.error(f"Error syncing currencies: {e}", exc_info=True)
+            self.log.error(f"Error syncing currencies: {e}", exc_info=True)
 
-    async def cog_unload(self):
+    async def on_disable(self):
         """Cancel auto-import task if running."""
         if self._auto_import_task and self._auto_import_task.is_running():
             self._auto_import_task.cancel()
-        logger.info("Shopkeepers branch unloaded")
+        self.log.info("Shopkeepers branch unloaded")
 
     # ------------------------------------------------------------------
     # Pagination helpers
@@ -334,9 +304,12 @@ class Shopkeepers(commands.Cog):
             lines = [format_row(i, row) for i, row in enumerate(page_rows, start=page_start + 1)]
             page_num = (page_start // per_page) + 1
             total_pages = -(-len(rows) // per_page)
+            description = separator.join(lines)
+            if len(description) > EMBED_DESCRIPTION_MAX:
+                description = description[:EMBED_DESCRIPTION_MAX - 3] + "..."
             embed = discord.Embed(
                 title=title,
-                description=separator.join(lines),
+                description=description,
                 color=self.embed_color,
             )
             footer = f"Page {page_num}/{total_pages}"
@@ -346,16 +319,21 @@ class Shopkeepers(commands.Cog):
             pages.append(embed)
         return pages
 
-    async def _send_paginated(self, interaction: discord.Interaction, pages: list[discord.Embed]):
+    @staticmethod
+    def _escape_like(text: str) -> str:
+        """Escape SQL LIKE wildcard characters in user input."""
+        return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+    async def _send_paginated(self, interaction: discord.Interaction, pages: list[discord.Embed], *, ephemeral: bool = True):
         """Send a single embed or a paginated view."""
         if not pages:
             await interaction.followup.send("No data available.", ephemeral=True)
             return
         if len(pages) == 1:
-            await interaction.followup.send(embed=pages[0], ephemeral=True)
+            await interaction.followup.send(embed=pages[0], ephemeral=ephemeral)
         else:
             view = PaginatedEmbedView(pages, interaction.user.id)
-            message = await interaction.followup.send(embed=pages[0], view=view, ephemeral=True)
+            message = await interaction.followup.send(embed=pages[0], view=view, ephemeral=ephemeral)
             view.message = message
 
     @tasks.loop(minutes=30)
@@ -369,15 +347,15 @@ class Shopkeepers(commands.Cog):
                 )
 
             if result.new_trades > 0 or result.errors:
-                logger.info(
+                self.log.info(
                     f"Auto-import complete: {result.files_imported} files, "
                     f"{result.new_trades} new trades, {result.new_items} new items"
                 )
             if result.errors:
                 for error in result.errors:
-                    logger.error(f"Auto-import error: {error}")
+                    self.log.error(f"Auto-import error: {error}")
         except Exception as e:
-            logger.error(f"Error in auto-import task: {e}", exc_info=True)
+            self.log.error(f"Error in auto-import task: {e}", exc_info=True)
 
     @auto_import_task.before_loop
     async def before_auto_import_task(self):
@@ -425,7 +403,7 @@ class Shopkeepers(commands.Cog):
             error_text = "\n".join(result.errors[:10])
             if len(result.errors) > 10:
                 error_text += f"\n... and {len(result.errors) - 10} more"
-            embed.add_field(name="Errors", value=error_text, inline=False)
+            embed.add_field(name="Errors", value=truncate_for_embed_field(error_text), inline=False)
 
         await interaction.followup.send(embed=embed, ephemeral=True)
 
@@ -440,17 +418,18 @@ class Shopkeepers(commands.Cog):
         try:
             async with aiosqlite.connect(self.db_path) as db:
                 if current.strip():
+                    escaped = self._escape_like(current.lower())
                     query = """
                         SELECT i.item_key, i.display_name, i.search_name,
                                COALESCE(SUM(ps.total_volume), 0) AS vol
                         FROM items i
                         LEFT JOIN price_summary ps ON ps.item_id = i.id
-                        WHERE i.is_currency = 0 AND i.search_name LIKE ?
+                        WHERE i.is_currency = 0 AND i.search_name LIKE ? ESCAPE '\\'
                         GROUP BY i.id
                         ORDER BY vol DESC
                         LIMIT 25
                     """
-                    rows = await db.execute_fetchall(query, (f"%{current.lower()}%",))
+                    rows = await db.execute_fetchall(query, (f"%{escaped}%",))
                 else:
                     query = """
                         SELECT i.item_key, i.display_name, i.search_name,
@@ -472,7 +451,7 @@ class Shopkeepers(commands.Cog):
                     for row in rows
                 ]
         except Exception as e:
-            logger.error(f"Item autocomplete error: {e}", exc_info=True)
+            self.log.error(f"Item autocomplete error: {e}", exc_info=True)
             return []
 
     async def player_autocomplete(
@@ -482,13 +461,14 @@ class Shopkeepers(commands.Cog):
         try:
             async with aiosqlite.connect(self.db_path) as db:
                 if current.strip():
+                    escaped = self._escape_like(current)
                     query = """
                         SELECT last_name, uuid FROM players
-                        WHERE last_name LIKE ? COLLATE NOCASE
+                        WHERE last_name LIKE ? ESCAPE '\\' COLLATE NOCASE
                         ORDER BY last_seen DESC
                         LIMIT 25
                     """
-                    rows = await db.execute_fetchall(query, (f"%{current}%",))
+                    rows = await db.execute_fetchall(query, (f"%{escaped}%",))
                 else:
                     # Show most recently active players when empty
                     query = """
@@ -503,7 +483,7 @@ class Shopkeepers(commands.Cog):
                     for row in rows
                 ]
         except Exception as e:
-            logger.error(f"Player autocomplete error: {e}", exc_info=True)
+            self.log.error(f"Player autocomplete error: {e}", exc_info=True)
             return []
 
     # ------------------------------------------------------------------
@@ -511,10 +491,10 @@ class Shopkeepers(commands.Cog):
     # ------------------------------------------------------------------
 
     @app_commands.command(name="price", description="Check the price of an item")
-    @app_commands.describe(item="Item to look up", days="Number of days to analyze (default: 30)")
-    async def price(self, interaction: discord.Interaction, item: str, days: app_commands.Range[int, 1, 365] = None):
+    @app_commands.describe(item="Item to look up", days="Number of days to analyze (default: 30)", public="Show result publicly")
+    async def price(self, interaction: discord.Interaction, item: str, days: app_commands.Range[int, 1, 365] = None, public: bool = False):
         """Show price statistics for an item."""
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer(ephemeral=not public)
 
         period_days = days if days is not None else self.price_history_days
 
@@ -527,12 +507,13 @@ class Shopkeepers(commands.Cog):
                 )
                 # Fallback: fuzzy match on search_name
                 if not row:
+                    escaped_item = self._escape_like(item.lower())
                     row = await db.execute_fetchall(
-                        "SELECT id, item_key, display_name, search_name FROM items WHERE search_name LIKE ? LIMIT 1",
-                        (f"%{item.lower()}%",),
+                        "SELECT id, item_key, display_name, search_name FROM items WHERE search_name LIKE ? ESCAPE '\\' LIMIT 1",
+                        (f"%{escaped_item}%",),
                     )
                 if not row:
-                    await interaction.followup.send(f"No item found matching **{item}**.", ephemeral=True)
+                    await interaction.followup.send(f"No item found matching **{item[:100]}**.", ephemeral=True)
                     return
 
                 item_id, item_key, display_name, search_name = row[0]
@@ -543,6 +524,7 @@ class Shopkeepers(commands.Cog):
                     """SELECT emerald_cost_per_unit FROM trades
                        WHERE result_item_id = ? AND trade_date >= date('now', ?)
                          AND emerald_cost_per_unit IS NOT NULL
+                         AND shop_type != 'admin'
                        ORDER BY emerald_cost_per_unit""",
                     (item_id, f"-{period_days} days"),
                 )
@@ -568,7 +550,7 @@ class Shopkeepers(commands.Cog):
 
                 avg_p, min_p, max_p, volume, trades = stats[0] if stats else (None, None, None, None, None)
 
-                # Build embed with per-unit and per-stack (×64) prices
+                # Build embed with per-unit and per-stack (x64) prices
                 embed = discord.Embed(title=f"Price: {name}", color=self.embed_color)
 
                 # Per-unit prices
@@ -576,13 +558,13 @@ class Shopkeepers(commands.Cog):
                 embed.add_field(name="Median", value=format_price(median_p), inline=True)
                 embed.add_field(name="Min / Max", value=f"{format_price(min_p)} / {format_price(max_p)}", inline=True)
 
-                # Per-stack prices (×64)
+                # Per-stack prices (x64)
                 stack_avg = avg_p * 64 if avg_p else None
                 stack_median = median_p * 64 if median_p else None
                 stack_min = min_p * 64 if min_p else None
                 stack_max = max_p * 64 if max_p else None
 
-                embed.add_field(name="Stack Avg (×64)", value=format_price(stack_avg), inline=True)
+                embed.add_field(name="Stack Avg (x64)", value=format_price(stack_avg), inline=True)
                 embed.add_field(name="Stack Median", value=format_price(stack_median), inline=True)
                 embed.add_field(name="Stack Min / Max", value=f"{format_price(stack_min)} / {format_price(stack_max)}", inline=True)
 
@@ -605,13 +587,13 @@ class Shopkeepers(commands.Cog):
                     for h_date, h_price, h_vol in history:
                         date_short = h_date[5:]  # MM-DD
                         lines.append(f"`{date_short}` {format_price(h_price)} ({int(h_vol):,} vol)")
-                    embed.add_field(name="Recent History", value="\n".join(lines), inline=False)
+                    embed.add_field(name="Recent History", value=truncate_for_embed_field("\n".join(lines)), inline=False)
 
-                embed.set_footer(text=f"Item key: {item_key} | Stack prices assume ×64")
-                await interaction.followup.send(embed=embed, ephemeral=True)
+                embed.set_footer(text=f"Item key: {item_key} | Stack prices assume x64")
+                await interaction.followup.send(embed=embed, ephemeral=not public)
 
         except Exception as e:
-            logger.error(f"Error in /price command: {e}", exc_info=True)
+            self.log.error(f"Error in /price command: {e}", exc_info=True)
             await interaction.followup.send("An error occurred while fetching price data.", ephemeral=True)
 
     @price.autocomplete("item")
@@ -623,15 +605,15 @@ class Shopkeepers(commands.Cog):
     # ------------------------------------------------------------------
 
     @app_commands.command(name="top", description="View top traded items")
-    @app_commands.describe(sort_by="Sort order")
+    @app_commands.describe(sort_by="Sort order", public="Show result publicly")
     @app_commands.choices(sort_by=[
         app_commands.Choice(name="Most Trades", value="trades"),
         app_commands.Choice(name="Most Expensive", value="expensive"),
         app_commands.Choice(name="Highest Volume", value="volume"),
     ])
-    async def top(self, interaction: discord.Interaction, sort_by: str = "trades"):
+    async def top(self, interaction: discord.Interaction, sort_by: str = "trades", public: bool = False):
         """Show top items by trades, price, or volume."""
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer(ephemeral=not public)
 
         try:
             async with aiosqlite.connect(self.db_path) as db:
@@ -661,16 +643,16 @@ class Shopkeepers(commands.Cog):
                 sort_labels = {"trades": "Most Trades", "expensive": "Most Expensive", "volume": "Highest Volume"}
                 pages = self._build_pages(
                     rows, self.top_entries,
-                    f"Top Items — {sort_labels.get(sort_by, sort_by)}",
+                    f"Top Items -- {sort_labels.get(sort_by, sort_by)}",
                     lambda i, row: (
-                        f"**{i}.** {format_item_name(row[0], row[1])} — "
+                        f"**{i}.** {format_item_name(row[0], row[1])} -- "
                         f"{format_price(row[3])} | {int(row[4]):,} vol | {int(row[5]):,} trades"
                     ),
                 )
-                await self._send_paginated(interaction, pages)
+                await self._send_paginated(interaction, pages, ephemeral=not public)
 
         except Exception as e:
-            logger.error(f"Error in /top command: {e}", exc_info=True)
+            self.log.error(f"Error in /top command: {e}", exc_info=True)
             await interaction.followup.send("An error occurred while fetching top items.", ephemeral=True)
 
     # ------------------------------------------------------------------
@@ -678,13 +660,14 @@ class Shopkeepers(commands.Cog):
     # ------------------------------------------------------------------
 
     @app_commands.command(name="search", description="Search for items by name")
-    @app_commands.describe(query="Item name to search for")
-    async def search(self, interaction: discord.Interaction, query: str):
+    @app_commands.describe(query="Item name to search for", public="Show result publicly")
+    async def search(self, interaction: discord.Interaction, query: str, public: bool = False):
         """Search for items and show price info."""
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer(ephemeral=not public)
 
         try:
             async with aiosqlite.connect(self.db_path) as db:
+                escaped_query = self._escape_like(query.lower())
                 rows = await db.execute_fetchall(
                     """SELECT i.item_key, i.display_name, i.search_name,
                               i.plugin_id, i.material_type,
@@ -693,15 +676,15 @@ class Shopkeepers(commands.Cog):
                               COALESCE(SUM(ps.trade_count), 0) AS tc
                        FROM items i
                        LEFT JOIN price_summary ps ON ps.item_id = i.id
-                       WHERE i.item_key = ? OR i.search_name LIKE ?
+                       WHERE i.item_key = ? OR i.search_name LIKE ? ESCAPE '\\'
                        GROUP BY i.id
                        ORDER BY tc DESC
                        LIMIT 25""",
-                    (query, f"%{query.lower()}%"),
+                    (query, f"%{escaped_query}%"),
                 )
 
                 if not rows:
-                    await interaction.followup.send(f"No items found matching **{query}**.", ephemeral=True)
+                    await interaction.followup.send(f"No items found matching **{query[:100]}**.", ephemeral=True)
                     return
 
                 def _fmt_search(i, row):
@@ -715,14 +698,14 @@ class Shopkeepers(commands.Cog):
 
                 pages = self._build_pages(
                     rows, self.trades_per_page,
-                    f"Search: {query}", _fmt_search,
+                    f"Search: {query[:100]}", _fmt_search,
                     footer_extra=f"{len(rows)} results",
                     separator="\n\n",
                 )
-                await self._send_paginated(interaction, pages)
+                await self._send_paginated(interaction, pages, ephemeral=not public)
 
         except Exception as e:
-            logger.error(f"Error in /search command: {e}", exc_info=True)
+            self.log.error(f"Error in /search command: {e}", exc_info=True)
             await interaction.followup.send("An error occurred while searching.", ephemeral=True)
 
     @search.autocomplete("query")
@@ -734,10 +717,10 @@ class Shopkeepers(commands.Cog):
     # ------------------------------------------------------------------
 
     @app_commands.command(name="player", description="View trade stats for a player")
-    @app_commands.describe(player="Player name or UUID")
-    async def player(self, interaction: discord.Interaction, player: str):
+    @app_commands.describe(player="Player name or UUID", public="Show result publicly")
+    async def player(self, interaction: discord.Interaction, player: str, public: bool = False):
         """Show trade statistics for a player by name or UUID."""
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer(ephemeral=not public)
 
         try:
             async with aiosqlite.connect(self.db_path) as db:
@@ -759,7 +742,7 @@ class Shopkeepers(commands.Cog):
                     )
                     if not uuid_row:
                         await interaction.followup.send(
-                            f"No player found with name **{player}**. Try using their UUID instead.",
+                            f"No player found with name **{player[:100]}**. Try using their UUID instead.",
                             ephemeral=True,
                         )
                         return
@@ -816,13 +799,13 @@ class Shopkeepers(commands.Cog):
                     lines = []
                     for dname, sname, vol in top_items:
                         name = format_item_name(dname, sname)
-                        lines.append(f"• {name} — {int(vol):,}")
-                    embed.add_field(name="Top Purchased Items", value="\n".join(lines), inline=False)
+                        lines.append(f"* {name} -- {int(vol):,}")
+                    embed.add_field(name="Top Purchased Items", value=truncate_for_embed_field("\n".join(lines)), inline=False)
 
-                await interaction.followup.send(embed=embed, ephemeral=True)
+                await interaction.followup.send(embed=embed, ephemeral=not public)
 
         except Exception as e:
-            logger.error(f"Error in /player command: {e}", exc_info=True)
+            self.log.error(f"Error in /player command: {e}", exc_info=True)
             await interaction.followup.send("An error occurred while fetching player data.", ephemeral=True)
 
     @player.autocomplete("player")
@@ -834,10 +817,10 @@ class Shopkeepers(commands.Cog):
     # ------------------------------------------------------------------
 
     @app_commands.command(name="shop", description="View trade stats for a shop owner")
-    @app_commands.describe(owner="Shop owner name or UUID")
-    async def shop(self, interaction: discord.Interaction, owner: str):
+    @app_commands.describe(owner="Shop owner name or UUID", public="Show result publicly")
+    async def shop(self, interaction: discord.Interaction, owner: str, public: bool = False):
         """Show trade statistics for a shop owner by name or UUID."""
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer(ephemeral=not public)
 
         try:
             async with aiosqlite.connect(self.db_path) as db:
@@ -857,7 +840,7 @@ class Shopkeepers(commands.Cog):
                     )
                     if not uuid_row:
                         await interaction.followup.send(
-                            f"No player found with name **{owner}**. Try using their UUID instead.",
+                            f"No player found with name **{owner[:100]}**. Try using their UUID instead.",
                             ephemeral=True,
                         )
                         return
@@ -916,8 +899,8 @@ class Shopkeepers(commands.Cog):
                     lines = []
                     for dname, sname, vol in top_items:
                         name = format_item_name(dname, sname)
-                        lines.append(f"• {name} — {int(vol):,}")
-                    embed.add_field(name="Top Sold Items", value="\n".join(lines), inline=False)
+                        lines.append(f"* {name} -- {int(vol):,}")
+                    embed.add_field(name="Top Sold Items", value=truncate_for_embed_field("\n".join(lines)), inline=False)
 
                 # Shop locations (top 5 by trade count)
                 locations = await db.execute_fetchall(
@@ -932,13 +915,13 @@ class Shopkeepers(commands.Cog):
                 if locations:
                     loc_lines = []
                     for world, x, y, z, tc in locations:
-                        loc_lines.append(f"• {world} ({x}, {y}, {z}) — {tc:,} trades")
-                    embed.add_field(name="Shop Locations", value="\n".join(loc_lines), inline=False)
+                        loc_lines.append(f"* {world} ({x}, {y}, {z}) -- {tc:,} trades")
+                    embed.add_field(name="Shop Locations", value=truncate_for_embed_field("\n".join(loc_lines)), inline=False)
 
-                await interaction.followup.send(embed=embed, ephemeral=True)
+                await interaction.followup.send(embed=embed, ephemeral=not public)
 
         except Exception as e:
-            logger.error(f"Error in /shop command: {e}", exc_info=True)
+            self.log.error(f"Error in /shop command: {e}", exc_info=True)
             await interaction.followup.send("An error occurred while fetching shop data.", ephemeral=True)
 
     @shop.autocomplete("owner")
@@ -1005,21 +988,21 @@ class Shopkeepers(commands.Cog):
             embed.add_field(name="Price Summaries", value=f"{ps_count:,}", inline=True)
 
             if date_range[0]:
-                embed.add_field(name="Date Range", value=f"{date_range[0]} — {date_range[1]}", inline=False)
+                embed.add_field(name="Date Range", value=f"{date_range[0]} -- {date_range[1]}", inline=False)
 
             if shop_types:
-                type_lines = [f"• {stype}: {count:,}" for stype, count in shop_types]
-                embed.add_field(name="Shop Types", value="\n".join(type_lines), inline=True)
+                type_lines = [f"* {stype}: {count:,}" for stype, count in shop_types]
+                embed.add_field(name="Shop Types", value=truncate_for_embed_field("\n".join(type_lines)), inline=True)
 
             if worlds:
-                world_lines = [f"• {world}: {count:,}" for world, count in worlds]
-                embed.add_field(name="Worlds", value="\n".join(world_lines), inline=True)
+                world_lines = [f"* {world}: {count:,}" for world, count in worlds]
+                embed.add_field(name="Worlds", value=truncate_for_embed_field("\n".join(world_lines)), inline=True)
 
             embed.set_footer(text=f"Database size: {db_size}")
             await interaction.followup.send(embed=embed, ephemeral=True)
 
         except Exception as e:
-            logger.error(f"Error in /shopkeepers_stats command: {e}", exc_info=True)
+            self.log.error(f"Error in /shopkeepers_stats command: {e}", exc_info=True)
             await interaction.followup.send("An error occurred while fetching stats.", ephemeral=True)
 
     # ------------------------------------------------------------------
@@ -1148,33 +1131,30 @@ class Shopkeepers(commands.Cog):
 
                 # Build embed
                 embed = discord.Embed(
-                    title="Economy Analysis — Admin Shops",
+                    title="Economy Analysis -- Admin Shops",
                     color=self.embed_color,
                 )
 
                 # Flow indicators
                 if net_flow < 0:
-                    flow_indicator = "📉 Net Sink (Healthy)"
-                    flow_color = "green"
+                    flow_indicator = "Net Sink (Healthy)"
                 elif net_flow > 0:
-                    flow_indicator = "📈 Net Faucet (Inflation)"
-                    flow_color = "red"
+                    flow_indicator = "Net Faucet (Inflation)"
                 else:
-                    flow_indicator = "⚖️ Balanced"
-                    flow_color = "yellow"
+                    flow_indicator = "Balanced"
 
                 embed.add_field(
-                    name="💰 Currency Sunk",
+                    name="Currency Sunk",
                     value=f"{format_price(total_sunk)}\n({sink_trades:,} trades)",
                     inline=True,
                 )
                 embed.add_field(
-                    name="💸 Currency Fauceted",
+                    name="Currency Fauceted",
                     value=f"{format_price(total_fauceted)}\n({faucet_trades:,} trades)",
                     inline=True,
                 )
                 embed.add_field(
-                    name=f"📊 Net Flow",
+                    name="Net Flow",
                     value=f"{format_price(abs(net_flow))}\n{flow_indicator}",
                     inline=True,
                 )
@@ -1184,10 +1164,10 @@ class Shopkeepers(commands.Cog):
                     sink_lines = []
                     for dname, sname, cost, vol, tc in top_sinks[:5]:
                         name = format_item_name(dname, sname)
-                        sink_lines.append(f"• {name}: {format_price(cost)}")
+                        sink_lines.append(f"* {name}: {format_price(cost)}")
                     embed.add_field(
-                        name="🛒 Top Sinks (Players Buy)",
-                        value="\n".join(sink_lines),
+                        name="Top Sinks (Players Buy)",
+                        value=truncate_for_embed_field("\n".join(sink_lines)),
                         inline=True,
                     )
 
@@ -1196,10 +1176,10 @@ class Shopkeepers(commands.Cog):
                     faucet_lines = []
                     for dname, sname, earned, vol, tc in top_faucets[:5]:
                         name = format_item_name(dname, sname)
-                        faucet_lines.append(f"• {name}: {format_price(earned)}")
+                        faucet_lines.append(f"* {name}: {format_price(earned)}")
                     embed.add_field(
-                        name="💵 Top Faucets (Players Sell)",
-                        value="\n".join(faucet_lines),
+                        name="Top Faucets (Players Sell)",
+                        value=truncate_for_embed_field("\n".join(faucet_lines)),
                         inline=True,
                     )
 
@@ -1209,13 +1189,13 @@ class Shopkeepers(commands.Cog):
                     for date, daily_sink, daily_faucet in daily_data[:7]:
                         date_short = date[5:]  # MM-DD
                         net = daily_faucet - daily_sink
-                        arrow = "📉" if net < 0 else "📈" if net > 0 else "➡️"
+                        arrow = "v" if net < 0 else "^" if net > 0 else "="
                         trend_lines.append(
                             f"`{date_short}` {arrow} S:{format_price(daily_sink)} F:{format_price(daily_faucet)}"
                         )
                     embed.add_field(
-                        name="📅 Daily Trend (Last 7 Days)",
-                        value="\n".join(trend_lines),
+                        name="Daily Trend (Last 7 Days)",
+                        value=truncate_for_embed_field("\n".join(trend_lines)),
                         inline=False,
                     )
 
@@ -1223,7 +1203,7 @@ class Shopkeepers(commands.Cog):
                 await interaction.followup.send(embed=embed, ephemeral=True)
 
         except Exception as e:
-            logger.error(f"Error in /economy command: {e}", exc_info=True)
+            self.log.error(f"Error in /economy command: {e}", exc_info=True)
             await interaction.followup.send("An error occurred while fetching economy data.", ephemeral=True)
 
     # ------------------------------------------------------------------
@@ -1292,19 +1272,19 @@ class Shopkeepers(commands.Cog):
                     source = f" `{ikey}`" if not ikey.startswith("minecraft:") or ikey.count(":") > 1 else ""
                     return (
                         f"**{i}.** {name}{source}\n"
-                        f"   💰 {format_price(cost)} ({pct:.1f}%) | "
-                        f"📦 {int(vol):,} items | 🛒 {tc:,} trades"
+                        f"   {format_price(cost)} ({pct:.1f}%) | "
+                        f"{int(vol):,} items | {tc:,} trades"
                     )
 
                 pages = self._build_pages(
                     rows, self.top_entries,
-                    "💰 Economy Sinks — Admin Shops", _fmt_sink,
+                    "Economy Sinks -- Admin Shops", _fmt_sink,
                     footer_extra=f"{period_label} | Total: {format_price(total_sunk)}",
                 )
                 await self._send_paginated(interaction, pages)
 
         except Exception as e:
-            logger.error(f"Error in /sinks command: {e}", exc_info=True)
+            self.log.error(f"Error in /sinks command: {e}", exc_info=True)
             await interaction.followup.send("An error occurred while fetching sink data.", ephemeral=True)
 
     # ------------------------------------------------------------------
@@ -1375,19 +1355,19 @@ class Shopkeepers(commands.Cog):
                     source = f" `{ikey}`" if not ikey.startswith("minecraft:") or ikey.count(":") > 1 else ""
                     return (
                         f"**{i}.** {name}{source}\n"
-                        f"   💸 {format_price(earned)} ({pct:.1f}%) | "
-                        f"📦 {int(vol):,} items | 🛒 {tc:,} trades"
+                        f"   {format_price(earned)} ({pct:.1f}%) | "
+                        f"{int(vol):,} items | {tc:,} trades"
                     )
 
                 pages = self._build_pages(
                     rows, self.top_entries,
-                    "💸 Economy Faucets — Admin Shops", _fmt_faucet,
+                    "Economy Faucets -- Admin Shops", _fmt_faucet,
                     footer_extra=f"{period_label} | Total: {format_price(total_fauceted)}",
                 )
                 await self._send_paginated(interaction, pages)
 
         except Exception as e:
-            logger.error(f"Error in /faucets command: {e}", exc_info=True)
+            self.log.error(f"Error in /faucets command: {e}", exc_info=True)
             await interaction.followup.send("An error occurred while fetching faucet data.", ephemeral=True)
 
     # ------------------------------------------------------------------
@@ -1397,7 +1377,8 @@ class Shopkeepers(commands.Cog):
     @app_commands.command(name="trending", description="View items with biggest price changes (compares recent half vs prior half)")
     @app_commands.describe(
         period="Time window split in half for comparison (e.g. 14d = last 7d vs prior 7d)",
-        direction="Show price increases, decreases, or both"
+        direction="Show price increases, decreases, or both",
+        public="Show result publicly",
     )
     @app_commands.choices(period=[
         app_commands.Choice(name="Last 7 days", value=7),
@@ -1413,10 +1394,11 @@ class Shopkeepers(commands.Cog):
         self,
         interaction: discord.Interaction,
         period: int = 7,
-        direction: str = "both"
+        direction: str = "both",
+        public: bool = False,
     ):
         """Show items with the biggest price changes."""
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer(ephemeral=not public)
 
         try:
             async with aiosqlite.connect(self.db_path) as db:
@@ -1476,23 +1458,23 @@ class Shopkeepers(commands.Cog):
                 def _fmt_trend(i, row):
                     dname, sname, ikey, recent, prev, trades, pct = row
                     name = format_item_name(dname, sname)
-                    arrow = "📈" if pct > 0 else "📉"
+                    arrow = "^" if pct > 0 else "v"
                     sign = "+" if pct > 0 else ""
                     return (
                         f"**{i}.** {arrow} {name}\n"
-                        f"   {format_price(prev)} → {format_price(recent)} ({sign}{pct:.1f}%)"
+                        f"   {format_price(prev)} -> {format_price(recent)} ({sign}{pct:.1f}%)"
                     )
 
                 pages = self._build_pages(
                     rows, self.top_entries,
-                    f"Trending Items — {direction_labels.get(direction)}",
+                    f"Trending Items -- {direction_labels.get(direction)}",
                     _fmt_trend,
                     footer_extra=f"Last {period} days",
                 )
-                await self._send_paginated(interaction, pages)
+                await self._send_paginated(interaction, pages, ephemeral=not public)
 
         except Exception as e:
-            logger.error(f"Error in /trending command: {e}", exc_info=True)
+            self.log.error(f"Error in /trending command: {e}", exc_info=True)
             await interaction.followup.send("An error occurred while fetching trending data.", ephemeral=True)
 
     # ------------------------------------------------------------------
@@ -1500,15 +1482,15 @@ class Shopkeepers(commands.Cog):
     # ------------------------------------------------------------------
 
     @app_commands.command(name="shops", description="View top shop owner leaderboard")
-    @app_commands.describe(sort_by="Sort order")
+    @app_commands.describe(sort_by="Sort order", public="Show result publicly")
     @app_commands.choices(sort_by=[
         app_commands.Choice(name="Revenue (emeralds earned)", value="revenue"),
         app_commands.Choice(name="Trade Count", value="trades"),
         app_commands.Choice(name="Unique Customers", value="customers"),
     ])
-    async def shops(self, interaction: discord.Interaction, sort_by: str = "revenue"):
+    async def shops(self, interaction: discord.Interaction, sort_by: str = "revenue", public: bool = False):
         """Show leaderboard of top shop owners."""
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer(ephemeral=not public)
 
         try:
             async with aiosqlite.connect(self.db_path) as db:
@@ -1538,17 +1520,17 @@ class Shopkeepers(commands.Cog):
                 sort_labels = {"revenue": "Top Revenue", "trades": "Most Trades", "customers": "Most Customers"}
                 pages = self._build_pages(
                     rows, self.top_entries,
-                    f"Shop Leaderboard — {sort_labels.get(sort_by)}",
+                    f"Shop Leaderboard -- {sort_labels.get(sort_by)}",
                     lambda i, row: (
                         f"**{i}.** {row[1] if row[1] else row[0][:8] + '...'}\n"
-                        f"   💰 {format_price(row[2]) if row[2] else 'N/A'} | "
-                        f"🛒 {row[3]:,} trades | 👥 {row[4]:,} customers"
+                        f"   {format_price(row[2]) if row[2] else 'N/A'} | "
+                        f"{row[3]:,} trades | {row[4]:,} customers"
                     ),
                 )
-                await self._send_paginated(interaction, pages)
+                await self._send_paginated(interaction, pages, ephemeral=not public)
 
         except Exception as e:
-            logger.error(f"Error in /shops command: {e}", exc_info=True)
+            self.log.error(f"Error in /shops command: {e}", exc_info=True)
             await interaction.followup.send("An error occurred while fetching shop leaderboard.", ephemeral=True)
 
     # ------------------------------------------------------------------
@@ -1556,15 +1538,15 @@ class Shopkeepers(commands.Cog):
     # ------------------------------------------------------------------
 
     @app_commands.command(name="players", description="View top player leaderboard")
-    @app_commands.describe(sort_by="Sort order")
+    @app_commands.describe(sort_by="Sort order", public="Show result publicly")
     @app_commands.choices(sort_by=[
         app_commands.Choice(name="Spending (emeralds spent)", value="spending"),
         app_commands.Choice(name="Trade Count", value="trades"),
         app_commands.Choice(name="Unique Items", value="items"),
     ])
-    async def players_leaderboard(self, interaction: discord.Interaction, sort_by: str = "spending"):
+    async def players_leaderboard(self, interaction: discord.Interaction, sort_by: str = "spending", public: bool = False):
         """Show leaderboard of top players/buyers."""
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer(ephemeral=not public)
 
         try:
             async with aiosqlite.connect(self.db_path) as db:
@@ -1594,17 +1576,15 @@ class Shopkeepers(commands.Cog):
                 sort_labels = {"spending": "Top Spenders", "trades": "Most Trades", "items": "Most Unique Items"}
                 pages = self._build_pages(
                     rows, self.top_entries,
-                    f"Player Leaderboard — {sort_labels.get(sort_by)}",
+                    f"Player Leaderboard -- {sort_labels.get(sort_by)}",
                     lambda i, row: (
                         f"**{i}.** {row[1] if row[1] else row[0][:8] + '...'}\n"
-                        f"   💸 {format_price(row[2]) if row[2] else 'N/A'} | "
-                        f"🛒 {row[3]:,} trades | 📦 {row[4]:,} items"
+                        f"   {format_price(row[2]) if row[2] else 'N/A'} | "
+                        f"{row[3]:,} trades | {row[4]:,} items"
                     ),
                 )
-                await self._send_paginated(interaction, pages)
+                await self._send_paginated(interaction, pages, ephemeral=not public)
 
         except Exception as e:
-            logger.error(f"Error in /players command: {e}", exc_info=True)
+            self.log.error(f"Error in /players command: {e}", exc_info=True)
             await interaction.followup.send("An error occurred while fetching player leaderboard.", ephemeral=True)
-
-

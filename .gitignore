@@ -1,5 +1,7 @@
-# Environment Variables (keep .env with placeholders in repo)
-# Only ignore local environment files with actual secrets
+# Environment Variables
+# .env.example has placeholders (tracked in repo)
+# .env has real secrets (NEVER commit)
+.env
 .env.local
 .env.*.local
 

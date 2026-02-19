@@ -5,8 +5,8 @@ Handles all modal forms for the application system.
 
 import discord
 from discord.ui import Modal, TextInput
-from utils import sanitize_text
-from constants import (
+from oak.utils import sanitize_text
+from oak.constants import (
     MODAL_TITLE_MAX,
     MODAL_TEXT_INPUT_LABEL_MAX,
     MODAL_TEXT_INPUT_PLACEHOLDER_MAX,
@@ -105,16 +105,16 @@ class ApplicationModal(Modal):
 
         if remaining > 0:
             # More questions to answer
-            # Update last activity in database
+            # Save partial answers and update last activity in database
             try:
                 async with aiosqlite.connect(self.get_db_path()) as db:
                     await db.execute(
-                        "UPDATE applications SET last_activity_at = datetime('now') WHERE channel_id = ?",
-                        (interaction.channel.id,)
+                        "UPDATE applications SET answers = ?, last_activity_at = datetime('now') WHERE channel_id = ?",
+                        (json.dumps(self.answers), interaction.channel.id)
                     )
                     await db.commit()
             except Exception as e:
-                logger.error(f"Failed to update last activity: {e}")
+                logger.error(f"Failed to save partial answers: {e}")
 
             await interaction.response.defer()
             await interaction.channel.send(
@@ -298,6 +298,13 @@ class DeclineReasonModal(Modal):
         import asyncio
         from .helpers import get_application_config
 
+        # Defer immediately to avoid interaction timeout
+        await interaction.response.defer(ephemeral=True)
+
+        # Sanitize the decline reason to prevent markdown/mention injection
+        raw_reason = self.reason.value
+        sanitized_reason = discord.utils.escape_markdown(discord.utils.escape_mentions(raw_reason))
+
         # Get config
         config = get_application_config()
         denial_config = config.get("settings", {}).get("denial", {})
@@ -314,7 +321,7 @@ class DeclineReasonModal(Modal):
                         title="Application Update",
                         description=(
                             "We're sorry to inform you that your application has been **denied**.\n\n"
-                            f"**Reason:** {self.reason.value}\n\n"
+                            f"**Reason:** {sanitized_reason}\n\n"
                             "We encourage you to continue contributing to the community and consider reapplying in the future."
                         ),
                         color=get_embed_colors()["error"]
@@ -324,11 +331,11 @@ class DeclineReasonModal(Modal):
             except discord.Forbidden:
                 pass  # DM failed
 
-        # Update database with denial info
+        # Update database with denial info (store raw reason for DB, display sanitized)
         async with aiosqlite.connect(self.get_db_path()) as db:
             await db.execute(
                 "UPDATE applications SET status = 'denied', denied_at = datetime('now'), denial_dm_sent = ?, denial_reason = ? WHERE channel_id = ?",
-                (1 if dm_sent else 0, self.reason.value, interaction.channel.id)
+                (1 if dm_sent else 0, raw_reason, interaction.channel.id)
             )
             await db.commit()
 
@@ -336,7 +343,7 @@ class DeclineReasonModal(Modal):
         await interaction.channel.send(
             embed=discord.Embed(
                 title="Application Denied",
-                description=f"❌ Application for <@{self.applicant_id}> was denied.\n\n**Reason:** {self.reason.value}",
+                description=f"Application for <@{self.applicant_id}> was denied.\n\n**Reason:** {sanitized_reason}",
                 color=get_embed_colors()["error"]
             )
         )
@@ -365,7 +372,7 @@ class DeclineReasonModal(Modal):
                     color=get_embed_colors()["warning"]
                 )
             )
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"Application denied. Channel kept open because DM failed. {'Will auto-delete in ' + str(auto_delete_hours) + ' hours.' if auto_delete_enabled else ''}",
                 ephemeral=True
             )
@@ -373,12 +380,12 @@ class DeclineReasonModal(Modal):
             # DM succeeded - notify staff and schedule deletion
             await interaction.channel.send(
                 embed=discord.Embed(
-                    description=f"✅ <@{self.applicant_id}> has been notified via DM.\n\n**This channel will be deleted in {delete_delay} seconds.**",
+                    description=f"<@{self.applicant_id}> has been notified via DM.\n\n**This channel will be deleted in {delete_delay} seconds.**",
                     color=get_embed_colors()["success"]
                 )
             )
 
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"Application denied and user notified. Channel will be deleted in {delete_delay} seconds.",
                 ephemeral=True
             )
