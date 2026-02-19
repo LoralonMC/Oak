@@ -316,6 +316,20 @@ class Application(OakBranch):
         # Run database migration for new columns
         await self._migrate_database()
 
+        if self.application_channel_id == 0:
+            self.log.warning("application_channel_id is 0 (placeholder) — application button will not be posted")
+        if self.application_category_id == 0:
+            self.log.warning("application_category_id is 0 (placeholder) — applications cannot be created")
+
+        # Validate inactivity settings
+        inactivity_config = self.config.get("settings", {}).get("inactivity", {})
+        warning_days = inactivity_config.get("warning_after_days", 3)
+        abandon_days = inactivity_config.get("abandon_after_days", 7)
+        if abandon_days <= warning_days:
+            self.log.error(
+                f"abandon_after_days ({abandon_days}) must be greater than warning_after_days ({warning_days})"
+            )
+
         # Register persistent views (both legacy and namespaced)
         self.log.info("Registering persistent views for Application")
         self.bot.add_view(ApplicationButtonView(handle_application_start_func=handle_application_start, legacy=True))

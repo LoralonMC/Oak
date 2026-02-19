@@ -207,6 +207,9 @@ class ApplicationModal(Modal):
         except discord.HTTPException as e:
             logger.error(f"Failed to send submission message: {e}")
 
+        # Update database first to ensure consistent state even if Discord API calls fail
+        await self._update_database(interaction)
+
         # Notify admin chat
         await self._notify_admin_chat(interaction, applicant, config)
 
@@ -216,8 +219,15 @@ class ApplicationModal(Modal):
         # Try to DM the user
         await self._dm_applicant(interaction, applicant)
 
-        # Update database
-        await self._update_database(interaction)
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        logger.error(f"Error in ApplicationModal: {error}", exc_info=True)
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send("An error occurred. Please try again.", ephemeral=True)
+            else:
+                await interaction.response.send_message("An error occurred. Please try again.", ephemeral=True)
+        except Exception:
+            pass
 
     async def _notify_admin_chat(self, interaction, applicant, config):
         """Notify admin chat of new application."""
@@ -332,10 +342,13 @@ class DeclineReasonModal(Modal):
 
         # Update database with denial info (store raw reason for DB, display sanitized)
         async with aiosqlite.connect(self.get_db_path()) as db:
-            await db.execute(
-                "UPDATE applications SET status = 'denied', denied_at = datetime('now'), denial_dm_sent = ?, denial_reason = ? WHERE channel_id = ?",
+            cursor = await db.execute(
+                "UPDATE applications SET status = 'denied', denied_at = datetime('now'), denial_dm_sent = ?, denial_reason = ? WHERE channel_id = ? AND status = 'pending'",
                 (1 if dm_sent else 0, raw_reason, interaction.channel.id)
             )
+            if cursor.rowcount == 0:
+                await interaction.followup.send("This application was already processed.", ephemeral=True)
+                return
             await db.commit()
 
         # Public message in the channel
@@ -389,10 +402,24 @@ class DeclineReasonModal(Modal):
                 ephemeral=True
             )
 
-            # Wait configurable time then delete channel
-            await asyncio.sleep(delete_delay)
-            try:
-                await interaction.channel.delete(reason=f"Application denied (user {self.applicant_id} notified via DM)")
-                logger.info(f"Deleted denied application channel {interaction.channel.id} for user {self.applicant_id}")
-            except discord.HTTPException as e:
-                logger.error(f"Failed to delete denied application channel: {e}")
+            # Fire-and-forget delayed channel deletion to avoid blocking the handler
+            async def _delayed_delete():
+                await asyncio.sleep(delete_delay)
+                try:
+                    await interaction.channel.delete(reason=f"Application denied (user {self.applicant_id} notified via DM)")
+                    logger.info(f"Deleted denied application channel {interaction.channel.id} for user {self.applicant_id}")
+                except discord.HTTPException as e:
+                    logger.error(f"Failed to delete denied application channel: {e}")
+
+            task = asyncio.create_task(_delayed_delete())
+            task.add_done_callback(lambda t: logger.error(f"Delayed delete task error: {t.exception()}", exc_info=t.exception()) if t.exception() else None)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        logger.error(f"Error in DeclineReasonModal: {error}", exc_info=True)
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send("An error occurred. Please try again.", ephemeral=True)
+            else:
+                await interaction.response.send_message("An error occurred. Please try again.", ephemeral=True)
+        except Exception:
+            pass

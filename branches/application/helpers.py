@@ -159,24 +159,6 @@ def get_reviewer_role_ids():
     return tuple(config.get("settings", {}).get("reviewer_role_ids", []))
 
 
-def is_application_reviewer():
-    """
-    Decorator to check if user has application reviewer permissions.
-
-    Returns:
-        commands.check decorator
-    """
-    from discord.ext import commands
-
-    async def predicate(ctx):
-        config = get_application_config()
-        reviewer_role_ids = config.get("settings", {}).get("reviewer_role_ids", [])
-        user_role_ids = [role.id for role in ctx.author.roles]
-        return any(role_id in reviewer_role_ids for role_id in user_role_ids)
-
-    return commands.check(predicate)
-
-
 def check_application_answer_quality(question: str, answer: str) -> tuple[bool, str]:
     """
     Check if an application answer is of sufficient quality.

@@ -132,9 +132,19 @@ class StatusModal(ui.Modal, title="Reason for Action"):
                 suggestion_link = f"https://discord.com/channels/{guild_id}/{self.channel_id or 0}/{self.message_id}"
                 dm_content = (
                     f"Your suggestion was **{self.status.lower()}**!\n"
-                    f"**Reason:** {self.reason.value}\n"
+                    f"**Reason:** {sanitized_reason}\n"
                     f"[Click here to view your suggestion]({suggestion_link})"
                 )
                 await user.send(dm_content)
             except discord.Forbidden:
                 pass
+
+    async def on_error(self, interaction: Interaction, error: Exception):
+        logger.error(f"Error in StatusModal: {error}", exc_info=True)
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send("An error occurred while processing the suggestion.", ephemeral=True)
+            else:
+                await interaction.response.send_message("An error occurred while processing the suggestion.", ephemeral=True)
+        except Exception:
+            pass

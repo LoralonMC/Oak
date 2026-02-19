@@ -16,7 +16,7 @@ from .errors import OakError
 
 logger = logging.getLogger(__name__)
 
-_VALUE_PATTERN = re.compile(r"^[A-Za-z0-9._-]*$")
+_VALUE_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
 @dataclass(frozen=True)
@@ -46,8 +46,6 @@ class InteractionRouter:
         value = parts[3] if len(parts) == 4 else ""
 
         if not branch or not action:
-            return None
-        if ":" in branch or ":" in action:
             return None
         if value and not _VALUE_PATTERN.match(value):
             return None

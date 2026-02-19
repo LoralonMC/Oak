@@ -720,6 +720,8 @@ class StatusChangeView(View):
                 )
                 await db.commit()
 
+            logger.info(f"Staff {interaction.user} changed app #{self.app_index} status to {new_status}")
+
             await interaction.response.send_message(
                 embed=discord.Embed(
                     title="Status Updated",

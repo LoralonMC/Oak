@@ -119,6 +119,7 @@ class Tickets(OakBranch):
             self.log.warning("staff_role_ids contains placeholder value [0] - replace with actual role IDs")
 
         self._thread_update_times: dict[int, float] = {}
+        self._registered_views: list = []
 
         self.log.info(f"Tickets branch initialized (db: {self.db_path})")
 
@@ -140,11 +141,17 @@ class Tickets(OakBranch):
         self.anti_archive_interval = anti_archive.get("check_interval_minutes", 30)
 
         self.log.info("Registering persistent views for Tickets")
-        self.bot.add_view(TicketPanelView(legacy=True))
-        self.bot.add_view(TicketPanelView())
-        self.bot.add_view(TicketControlView(legacy=True))
-        self.bot.add_view(TicketControlView())
-        self.bot.add_view(LegacyReminderView())
+        panel_view = TicketPanelView()
+        panel_view_legacy = TicketPanelView(legacy=True)
+        control_view = TicketControlView()
+        control_view_legacy = TicketControlView(legacy=True)
+        legacy_reminder_view = LegacyReminderView()
+        self.bot.add_view(panel_view_legacy)
+        self.bot.add_view(panel_view)
+        self.bot.add_view(control_view_legacy)
+        self.bot.add_view(control_view)
+        self.bot.add_view(legacy_reminder_view)
+        self._registered_views = [panel_view_legacy, panel_view, control_view_legacy, control_view, legacy_reminder_view]
         self.bot.add_dynamic_items(
             ReminderStopButton, ReminderSnooze1hButton,
             ReminderSnooze6hButton, ReminderSnooze1dButton
@@ -180,11 +187,14 @@ class Tickets(OakBranch):
             self.log.error(f"Error running migrations: {e}", exc_info=True)
 
     async def on_disable(self):
-        """Stop background tasks."""
+        """Stop background tasks and remove persistent views."""
         if self.anti_archive_task.is_running():
             self.anti_archive_task.cancel()
         if self.check_reminders_task.is_running():
             self.check_reminders_task.cancel()
+        for view in self._registered_views:
+            view.stop()
+        self._registered_views.clear()
         self.log.info("Tickets branch unloaded")
 
     async def validate_panel(self):
@@ -319,6 +329,12 @@ class Tickets(OakBranch):
     @tasks.loop(minutes=30)
     async def anti_archive_task(self):
         """Periodically unarchive open ticket threads that were manually archived."""
+        # Cleanup stale entries from _thread_update_times
+        now = time.time()
+        stale = [tid for tid, ts in self._thread_update_times.items() if now - ts > 30]
+        for tid in stale:
+            del self._thread_update_times[tid]
+
         try:
             async with aiosqlite.connect(self.db_path) as db:
                 cursor = await db.execute(
@@ -534,6 +550,8 @@ class Tickets(OakBranch):
                     (payload.thread_id,)
                 )
                 ticket_data = await cursor.fetchone()
+                if not ticket_data:
+                    return
                 creator_id, category = ticket_data
 
                 # Resolve the thread
@@ -594,6 +612,18 @@ class Tickets(OakBranch):
                         except discord.HTTPException as e:
                             self.log.error(f"Failed to re-archive unauthorized thread {payload.thread_id}: {e}")
                         return
+
+                elif unarchiver is None:
+                    # Audit log lookup failed — deny the reopen for safety
+                    self.log.error(
+                        f"Could not determine who unarchived closed ticket {payload.thread_id}; "
+                        "re-archiving (likely missing Audit Log permission)"
+                    )
+                    try:
+                        await thread.edit(archived=True, locked=True)
+                    except discord.HTTPException as e:
+                        self.log.error(f"Failed to re-archive thread {payload.thread_id}: {e}")
+                    return
 
                 # Authorized reopen - update DB and notify
                 await db.execute(

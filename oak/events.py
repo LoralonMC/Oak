@@ -6,6 +6,7 @@ Phase 1 — minimal implementation with full interface.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass, field
 from typing import Any, Callable, Coroutine
@@ -48,7 +49,11 @@ class EventBus:
         listeners = self._listeners.get(event.name, [])
         for branch_id, callback in listeners:
             try:
-                await callback(event)
+                await asyncio.wait_for(asyncio.shield(callback(event)), timeout=30.0)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"Event listener for '{event.name}' in branch '{branch_id}' timed out after 30s"
+                )
             except Exception:
                 logger.exception(
                     f"Error in event listener for '{event.name}' in branch '{branch_id}'"

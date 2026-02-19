@@ -26,7 +26,7 @@ def create_branch(branch_name: str, description: str = ""):
     class_name = "".join(word.capitalize() for word in branch_name.split("_"))
 
     # Create branch folder
-    branch_folder = Path(f"branches/{branch_name}")
+    branch_folder = Path(__file__).parent / "branches" / branch_name
 
     if branch_folder.exists():
         print(f"Branch folder already exists: {branch_folder}")
@@ -54,7 +54,7 @@ name: {class_name}
 version: "1.0.0"
 description: {description or f"{class_name} branch"}
 main: branch.{class_name}
-database: true
+database: false
 """
     with open(manifest_file, "w") as f:
         f.write(manifest_content)
@@ -68,7 +68,6 @@ database: true
 
 import discord
 from discord import app_commands
-import aiosqlite
 
 from oak import OakBranch
 from oak.context import BranchContext
@@ -105,8 +104,6 @@ class {class_name}(OakBranch):
 
     def __init__(self, ctx: BranchContext):
         super().__init__(ctx)
-        self.db_path = str(self.data_dir / "data.db")
-
         # Access settings via self.setting()
         self.channel_id = self.setting("example_channel_id", default=0)
         self.feature_a = self.setting("features", "feature_a", default=True)
@@ -145,14 +142,15 @@ class {class_name}(OakBranch):
     @app_commands.command(name="{branch_name}_save", description="Example DB command")
     @app_commands.describe(data="Data to save")
     async def save_data(self, interaction: discord.Interaction, data: str) -> None:
-        """Example database command."""
+        """Example database command (requires database: true in branch.yml)."""
+        if not self.db:
+            await interaction.response.send_message("Database not enabled for this branch.", ephemeral=True)
+            return
         try:
-            async with aiosqlite.connect(self.db_path) as db:
-                await db.execute(
-                    "INSERT INTO {branch_name}_data (user_id, data) VALUES (?, ?)",
-                    (interaction.user.id, data),
-                )
-                await db.commit()
+            await self.db.execute(
+                "INSERT INTO {branch_name}_data (user_id, data) VALUES (?, ?)",
+                (interaction.user.id, data),
+            )
             await interaction.response.send_message("Data saved!", ephemeral=True)
         except Exception as e:
             self.log.error(f"Error saving data: {{e}}")
@@ -219,6 +217,14 @@ def main():
 
     if not branch_name.replace("_", "").isalnum():
         print("Branch name must contain only letters, numbers, and underscores")
+        sys.exit(1)
+
+    RESERVED_NAMES = {"__pycache__", "admin", "__init__"}
+    if branch_name.startswith("_"):
+        print("Branch name must not start with underscore")
+        sys.exit(1)
+    if branch_name in RESERVED_NAMES:
+        print(f"Branch name '{branch_name}' is reserved")
         sys.exit(1)
 
     create_branch(branch_name, description)

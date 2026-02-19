@@ -524,7 +524,7 @@ def _calculate_emerald_cost(
         cost_per_trade += item1_amount * currency_map[item1_id]
         has_currency = True
 
-    if item2_id and item2_id in currency_map:
+    if item2_id is not None and item2_id in currency_map and item2_amount is not None:
         cost_per_trade += item2_amount * currency_map[item2_id]
         has_currency = True
 

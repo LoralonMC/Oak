@@ -127,6 +127,10 @@ class StatusChannels(OakBranch):
                         self.log.warning(f"Error fetching server status for {host}:{port}: {e}")
                         return
 
+                    if status.players is None:
+                        self.log.warning(f"Server {host}:{port} returned no player information")
+                        return
+
                     online_channel = guild.get_channel(player_channel_id)
                     if not online_channel:
                         self.log.warning(f"Online channel {player_channel_id} not found")
@@ -144,6 +148,8 @@ class StatusChannels(OakBranch):
                         self.log.warning("Rate limited updating online channel, will retry next cycle")
                     else:
                         self.log.error(f"Failed to update online channel: {e}")
+                except Exception as e:
+                    self.log.error(f"Unexpected error updating online channel: {e}", exc_info=True)
 
         except Exception as e:
             self.log.error(f"Critical error in update_status_channels: {e}")

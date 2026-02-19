@@ -24,7 +24,13 @@ CREATE TABLE IF NOT EXISTS suggestions (
     status TEXT,
     reason TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-)
+);
+CREATE TABLE IF NOT EXISTS suggestion_votes (
+    suggestion_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    vote_type TEXT NOT NULL CHECK(vote_type IN ('like', 'dislike')),
+    PRIMARY KEY (suggestion_id, user_id)
+);
 """
 
 DEFAULT_CONFIG = {
@@ -70,9 +76,50 @@ class Suggestions(OakBranch):
     async def on_enable(self) -> None:
         if self.db:
             await self.db.initialize(SUGGESTIONS_SCHEMA)
+            # Migrate existing votes from JSON columns to votes table
+            await self._migrate_votes()
+
+        channel_id = self.setting("channel_id", default=0)
+        if channel_id == 0:
+            self.log.warning("suggestions channel_id is 0 (placeholder) — suggestions will not work")
+        manager_role_ids = self.setting("manager_role_ids", default=[])
+        if not manager_role_ids or manager_role_ids == [0]:
+            self.log.warning("manager_role_ids is empty or placeholder — suggestion management will not work")
+
         self.log.info("Registering SuggestionVoteView for persistent interactions")
         self.bot.add_view(SuggestionVoteView(legacy=True))
         self.bot.add_view(SuggestionVoteView())
+
+    async def _migrate_votes(self):
+        """Backfill suggestion_votes table from legacy JSON columns."""
+        try:
+            row = await self.db.fetchone("SELECT COUNT(*) FROM suggestion_votes")
+            if row and row[0] > 0:
+                return  # Already migrated
+
+            rows = await self.db.fetchall("SELECT id, likes, dislikes FROM suggestions")
+            if not rows:
+                return
+
+            conn = self.db.connect()
+            async with self.db.write_lock:
+                for suggestion_id, likes_json, dislikes_json in rows:
+                    likes = json.loads(likes_json) if likes_json else []
+                    dislikes = json.loads(dislikes_json) if dislikes_json else []
+                    for user_id in likes:
+                        await conn.execute(
+                            "INSERT OR IGNORE INTO suggestion_votes (suggestion_id, user_id, vote_type) VALUES (?, ?, 'like')",
+                            (suggestion_id, user_id),
+                        )
+                    for user_id in dislikes:
+                        await conn.execute(
+                            "INSERT OR IGNORE INTO suggestion_votes (suggestion_id, user_id, vote_type) VALUES (?, ?, 'dislike')",
+                            (suggestion_id, user_id),
+                        )
+                await conn.commit()
+            self.log.info("Migrated suggestion votes to new table")
+        except Exception as e:
+            self.log.error(f"Failed to migrate suggestion votes: {e}", exc_info=True)
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):

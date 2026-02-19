@@ -111,15 +111,7 @@ MAX_AGE_REASONABLE = 100
 def truncate_for_embed_field(text: str, suffix: str = "...", max_length: int = EMBED_FIELD_VALUE_MAX) -> str:
     """Truncate text to fit in an embed field value.
 
-    Args:
-        text: Text to truncate.
-        suffix: String appended when truncation occurs.
-        max_length: Maximum allowed length (default: 1024).
+    .. deprecated:: Use ``oak.utils.truncate_for_embed_field`` instead.
     """
-    if not text:
-        return ""
-    if len(suffix) >= max_length:
-        return text[:max_length]
-    if len(text) <= max_length:
-        return text
-    return text[:max_length - len(suffix)] + suffix
+    from .utils import truncate_for_embed_field as _impl
+    return _impl(text, suffix, max_length)

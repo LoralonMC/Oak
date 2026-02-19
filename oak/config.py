@@ -5,12 +5,13 @@ Oak configuration: environment loading, branch config merge.
 import copy
 import logging
 import os
-import sys
 from pathlib import Path
 from typing import Any
 
 import yaml
 from dotenv import load_dotenv
+
+from .errors import ConfigError
 
 logger = logging.getLogger(__name__)
 
@@ -66,9 +67,9 @@ class OakConfig:
     def _require(self, key: str) -> str:
         value = os.getenv(key)
         if not value:
-            print(f"ERROR: Missing required environment variable: {key}")
-            print(f"Please add {key} to your .env file")
-            sys.exit(1)
+            msg = f"Missing required environment variable: {key}. Please add {key} to your .env file"
+            logger.critical(msg)
+            raise ConfigError(msg)
         return value
 
     def _require_int(self, key: str) -> int:
@@ -76,17 +77,20 @@ class OakConfig:
         try:
             return int(raw)
         except ValueError:
-            print(f"ERROR: {key} must be a valid integer, got: {raw}")
-            sys.exit(1)
+            msg = f"{key} must be a valid integer, got: {raw}"
+            logger.critical(msg)
+            raise ConfigError(msg)
 
     def _validate(self) -> None:
         placeholders = {"your_bot_token_here", "your_token_here", "placeholder", ""}
         if self.token in placeholders:
-            print("ERROR: DISCORD_TOKEN is still set to a placeholder value!")
-            sys.exit(1)
+            msg = "DISCORD_TOKEN is still set to a placeholder value!"
+            logger.critical(msg)
+            raise ConfigError(msg)
         if self.guild_id == 0:
-            print("ERROR: GUILD_ID is still set to 0 (placeholder)!")
-            sys.exit(1)
+            msg = "GUILD_ID is still set to 0 (placeholder)!"
+            logger.critical(msg)
+            raise ConfigError(msg)
 
     def get(self, key: str, default: Any = None) -> Any:
         """Get an optional environment variable."""

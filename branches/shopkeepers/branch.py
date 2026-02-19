@@ -131,6 +131,7 @@ CREATE INDEX IF NOT EXISTS idx_trades_item1 ON trades(item1_id);
 CREATE INDEX IF NOT EXISTS idx_trades_player_uuid ON trades(player_uuid);
 CREATE INDEX IF NOT EXISTS idx_trades_shop_owner_uuid ON trades(shop_owner_uuid);
 CREATE INDEX IF NOT EXISTS idx_trades_shop_type ON trades(shop_type);
+CREATE INDEX IF NOT EXISTS idx_trades_shop_type_date ON trades(shop_type, trade_date);
 
 CREATE TABLE IF NOT EXISTS price_summary (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -216,12 +217,7 @@ class Shopkeepers(OakBranch):
 
     async def _run_migrations(self):
         """Run database migrations for existing databases."""
-        try:
-            async with aiosqlite.connect(self.db_path):
-                # Placeholder for future migrations
-                pass
-        except Exception as e:
-            self.log.error(f"Error running migrations: {e}", exc_info=True)
+        pass
 
     async def _sync_currencies(self):
         """
@@ -359,6 +355,11 @@ class Shopkeepers(OakBranch):
     async def before_auto_import_task(self):
         """Wait until bot is ready before starting task."""
         await self.bot.wait_until_ready()
+
+    @auto_import_task.error
+    async def auto_import_task_error(self, error):
+        """Log errors from the auto-import task."""
+        self.log.error(f"Unhandled error in auto_import_task: {error}", exc_info=True)
 
     @app_commands.command(
         name="shopkeepers_import",
@@ -507,7 +508,7 @@ class Shopkeepers(OakBranch):
                 if not row:
                     escaped_item = self._escape_like(item.lower())
                     row = await db.execute_fetchall(
-                        "SELECT id, item_key, display_name, search_name FROM items WHERE search_name LIKE ? ESCAPE '\\' LIMIT 1",
+                        "SELECT id, item_key, display_name, search_name FROM items WHERE search_name LIKE ? ESCAPE '\\' ORDER BY LENGTH(search_name) ASC LIMIT 1",
                         (f"%{escaped_item}%",),
                     )
                 if not row:

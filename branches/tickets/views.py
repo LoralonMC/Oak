@@ -99,7 +99,6 @@ class TicketPanelView(discord.ui.View):
 
             if cooldown_seconds > 0:
                 _cleanup_rate_limits(cooldown_seconds)
-                global _last_ticket_creation
                 now = time.time()
                 last_creation = _last_ticket_creation.get(interaction.user.id, 0)
                 time_since_last = now - last_creation
@@ -170,7 +169,6 @@ class TicketPanelView(discord.ui.View):
 
             # Re-check rate limit (user might have created another ticket while filling out modal)
             if cooldown_seconds > 0:
-                global _last_ticket_creation
                 now = time.time()
                 last_creation = _last_ticket_creation.get(interaction.user.id, 0)
                 time_since_last = now - last_creation
@@ -390,9 +388,10 @@ class TicketPanelView(discord.ui.View):
 class ConfirmCloseView(discord.ui.View):
     """Confirmation view for closing tickets."""
 
-    def __init__(self, close_callback):
+    def __init__(self, close_callback, author_id: int):
         super().__init__(timeout=60)
         self.close_callback = close_callback
+        self.author_id = author_id
 
     @discord.ui.button(
         label="Yes, Close Ticket",
@@ -400,6 +399,9 @@ class ConfirmCloseView(discord.ui.View):
     )
     async def confirm_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Confirm ticket closure."""
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("Only the person who initiated the close can confirm.", ephemeral=True)
+            return
         await self.close_callback(interaction, reason=None)
         # Disable buttons
         for item in self.children:
@@ -415,6 +417,9 @@ class ConfirmCloseView(discord.ui.View):
     )
     async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Cancel ticket closure."""
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("Only the person who initiated the close can confirm.", ephemeral=True)
+            return
         await interaction.response.send_message(
             "❌ Ticket closure cancelled.",
             ephemeral=True
@@ -452,7 +457,7 @@ class TicketControlView(discord.ui.View):
     async def close_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Close ticket without reason - shows confirmation first."""
         # Show confirmation view
-        confirm_view = ConfirmCloseView(close_callback=self._close_ticket)
+        confirm_view = ConfirmCloseView(close_callback=self._close_ticket, author_id=interaction.user.id)
         await interaction.response.send_message(
             "⚠️ Are you sure you want to close this ticket?",
             view=confirm_view,
@@ -558,12 +563,14 @@ class TicketControlView(discord.ui.View):
 
         # Update database and cancel reminders atomically after successfully closing thread
         async with aiosqlite.connect(get_db_path()) as db:
-            await db.execute(
+            cursor = await db.execute(
                 """UPDATE tickets
                 SET status = 'closed', closed_by = ?, close_reason = ?, closed_at = datetime('now')
-                WHERE thread_id = ?""",
+                WHERE thread_id = ? AND status = 'open'""",
                 (interaction.user.id, reason, thread.id)
             )
+            if cursor.rowcount == 0:
+                logger.warning(f"Ticket {thread.id} was already closed by another user")
             await db.execute(
                 "UPDATE ticket_reminders SET active = 0 WHERE ticket_thread_id = ? AND active = 1",
                 (thread.id,)

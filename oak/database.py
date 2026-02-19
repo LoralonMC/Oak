@@ -45,6 +45,8 @@ class BranchDatabase:
 
     async def initialize(self, schema: str) -> None:
         """Open the persistent connection, set pragmas, run schema."""
+        if self._conn is not None:
+            raise RuntimeError("Database already initialized")
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = await aiosqlite.connect(str(self._path))
         await self._conn.execute("PRAGMA journal_mode=WAL")
@@ -62,6 +64,12 @@ class BranchDatabase:
         if not self._conn:
             raise RuntimeError("Database not initialized — call initialize() first")
 
+        # Guard against duplicate migration names
+        names = [m.name for m in migrations]
+        if len(names) != len(set(names)):
+            dupes = [n for n in names if names.count(n) > 1]
+            raise ValueError(f"Duplicate migration names: {sorted(set(dupes))}")
+
         async with self._write_lock:
             for migration in migrations:
                 cursor = await self._conn.execute(
@@ -72,12 +80,19 @@ class BranchDatabase:
                     continue  # already applied
 
                 logger.info(f"Running migration: {migration.name}")
-                await self._conn.executescript(migration.sql)
-                await self._conn.execute(
-                    "INSERT INTO _oak_migrations (name) VALUES (?)",
-                    (migration.name,),
-                )
-                await self._conn.commit()
+                try:
+                    await self._conn.executescript(migration.sql)
+                    await self._conn.execute(
+                        "INSERT INTO _oak_migrations (name) VALUES (?)",
+                        (migration.name,),
+                    )
+                    await self._conn.commit()
+                except Exception as e:
+                    logger.error(
+                        f"Migration '{migration.name}' failed: {e}",
+                        exc_info=True,
+                    )
+                    raise
 
     async def execute(self, query: str, params: tuple = ()) -> aiosqlite.Cursor:
         """Execute a write query (INSERT/UPDATE/DELETE) with lock."""
@@ -102,8 +117,18 @@ class BranchDatabase:
         cursor = await self._conn.execute(query, params)
         return await cursor.fetchall()
 
+    @property
+    def write_lock(self) -> asyncio.Lock:
+        """Return the write lock for advanced use."""
+        return self._write_lock
+
     def connect(self) -> aiosqlite.Connection:
-        """Return the raw persistent connection for advanced use."""
+        """Return the raw persistent connection for advanced use.
+
+        Warning: callers using this connection directly bypass the write lock.
+        Use ``write_lock`` to serialise writes when operating on the raw
+        connection.
+        """
         if not self._conn:
             raise RuntimeError("Database not initialized")
         return self._conn

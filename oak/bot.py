@@ -37,7 +37,7 @@ class OakBot(commands.Bot):
         self.router = InteractionRouter()
         self.loader = BranchLoader(
             bot=self,
-            branches_dir=Path("branches"),
+            branches_dir=Path(__file__).parent.parent / "branches",
             event_bus=self.event_bus,
             router=self.router,
         )
@@ -67,8 +67,12 @@ class OakBot(commands.Bot):
         # Sync slash commands to guild
         guild = discord.Object(id=self.guild_id)
         self.tree.copy_global_to(guild=guild)
-        synced = await self.tree.sync(guild=guild)
-        logger.info(f"Synced {len(synced)} commands to guild {self.guild_id}")
+        try:
+            synced = await self.tree.sync(guild=guild)
+            logger.info(f"Synced {len(synced)} commands to guild {self.guild_id}")
+        except discord.HTTPException as exc:
+            logger.error(f"Failed to sync commands to guild {self.guild_id}: {exc}")
+            raise
 
         logger.info("Oak setup complete!")
 
@@ -144,7 +148,9 @@ class OakBot(commands.Bot):
     async def on_command_error(self, ctx: commands.Context, error: commands.CommandError) -> None:
         if isinstance(error, commands.CommandNotFound):
             return
-        if isinstance(error, (commands.MissingPermissions, commands.MissingRole,
+        if isinstance(error, commands.CommandOnCooldown):
+            await ctx.send(f"This command is on cooldown. Try again in {error.retry_after:.0f}s.", delete_after=10)
+        elif isinstance(error, (commands.MissingPermissions, commands.MissingRole,
                               commands.MissingAnyRole, commands.CheckFailure)):
             await ctx.send("You don't have permission to use this command.", delete_after=10)
         elif isinstance(error, commands.MissingRequiredArgument):

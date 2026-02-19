@@ -65,9 +65,9 @@ class AdminBranch(OakBranch):
             )
         except Exception as e:
             await interaction.followup.send(
-                f"Failed to reload **{branch_name}**: {e}", ephemeral=True
+                f"Failed to reload **{branch_name}**. Check bot logs for details.", ephemeral=True
             )
-            self.log.error(f"Failed to reload {branch_name}: {e}")
+            self.log.error(f"Failed to reload {branch_name}: {e}", exc_info=True)
 
     @app_commands.command(name="load", description="Load a branch")
     @app_commands.describe(branch_name="ID of the branch to load")
@@ -90,9 +90,9 @@ class AdminBranch(OakBranch):
             )
         except Exception as e:
             await interaction.followup.send(
-                f"Failed to load **{branch_name}**: {e}", ephemeral=True
+                f"Failed to load **{branch_name}**. Check bot logs for details.", ephemeral=True
             )
-            self.log.error(f"Failed to load {branch_name}: {e}")
+            self.log.error(f"Failed to load {branch_name}: {e}", exc_info=True)
 
     @app_commands.command(name="unload", description="Unload a branch")
     @app_commands.describe(branch_name="ID of the branch to unload")
@@ -121,9 +121,9 @@ class AdminBranch(OakBranch):
             )
         except Exception as e:
             await interaction.followup.send(
-                f"Failed to unload **{branch_name}**: {e}", ephemeral=True
+                f"Failed to unload **{branch_name}**. Check bot logs for details.", ephemeral=True
             )
-            self.log.error(f"Failed to unload {branch_name}: {e}")
+            self.log.error(f"Failed to unload {branch_name}: {e}", exc_info=True)
 
     @app_commands.command(name="branches", description="List all branches")
     @app_commands.default_permissions(administrator=True)
