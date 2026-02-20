@@ -21,21 +21,25 @@ Thank you for your interest in contributing to Oak! This document provides guide
 - Add docstrings to all functions and classes
 - Keep functions focused and single-purpose
 
-### Understanding Oak's Branch Terminology
+### Understanding Oak's Branch Architecture
 
-Oak uses **"branch"** as the user-facing term for modular extensions. However, in the code you'll see Discord.py's native terminology:
-- **`commands.Cog`** - The base class all branches inherit from (required by Discord.py)
-- **`bot.add_cog()`** - The method to register branches (required by Discord.py)
-- **`cog_load()` / `cog_unload()`** - Lifecycle methods for setup/cleanup (Discord.py Cog API)
+Oak uses **"branch"** as the user-facing term for modular extensions. Branches extend `OakBranch` (which inherits from discord.py's `commands.Cog` under the hood). The framework handles discovery, loading, and lifecycle — you write your branch class and the framework does the rest.
 
-This is not a terminology inconsistency - it's Discord.py's API. When writing Oak branches, you're creating Cogs under the hood, but we call them "branches" for clarity and to match Oak's modular philosophy.
+Key concepts:
+- **`OakBranch`** — Base class for all branches (provides `self.db`, `self.config`, `self.log`, etc.)
+- **`branch.yml`** — Manifest that declares branch metadata (id, version, main class, database flag)
+- **`on_enable()` / `on_disable()`** — Lifecycle hooks for setup and cleanup
+- **`self.db`** — Per-branch SQLite database managed by the framework (persistent connection, WAL mode, write locking)
+- **`self.setting()`** — Access nested config values with defaults
 
 ### Branch Development
 When creating new branches:
 - Use the `create_branch.py` script as a starting point
-- Follow the existing branch structure
+- Follow the existing branch structure (see [GUIDE.md](GUIDE.md) for full details)
 - Keep branches self-contained
-- Include a `config.yml` with all configurable settings
+- Include a `branch.yml` manifest and `config.yml` with all configurable settings
+- Use `self.db` methods for database access — never open raw `aiosqlite` connections
+- Use `self.setting()` or `self.config` for configuration — never read config files from disk
 - Document all configuration options
 
 ### Configuration
@@ -45,9 +49,11 @@ When creating new branches:
 - Document what each setting does
 
 ### Database
-- Use per-branch databases (`data.db` in branch folder)
+- Set `database: true` in `branch.yml` to get a per-branch SQLite database (`self.db`)
+- Use `self.db.execute()`, `self.db.fetchone()`, `self.db.fetchall()` — never raw `aiosqlite.connect()`
+- Use `self.db.transaction()` for multi-statement writes
+- Use `self.db.migrate()` for schema changes after initial release
 - Use parameterized queries (prevent SQL injection)
-- Include database schema in branch file
 - Handle database errors gracefully
 
 ### Error Handling
@@ -62,7 +68,7 @@ Before submitting a pull request:
 
 1. **Syntax Check**: Run `python -m py_compile` on your files
 2. **Test in Development**: Use a test Discord server
-3. **Test Hot-Reload**: Verify `!reload` works with your branch
+3. **Test Hot-Reload**: Verify `/reload` works with your branch
 4. **Test Configuration**: Ensure config changes work correctly
 5. **Check Logs**: Review logs for warnings or errors
 
@@ -71,36 +77,28 @@ Before submitting a pull request:
 ### Branch Structure
 ```
 branches/your_branch/
-├── __init__.py       # Package setup with async def setup(bot)
-├── branch.py         # Main branch code
-├── config.yml        # Configuration file
-└── data.db           # Database (if needed, auto-created)
+├── __init__.py       # Empty (framework uses branch.yml for discovery)
+├── branch.yml        # Manifest — declares id, version, main class
+├── branch.py         # OakBranch subclass — your code
+├── config.yml        # Runtime settings (operators edit this)
+└── data.db           # Database (auto-created if database: true)
 ```
 
 ### Required Files
 
-**__init__.py**
-```python
-"""
-BranchName
-Description
-"""
-
-from .branch import BranchName
-
-async def setup(bot):
-    """
-    Load the BranchName branch.
-
-    Note: bot.add_cog() is Discord.py's method for registering Cogs.
-    """
-    await bot.add_cog(BranchName(bot))
+**branch.yml**
+```yaml
+id: your_branch
+name: YourBranch
+version: "1.0.0"
+description: What this branch does
+main: branch.YourBranch
+database: true          # set false if no database needed
 ```
 
 **config.yml**
 ```yaml
 enabled: true
-version: "1.0.0"
 settings:
   # Your settings here
 ```

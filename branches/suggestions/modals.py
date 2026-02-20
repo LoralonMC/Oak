@@ -1,15 +1,12 @@
 """Suggestions modals — approval/denial forms."""
 
-import json
 import logging
 import time
 
 import discord
 from discord import Interaction, ui
 
-import aiosqlite
-
-from .helpers import get_db_path, get_embed_colors, get_manager_role_ids, truncate
+from .helpers import get_embed_colors, truncate
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +23,7 @@ class StatusModal(ui.Modal, title="Reason for Action"):
         self.add_item(self.reason)
 
     async def on_submit(self, interaction: Interaction):
-        from .views import SuggestionVoteView
+        from .views import _db, _config, SuggestionVoteView
 
         # Defer immediately to avoid timeout
         await interaction.response.defer(ephemeral=True)
@@ -34,52 +31,55 @@ class StatusModal(ui.Modal, title="Reason for Action"):
         # Re-check manager permissions
         if interaction.guild:
             user_role_ids = [role.id for role in interaction.user.roles]
-            manager_role_ids = get_manager_role_ids()
+            manager_role_ids = _config.get("settings", {}).get("manager_role_ids", [])
             if not any(role_id in manager_role_ids for role_id in user_role_ids):
                 await interaction.followup.send("You no longer have permission to manage suggestions.", ephemeral=True)
                 return
 
-        colors = get_embed_colors()
+        colors = get_embed_colors(_config)
         color_approved = colors["approved"]
         color_denied = colors["denied"]
 
-        async with aiosqlite.connect(get_db_path()) as db:
-            # Atomic update: only change status if still Pending
-            cursor = await db.execute(
-                "UPDATE suggestions SET status = ?, reason = ? WHERE message_id = ? AND status = 'Pending'",
-                (self.status, self.reason.value, self.message_id),
-            )
-            if cursor.rowcount == 0:
-                # Either not found or already processed — check which
-                check = await db.execute(
-                    "SELECT status FROM suggestions WHERE message_id = ?",
-                    (self.message_id,),
-                )
-                existing = await check.fetchone()
-                if not existing:
-                    await interaction.followup.send("This suggestion could not be found in the database.", ephemeral=True)
-                else:
-                    await interaction.followup.send(
-                        f"This suggestion has already been **{existing[0].lower()}** and cannot be changed.",
-                        ephemeral=True,
-                    )
-                return
-            await db.commit()
-
-            # Fetch data for embed update
-            cursor = await db.execute(
-                "SELECT user_id, content, likes, dislikes FROM suggestions WHERE message_id = ?",
+        # Atomic update: only change status if still Pending
+        cursor = await _db.execute(
+            "UPDATE suggestions SET status = ?, reason = ? WHERE message_id = ? AND status = 'Pending'",
+            (self.status, self.reason.value, self.message_id),
+        )
+        if cursor.rowcount == 0:
+            # Either not found or already processed
+            existing = await _db.fetchone(
+                "SELECT status FROM suggestions WHERE message_id = ?",
                 (self.message_id,),
             )
-            row = await cursor.fetchone()
-            if not row:
-                return
+            if not existing:
+                await interaction.followup.send("This suggestion could not be found in the database.", ephemeral=True)
+            else:
+                await interaction.followup.send(
+                    f"This suggestion has already been **{existing[0].lower()}** and cannot be changed.",
+                    ephemeral=True,
+                )
+            return
 
-            user_id, content, likes_json, dislikes_json = row
-            likes = json.loads(likes_json) if likes_json else []
-            dislikes = json.loads(dislikes_json) if dislikes_json else []
+        # M1: Query vote counts from suggestion_votes table instead of legacy JSON
+        row = await _db.fetchone(
+            "SELECT user_id, content FROM suggestions WHERE message_id = ?",
+            (self.message_id,),
+        )
+        if not row:
+            return
 
-        # Fetch the suggestion message from the stored channel_id (not the ephemeral interaction channel)
+        user_id, content = row
+
+        vote_rows = await _db.fetchall(
+            "SELECT vote_type, COUNT(*) FROM suggestion_votes WHERE suggestion_id = "
+            "(SELECT id FROM suggestions WHERE message_id = ?) GROUP BY vote_type",
+            (self.message_id,),
+        )
+        vote_counts = {r[0]: r[1] for r in vote_rows} if vote_rows else {}
+        likes_count = vote_counts.get("like", 0)
+        dislikes_count = vote_counts.get("dislike", 0)
+
+        # Fetch the suggestion message from the stored channel_id
         try:
             channel = None
             if self.channel_id:
@@ -99,6 +99,11 @@ class StatusModal(ui.Modal, title="Reason for Action"):
             await interaction.followup.send("Suggestion message not found.", ephemeral=True)
             return
 
+        # M5: Guard against missing embeds
+        if not message.embeds:
+            await interaction.followup.send("Suggestion message has no embed.", ephemeral=True)
+            return
+
         # Sanitize user content for embeds
         sanitized_content = discord.utils.escape_markdown(discord.utils.escape_mentions(content))
         sanitized_reason = discord.utils.escape_markdown(discord.utils.escape_mentions(self.reason.value))
@@ -111,7 +116,11 @@ class StatusModal(ui.Modal, title="Reason for Action"):
         embed.color = color_approved if self.status == "Approved" else color_denied
         embed.clear_fields()
         embed.add_field(name="💬 Suggestion", value=truncate(sanitized_content), inline=False)
-        embed.add_field(name="📊 Statistics", value=f"**{len(likes)}** Likes\n**{len(dislikes)}** Dislikes\nStatus: **{self.status}**", inline=True)
+        embed.add_field(
+            name="📊 Statistics",
+            value=f"**{likes_count}** Likes\n**{dislikes_count}** Dislikes\nStatus: **{self.status}**",
+            inline=True,
+        )
 
         author_text = f"{author.mention} ({author.name})" if author else f"<@{user_id}>"
         embed.add_field(name="👤 Author", value=author_text, inline=True)

@@ -4,21 +4,21 @@ Manages staff application workflow with multi-page forms, background checks, and
 """
 
 import discord
+import sqlite3
 from discord import app_commands
 from discord.ext import tasks
-import aiosqlite
-from pathlib import Path
 from oak import OakBranch
 from oak.context import BranchContext
+from oak.database import Migration
 
 # Import our modularized components
 from .helpers import (
-    get_application_config,
     get_application_questions,
-    get_db_path,
     get_embed_colors
 )
 from .views import (
+    configure as configure_views,
+    STATUS_EMOJI,
     ApplicationButtonView,
     StartCancelView,
     ContinueView,
@@ -48,47 +48,45 @@ async def handle_application_start(interaction: discord.Interaction):
     Handle the start of a new application.
 
     Uses a 3-phase approach to avoid holding a DB connection during slow Discord API calls:
-      Phase 1: Check existing apps (short DB connection, close it)
+      Phase 1: Check existing apps (short DB read)
       Phase 2: Create Discord channel (no DB held)
-      Phase 3: Save to DB (new connection, atomic app_index assignment)
+      Phase 3: Save to DB (atomic app_index assignment)
 
     Args:
         interaction: Discord interaction from the Apply button
     """
+    from .views import _db, _config
+
     user = interaction.user
     guild = interaction.guild
+    colors = get_embed_colors(_config)
 
     try:
-        # --- Phase 1: Check existing applications (short DB connection) ---
-        async with aiosqlite.connect(get_db_path()) as db:
-            async with db.execute(
-                "SELECT channel_id, status FROM applications WHERE user_id = ? AND status IN ('in_progress', 'pending')",
-                (user.id,)
-            ) as cursor:
-                row = await cursor.fetchone()
-                if row:
-                    channel_id, status = row
-                    existing_channel = guild.get_channel(channel_id)
-                    if existing_channel:
-                        await interaction.followup.send(
-                            embed=discord.Embed(
-                                title="You already have an open application!",
-                                description=f"Please continue your application here: {existing_channel.mention}\n\nStatus: **{status.title()}**",
-                                color=get_embed_colors()["warning"]
-                            ),
-                            ephemeral=True
-                        )
-                        return
-                    else:
-                        # Channel was deleted but application still exists - clean it up
-                        await db.execute("UPDATE applications SET status = 'cancelled' WHERE channel_id = ?", (channel_id,))
-                        await db.commit()
-        # DB connection closed here
+        # --- Phase 1: Check existing applications ---
+        row = await _db.fetchone(
+            "SELECT channel_id, status FROM applications WHERE user_id = ? AND status IN ('in_progress', 'pending')",
+            (user.id,)
+        )
+        if row:
+            channel_id, status = row
+            existing_channel = guild.get_channel(channel_id)
+            if existing_channel:
+                await interaction.followup.send(
+                    embed=discord.Embed(
+                        title="You already have an open application!",
+                        description=f"Please continue your application here: {existing_channel.mention}\n\nStatus: **{status.title()}**",
+                        color=colors["warning"]
+                    ),
+                    ephemeral=True
+                )
+                return
+            else:
+                # Channel was deleted but application still exists - clean it up
+                await _db.execute("UPDATE applications SET status = 'cancelled' WHERE channel_id = ?", (channel_id,))
 
         # --- Phase 2: Create Discord channel (no DB held - this is the slow Discord API call) ---
-        config = get_application_config()
-        application_category_id = config.get("settings", {}).get("application_category_id", 0)
-        channel_name_prefix = config.get("settings", {}).get("application", {}).get("channel_name_prefix", "application")
+        application_category_id = _config.get("settings", {}).get("application_category_id", 0)
+        channel_name_prefix = _config.get("settings", {}).get("application", {}).get("channel_name_prefix", "application")
 
         # Create channel with proper permissions
         overwrites = {
@@ -110,7 +108,7 @@ async def handle_application_start(interaction: discord.Interaction):
         }
 
         # Add reviewer roles with management permissions
-        reviewer_role_ids = config.get("settings", {}).get("reviewer_role_ids", [])
+        reviewer_role_ids = _config.get("settings", {}).get("reviewer_role_ids", [])
         for role_id in reviewer_role_ids:
             role = guild.get_role(role_id)
             if role:
@@ -128,7 +126,7 @@ async def handle_application_start(interaction: discord.Interaction):
                 embed=discord.Embed(
                     title="Configuration Error",
                     description="Application system is not properly configured. Please contact an administrator.",
-                    color=get_embed_colors()["error"]
+                    color=colors["error"]
                 ),
                 ephemeral=True
             )
@@ -142,24 +140,23 @@ async def handle_application_start(interaction: discord.Interaction):
             reason=f"Application created by {user}"
         )
 
-        # --- Phase 3: Save to DB (new connection, atomic app_index assignment) ---
+        # --- Phase 3: Save to DB (atomic app_index assignment) ---
         try:
-            async with aiosqlite.connect(get_db_path()) as db:
+            async with _db.transaction() as conn:
                 # Atomic app_index assignment: INSERT with subquery to avoid separate SELECT + INSERT race
-                await db.execute(
+                await conn.execute(
                     """INSERT INTO applications (user_id, channel_id, app_index, answers, status, submitted_at, last_activity_at)
                     VALUES (?, ?, (SELECT COALESCE(MAX(app_index), 0) + 1 FROM applications), ?, ?, datetime('now'), datetime('now'))""",
                     (user.id, channel.id, "[]", "in_progress")
                 )
-                await db.commit()
 
                 # Retrieve the assigned app_index for channel renaming
-                async with db.execute(
+                cursor = await conn.execute(
                     "SELECT app_index FROM applications WHERE channel_id = ?",
                     (channel.id,)
-                ) as cursor:
-                    idx_row = await cursor.fetchone()
-                    next_index = idx_row[0] if idx_row else 0
+                )
+                idx_row = await cursor.fetchone()
+                next_index = idx_row[0] if idx_row else 0
 
             # Rename channel to include the real index
             try:
@@ -167,17 +164,15 @@ async def handle_application_start(interaction: discord.Interaction):
             except discord.HTTPException:
                 pass  # Non-critical: channel works even with temp name
 
-        except aiosqlite.IntegrityError:
+        except sqlite3.IntegrityError:
             # Race condition: user already has an application
             await channel.delete(reason="Duplicate application (race condition)")
 
             # Find existing application
-            async with aiosqlite.connect(get_db_path()) as db:
-                async with db.execute(
-                    "SELECT channel_id, status FROM applications WHERE user_id = ? AND status IN ('in_progress', 'pending')",
-                    (user.id,)
-                ) as cursor:
-                    existing = await cursor.fetchone()
+            existing = await _db.fetchone(
+                "SELECT channel_id, status FROM applications WHERE user_id = ? AND status IN ('in_progress', 'pending')",
+                (user.id,)
+            )
 
             if existing:
                 existing_channel_id, existing_status = existing
@@ -187,7 +182,7 @@ async def handle_application_start(interaction: discord.Interaction):
                         embed=discord.Embed(
                             title="Application Already Exists",
                             description=f"You already have an application: {existing_channel.mention}\n\nStatus: **{existing_status.title()}**",
-                            color=get_embed_colors()["warning"]
+                            color=colors["warning"]
                         ),
                         ephemeral=True
                     )
@@ -201,12 +196,12 @@ async def handle_application_start(interaction: discord.Interaction):
             await user.send(embed=discord.Embed(
                 title="Application Started",
                 description=f"Your application channel is {channel.mention}.",
-                color=get_embed_colors()["success"]
+                color=colors["success"]
             ))
         except discord.Forbidden:
             await channel.send(embed=discord.Embed(
                 description=":warning: Couldn't DM applicant. Please remind them to open DMs.",
-                color=get_embed_colors()["warning"]
+                color=colors["warning"]
             ))
         except Exception:
             pass
@@ -224,13 +219,9 @@ async def handle_application_start(interaction: discord.Interaction):
                     "- Your progress is saved after each page\n\n"
                     "Good luck!"
                 ),
-                color=get_embed_colors()["info"]
+                color=colors["info"]
             ),
-            view=StartCancelView(
-                get_config_func=get_application_config,
-                get_questions_func=get_application_questions,
-                get_db_path_func=get_db_path
-            )
+            view=StartCancelView()
         )
 
         # Confirm to user
@@ -238,7 +229,7 @@ async def handle_application_start(interaction: discord.Interaction):
             embed=discord.Embed(
                 title="Application Channel Created!",
                 description=f"Your application channel is ready: {channel.mention}\n\nHead there to start your application.",
-                color=get_embed_colors()["success"]
+                color=colors["success"]
             ),
             ephemeral=True
         )
@@ -249,7 +240,7 @@ async def handle_application_start(interaction: discord.Interaction):
                 embed=discord.Embed(
                     title="Error Creating Application",
                     description="Failed to create your application channel. Please try again later or contact an administrator.",
-                    color=get_embed_colors()["error"]
+                    color=colors["error"]
                 ),
                 ephemeral=True
             )
@@ -262,7 +253,7 @@ async def handle_application_start(interaction: discord.Interaction):
                 embed=discord.Embed(
                     title="Error",
                     description="An unexpected error occurred. Please contact an administrator.",
-                    color=get_embed_colors()["error"]
+                    color=colors["error"]
                 ),
                 ephemeral=True
             )
@@ -275,9 +266,6 @@ class Application(OakBranch):
 
     def __init__(self, ctx: BranchContext):
         super().__init__(ctx)
-
-        # Set database path for sub-modules that use aiosqlite directly
-        self.db_path = str(Path(__file__).parent / "data.db")
 
         # Cache frequently used settings
         settings = self.config.get("settings", {})
@@ -299,11 +287,14 @@ class Application(OakBranch):
         # Application button view
         self._application_button_view = ApplicationButtonView(handle_application_start_func=handle_application_start)
 
-        self.log.info(f"Application branch initialized with config (db: {self.db_path})")
+        self.log.info("Application branch initialized")
 
     async def on_enable(self):
         """Initialize database and register persistent views."""
         await self.db.initialize(APPLICATIONS_SCHEMA)
+
+        # Configure module-level state for views/modals
+        configure_views(self.db, self.config)
 
         # Warn if reviewer_role_ids is still the placeholder value
         reviewer_role_ids = self.config.get("settings", {}).get("reviewer_role_ids", [])
@@ -313,8 +304,37 @@ class Application(OakBranch):
                 "Application reviews will not work until valid role IDs are configured."
             )
 
-        # Run database migration for new columns
-        await self._migrate_database()
+        # Run database migrations
+        await self.db.migrate([
+            Migration(
+                name="add_last_activity_at",
+                sql=(
+                    "ALTER TABLE applications ADD COLUMN last_activity_at TIMESTAMP;\n"
+                    "UPDATE applications SET last_activity_at = submitted_at;\n"
+                    "CREATE INDEX IF NOT EXISTS idx_applications_last_activity ON applications(last_activity_at)"
+                )
+            ),
+            Migration(
+                name="add_warning_sent_at",
+                sql="ALTER TABLE applications ADD COLUMN warning_sent_at TIMESTAMP"
+            ),
+            Migration(
+                name="add_denied_at",
+                sql="ALTER TABLE applications ADD COLUMN denied_at TIMESTAMP"
+            ),
+            Migration(
+                name="add_denial_dm_sent",
+                sql="ALTER TABLE applications ADD COLUMN denial_dm_sent INTEGER DEFAULT 0"
+            ),
+            Migration(
+                name="add_denial_reason",
+                sql="ALTER TABLE applications ADD COLUMN denial_reason TEXT"
+            ),
+            Migration(
+                name="add_user_id_index",
+                sql="CREATE INDEX IF NOT EXISTS idx_applications_user_id ON applications(user_id)"
+            ),
+        ])
 
         if self.application_channel_id == 0:
             self.log.warning("application_channel_id is 0 (placeholder) — application button will not be posted")
@@ -334,23 +354,14 @@ class Application(OakBranch):
         self.log.info("Registering persistent views for Application")
         self.bot.add_view(ApplicationButtonView(handle_application_start_func=handle_application_start, legacy=True))
         self.bot.add_view(self._application_button_view)
-        self.bot.add_view(StartCancelView(
-            get_config_func=get_application_config,
-            get_questions_func=get_application_questions,
-            get_db_path_func=get_db_path,
-            legacy=True,
-        ))
-        self.bot.add_view(StartCancelView(
-            get_config_func=get_application_config,
-            get_questions_func=get_application_questions,
-            get_db_path_func=get_db_path,
-        ))
+        self.bot.add_view(StartCancelView(legacy=True))
+        self.bot.add_view(StartCancelView())
         self.bot.add_view(ContinueView(legacy=True))
         self.bot.add_view(ContinueView())
-        self.bot.add_view(PostSubmissionView(get_db_path_func=get_db_path, legacy=True))
-        self.bot.add_view(PostSubmissionView(get_db_path_func=get_db_path))
-        self.bot.add_view(ManageView(get_db_path_func=get_db_path, legacy=True))
-        self.bot.add_view(ManageView(get_db_path_func=get_db_path))
+        self.bot.add_view(PostSubmissionView(legacy=True))
+        self.bot.add_view(PostSubmissionView())
+        self.bot.add_view(ManageView(legacy=True))
+        self.bot.add_view(ManageView())
 
         # Start inactivity check task if enabled
         inactivity_config = self.config.get("settings", {}).get("inactivity", {})
@@ -359,79 +370,6 @@ class Application(OakBranch):
             self.check_inactive_applications.change_interval(hours=check_interval)
             self.check_inactive_applications.start()
             self.log.info(f"Inactivity check task started (interval: {check_interval} hours)")
-
-    async def _migrate_database(self):
-        """Migrate database schema to add new columns if they don't exist."""
-        try:
-            async with aiosqlite.connect(self.db_path) as db:
-                # Check if last_activity_at column exists
-                cursor = await db.execute("PRAGMA table_info(applications)")
-                columns = [row[1] async for row in cursor]
-
-                # Add last_activity_at if it doesn't exist
-                if 'last_activity_at' not in columns:
-                    self.log.info("Migrating database: Adding last_activity_at column")
-                    # SQLite ALTER TABLE doesn't support CURRENT_TIMESTAMP default, so we use NULL and update
-                    await db.execute("""
-                        ALTER TABLE applications
-                        ADD COLUMN last_activity_at TIMESTAMP
-                    """)
-                    # Set last_activity_at to submitted_at for all existing rows
-                    await db.execute("""
-                        UPDATE applications
-                        SET last_activity_at = submitted_at
-                    """)
-                    # Create index on last_activity_at
-                    await db.execute("""
-                        CREATE INDEX IF NOT EXISTS idx_applications_last_activity
-                        ON applications(last_activity_at)
-                    """)
-                    await db.commit()
-                    self.log.info("Migration complete: last_activity_at column and index added")
-
-                # Add warning_sent_at if it doesn't exist
-                if 'warning_sent_at' not in columns:
-                    self.log.info("Migrating database: Adding warning_sent_at column")
-                    await db.execute("""
-                        ALTER TABLE applications
-                        ADD COLUMN warning_sent_at TIMESTAMP
-                    """)
-                    await db.commit()
-                    self.log.info("Migration complete: warning_sent_at column added")
-
-                # Add denied_at if it doesn't exist
-                if 'denied_at' not in columns:
-                    self.log.info("Migrating database: Adding denied_at column")
-                    await db.execute("""
-                        ALTER TABLE applications
-                        ADD COLUMN denied_at TIMESTAMP
-                    """)
-                    await db.commit()
-                    self.log.info("Migration complete: denied_at column added")
-
-                # Add denial_dm_sent if it doesn't exist
-                if 'denial_dm_sent' not in columns:
-                    self.log.info("Migrating database: Adding denial_dm_sent column")
-                    await db.execute("""
-                        ALTER TABLE applications
-                        ADD COLUMN denial_dm_sent INTEGER DEFAULT 0
-                    """)
-                    await db.commit()
-                    self.log.info("Migration complete: denial_dm_sent column added")
-
-                # Add denial_reason if it doesn't exist
-                if 'denial_reason' not in columns:
-                    self.log.info("Migrating database: Adding denial_reason column")
-                    await db.execute("""
-                        ALTER TABLE applications
-                        ADD COLUMN denial_reason TEXT
-                    """)
-                    await db.commit()
-                    self.log.info("Migration complete: denial_reason column added")
-
-        except Exception as e:
-            self.log.error(f"Error migrating database: {e}", exc_info=True)
-            raise
 
     async def on_disable(self):
         """Stop background tasks when branch is unloaded."""
@@ -449,54 +387,46 @@ class Application(OakBranch):
     async def application_stats(self, interaction: discord.Interaction):
         """Show application statistics (Staff only)"""
         try:
+            colors = get_embed_colors(self.config)
             # Check permissions
-            config = get_application_config()
-            reviewer_role_ids = config.get("settings", {}).get("reviewer_role_ids", [])
+            reviewer_role_ids = self.config.get("settings", {}).get("reviewer_role_ids", [])
             user_role_ids = [role.id for role in interaction.user.roles]
 
             if not any(role_id in reviewer_role_ids for role_id in user_role_ids):
                 await interaction.response.send_message(
                     embed=discord.Embed(
                         description="You don't have permission to use this command.",
-                        color=get_embed_colors()["error"]
+                        color=colors["error"]
                     ),
                     ephemeral=True
                 )
                 return
 
-            async with aiosqlite.connect(get_db_path()) as db:
-                # Get total applications
-                async with db.execute("SELECT COUNT(*) FROM applications") as cursor:
-                    total = (await cursor.fetchone())[0]
+            # Get total applications
+            total_row = await self.db.fetchone("SELECT COUNT(*) FROM applications")
+            total = total_row[0]
 
-                # Get status breakdown
-                async with db.execute("""
-                    SELECT status, COUNT(*)
-                    FROM applications
-                    GROUP BY status
-                """) as cursor:
-                    status_counts = {row[0]: row[1] async for row in cursor}
+            # Get status breakdown
+            status_rows = await self.db.fetchall(
+                "SELECT status, COUNT(*) FROM applications GROUP BY status"
+            )
+            status_counts = {row[0]: row[1] for row in status_rows}
 
-                # Get recent applications (last 7 days)
-                async with db.execute("""
-                    SELECT COUNT(*)
-                    FROM applications
-                    WHERE submitted_at >= datetime('now', '-7 days')
-                """) as cursor:
-                    recent = (await cursor.fetchone())[0]
+            # Get recent applications (last 7 days)
+            recent_row = await self.db.fetchone(
+                "SELECT COUNT(*) FROM applications WHERE submitted_at >= datetime('now', '-7 days')"
+            )
+            recent = recent_row[0]
 
-                # Get average processing time
-                async with db.execute("""
-                    SELECT AVG(julianday(datetime('now')) - julianday(submitted_at))
-                    FROM applications
-                    WHERE status IN ('accepted', 'denied')
-                """) as cursor:
-                    avg_days = await cursor.fetchone()
-                    avg_processing = avg_days[0] if avg_days and avg_days[0] else 0
+            # Get average processing time
+            avg_row = await self.db.fetchone(
+                "SELECT AVG(julianday(datetime('now')) - julianday(submitted_at)) FROM applications WHERE status IN ('accepted', 'denied')"
+            )
+            avg_processing = avg_row[0] if avg_row and avg_row[0] else 0
 
             embed = discord.Embed(
                 title="Application Statistics",
-                color=get_embed_colors()["info"]
+                color=colors["info"]
             )
 
             embed.add_field(name="Total Applications", value=f"**{total}**", inline=True)
@@ -524,38 +454,36 @@ class Application(OakBranch):
         from .views import ApplicationHistoryView
 
         try:
+            colors = get_embed_colors(self.config)
             # Check permissions
-            config = get_application_config()
-            reviewer_role_ids = config.get("settings", {}).get("reviewer_role_ids", [])
+            reviewer_role_ids = self.config.get("settings", {}).get("reviewer_role_ids", [])
             user_role_ids = [role.id for role in interaction.user.roles]
 
             if not any(role_id in reviewer_role_ids for role_id in user_role_ids):
                 await interaction.response.send_message(
                     embed=discord.Embed(
                         description="You don't have permission to use this command.",
-                        color=get_embed_colors()["error"]
+                        color=colors["error"]
                     ),
                     ephemeral=True
                 )
                 return
 
             # Fetch all applications for this user
-            async with aiosqlite.connect(get_db_path()) as db:
-                async with db.execute("""
-                    SELECT app_index, status, submitted_at, answers, channel_id, denied_at, denial_reason
-                    FROM applications
-                    WHERE user_id = ?
-                    ORDER BY submitted_at DESC
-                    LIMIT 10
-                """, (user.id,)) as cursor:
-                    all_apps = [row async for row in cursor]
+            all_apps = await self.db.fetchall("""
+                SELECT app_index, status, submitted_at, answers, channel_id, denied_at, denial_reason
+                FROM applications
+                WHERE user_id = ?
+                ORDER BY submitted_at DESC
+                LIMIT 10
+            """, (user.id,))
 
             if not all_apps:
                 await interaction.response.send_message(
                     embed=discord.Embed(
                         title="Application History",
                         description=f"{user.mention} has no applications on record.",
-                        color=get_embed_colors()["info"]
+                        color=colors["info"]
                     ),
                     ephemeral=True
                 )
@@ -565,7 +493,7 @@ class Application(OakBranch):
             summary_embed = discord.Embed(
                 title=f"Application History: {user.display_name}",
                 description=f"Found **{len(all_apps)}** application(s). Use the dropdown to view full details.",
-                color=get_embed_colors()["info"]
+                color=colors["info"]
             )
             summary_embed.set_thumbnail(url=user.display_avatar.url)
 
@@ -585,7 +513,7 @@ class Application(OakBranch):
             # Send with dropdown
             await interaction.response.send_message(
                 embed=summary_embed,
-                view=ApplicationHistoryView(user.id, all_apps, get_db_path),
+                view=ApplicationHistoryView(user.id, all_apps),
                 ephemeral=True
             )
 
@@ -596,6 +524,7 @@ class Application(OakBranch):
     async def ensure_application_message(self):
         """Ensure the application button message exists in the channel."""
         try:
+            colors = get_embed_colors(self.config)
             channel = self.bot.get_channel(self.application_channel_id)
             if not channel:
                 self.log.warning(f"Application channel {self.application_channel_id} not found")
@@ -614,7 +543,7 @@ class Application(OakBranch):
                             "- Be willing to help other players\n"
                             "- Have time to dedicate to staff duties"
                         ),
-                        color=get_embed_colors()["info"]
+                        color=colors["info"]
                     ),
                     view=self._application_button_view
                 )
@@ -626,41 +555,34 @@ class Application(OakBranch):
     async def check_inactive_applications(self):
         """Check for inactive applications and send warnings or mark as abandoned."""
         try:
-            config = get_application_config()
-            inactivity_config = config.get("settings", {}).get("inactivity", {})
+            inactivity_config = self.config.get("settings", {}).get("inactivity", {})
 
             warning_days = inactivity_config.get("warning_after_days", 3)
             abandon_days = inactivity_config.get("abandon_after_days", 7)
 
-            async with aiosqlite.connect(get_db_path()) as db:
-                # Fix any NULL last_activity_at values (one-time cleanup for legacy apps)
-                await db.execute("""
-                    UPDATE applications
-                    SET last_activity_at = submitted_at
-                    WHERE last_activity_at IS NULL
-                """)
-                await db.commit()
+            # Fix any NULL last_activity_at values (one-time cleanup for legacy apps)
+            await self.db.execute(
+                "UPDATE applications SET last_activity_at = submitted_at WHERE last_activity_at IS NULL"
+            )
 
-                # Find applications that need warnings (inactive for warning_days, no warning sent yet)
-                # Exclude apps that should already be abandoned (inactive >= abandon_days)
-                async with db.execute("""
-                    SELECT user_id, channel_id, last_activity_at
-                    FROM applications
-                    WHERE status = 'in_progress'
-                    AND warning_sent_at IS NULL
-                    AND julianday('now') - julianday(last_activity_at) >= ?
-                    AND julianday('now') - julianday(last_activity_at) < ?
-                """, (warning_days, abandon_days)) as cursor:
-                    apps_needing_warning = [row async for row in cursor]
+            # Find applications that need warnings (inactive for warning_days, no warning sent yet)
+            # Exclude apps that should already be abandoned (inactive >= abandon_days)
+            apps_needing_warning = await self.db.fetchall("""
+                SELECT user_id, channel_id, last_activity_at
+                FROM applications
+                WHERE status = 'in_progress'
+                AND warning_sent_at IS NULL
+                AND julianday('now') - julianday(last_activity_at) >= ?
+                AND julianday('now') - julianday(last_activity_at) < ?
+            """, (warning_days, abandon_days))
 
-                # Find applications that should be abandoned (inactive for abandon_days)
-                async with db.execute("""
-                    SELECT user_id, channel_id, last_activity_at
-                    FROM applications
-                    WHERE status = 'in_progress'
-                    AND julianday('now') - julianday(last_activity_at) >= ?
-                """, (abandon_days,)) as cursor:
-                    apps_to_abandon = [row async for row in cursor]
+            # Find applications that should be abandoned (inactive for abandon_days)
+            apps_to_abandon = await self.db.fetchall("""
+                SELECT user_id, channel_id, last_activity_at
+                FROM applications
+                WHERE status = 'in_progress'
+                AND julianday('now') - julianday(last_activity_at) >= ?
+            """, (abandon_days,))
 
             # Process warnings
             for user_id, channel_id, last_activity_at in apps_needing_warning:
@@ -687,6 +609,7 @@ class Application(OakBranch):
     async def _send_inactivity_warning(self, user_id: int, channel_id: int, warning_days: int, abandon_days: int):
         """Send inactivity warning to user via DM and in channel."""
         try:
+            colors = get_embed_colors(self.config)
             guild = self.bot.get_guild(self.bot.guild_id)
             if not guild:
                 self.log.error(f"Guild {self.bot.guild_id} not found")
@@ -702,8 +625,7 @@ class Application(OakBranch):
             days_remaining = abandon_days - warning_days
 
             # Get configurable messages
-            config = get_application_config()
-            inactivity_config = config.get("settings", {}).get("inactivity", {})
+            inactivity_config = self.config.get("settings", {}).get("inactivity", {})
 
             # DM warning config
             dm_config = inactivity_config.get("warning_dm", {})
@@ -725,7 +647,7 @@ class Application(OakBranch):
             warning_embed = discord.Embed(
                 title=dm_title,
                 description=dm_description,
-                color=get_embed_colors()["warning"]
+                color=colors["warning"]
             )
 
             # Try to DM the user
@@ -763,7 +685,7 @@ class Application(OakBranch):
                     channel_warning = discord.Embed(
                         title=channel_title,
                         description=channel_description,
-                        color=get_embed_colors()["warning"]
+                        color=colors["warning"]
                     )
 
                     if not dm_sent:
@@ -775,12 +697,10 @@ class Application(OakBranch):
                     self.log.error(f"Failed to send warning in channel {channel_id}: {e}")
 
             # Mark warning as sent
-            async with aiosqlite.connect(get_db_path()) as db:
-                await db.execute(
-                    "UPDATE applications SET warning_sent_at = datetime('now') WHERE channel_id = ?",
-                    (channel_id,)
-                )
-                await db.commit()
+            await self.db.execute(
+                "UPDATE applications SET warning_sent_at = datetime('now') WHERE channel_id = ?",
+                (channel_id,)
+            )
 
         except Exception as e:
             self.log.error(f"Error sending inactivity warning: {e}", exc_info=True)
@@ -788,6 +708,7 @@ class Application(OakBranch):
     async def _abandon_application(self, user_id: int, channel_id: int):
         """Mark application as abandoned and delete channel."""
         try:
+            colors = get_embed_colors(self.config)
             guild = self.bot.get_guild(self.bot.guild_id)
             if not guild:
                 self.log.error(f"Guild {self.bot.guild_id} not found")
@@ -797,19 +718,16 @@ class Application(OakBranch):
             channel = guild.get_channel(channel_id)
 
             # Update database
-            async with aiosqlite.connect(get_db_path()) as db:
-                await db.execute(
-                    "UPDATE applications SET status = 'abandoned' WHERE channel_id = ?",
-                    (channel_id,)
-                )
-                await db.commit()
+            await self.db.execute(
+                "UPDATE applications SET status = 'abandoned' WHERE channel_id = ?",
+                (channel_id,)
+            )
 
             # Try to DM user
             if user:
                 try:
                     # Get configurable abandonment message
-                    config = get_application_config()
-                    inactivity_config = config.get("settings", {}).get("inactivity", {})
+                    inactivity_config = self.config.get("settings", {}).get("inactivity", {})
                     abandon_config = inactivity_config.get("abandon_dm", {})
 
                     abandon_title = abandon_config.get("title", "Application Abandoned")
@@ -822,7 +740,7 @@ class Application(OakBranch):
                         embed=discord.Embed(
                             title=abandon_title,
                             description=abandon_description,
-                            color=get_embed_colors()["error"]
+                            color=colors["error"]
                         )
                     )
                     self.log.info(f"Sent abandonment DM to user {user_id}")
@@ -845,8 +763,7 @@ class Application(OakBranch):
     async def _check_denied_apps_cleanup(self):
         """Check for denied applications where DM failed and clean them up after configured time."""
         try:
-            config = get_application_config()
-            denial_config = config.get("settings", {}).get("denial", {})
+            denial_config = self.config.get("settings", {}).get("denial", {})
 
             auto_delete_enabled = denial_config.get("auto_delete_no_dm", True)
             if not auto_delete_enabled:
@@ -855,16 +772,14 @@ class Application(OakBranch):
             auto_delete_hours = denial_config.get("auto_delete_no_dm_after_hours", 24)
 
             # Find denied apps where DM failed and time has expired
-            async with aiosqlite.connect(get_db_path()) as db:
-                async with db.execute("""
-                    SELECT user_id, channel_id, denied_at
-                    FROM applications
-                    WHERE status = 'denied'
-                    AND denial_dm_sent = 0
-                    AND denied_at IS NOT NULL
-                    AND (julianday('now') - julianday(denied_at)) * 24 >= ?
-                """, (auto_delete_hours,)) as cursor:
-                    apps_to_delete = [row async for row in cursor]
+            apps_to_delete = await self.db.fetchall("""
+                SELECT user_id, channel_id, denied_at
+                FROM applications
+                WHERE status = 'denied'
+                AND denial_dm_sent = 0
+                AND denied_at IS NOT NULL
+                AND (julianday('now') - julianday(denied_at)) * 24 >= ?
+            """, (auto_delete_hours,))
 
             if not apps_to_delete:
                 return 0

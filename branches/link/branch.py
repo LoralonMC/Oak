@@ -43,3 +43,11 @@ class Link(OakBranch):
             color=self.setting("embed", "color", default=0xA180D0),
         )
         await ctx.send(embed=embed)
+
+    @link_command.error
+    async def link_command_error(self, ctx: commands.Context, error: commands.CommandError) -> None:
+        """Handle cooldown and other command errors."""
+        if isinstance(error, commands.CommandOnCooldown):
+            await ctx.send(f"Please wait {error.retry_after:.0f}s before using this again.", delete_after=5)
+        else:
+            raise error

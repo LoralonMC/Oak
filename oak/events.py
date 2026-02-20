@@ -46,10 +46,11 @@ class EventBus:
 
     async def emit(self, event: OakEvent) -> None:
         """Emit an event to all subscribers."""
-        listeners = self._listeners.get(event.name, [])
+        # Snapshot to avoid mutation during iteration
+        listeners = list(self._listeners.get(event.name, []))
         for branch_id, callback in listeners:
             try:
-                await asyncio.wait_for(asyncio.shield(callback(event)), timeout=30.0)
+                await asyncio.wait_for(callback(event), timeout=30.0)
             except asyncio.TimeoutError:
                 logger.warning(
                     f"Event listener for '{event.name}' in branch '{branch_id}' timed out after 30s"

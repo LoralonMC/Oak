@@ -114,26 +114,28 @@ class BranchLoader:
         visiting: set[str] = set()
         cycle_members: set[str] = set()
 
-        def visit(bid: str) -> None:
+        def visit(bid: str) -> bool:
+            """Visit a node; returns False if it's part of a cycle."""
             if bid in visited:
-                return
+                return bid not in cycle_members
             if bid in visiting:
                 logger.error(f"Circular dependency detected involving '{bid}'")
                 cycle_members.add(bid)
-                return
+                return False
             visiting.add(bid)
             for dep in graph.get(bid, set()):
-                visit(dep)
+                if not visit(dep):
+                    # Dependency is in a cycle — this branch can't load either
+                    cycle_members.add(bid)
             visiting.discard(bid)
             visited.add(bid)
-            order.append(bid)
+            if bid not in cycle_members:
+                order.append(bid)
+            return bid not in cycle_members
 
         # Visit in priority order (lower priority number = loaded first)
         for bid in sorted(graph, key=lambda b: self._manifests[b].priority):
             visit(bid)
-
-        # Remove any branches involved in dependency cycles
-        order = [bid for bid in order if bid not in cycle_members]
 
         return order
 
@@ -281,13 +283,14 @@ class BranchLoader:
         await self.unload_branch(branch_id)
 
         # Re-discover this branch's manifest (picks up manifest changes)
+        # Always key under original branch_id to avoid stale entries if id changed
         branch_dir = self._paths.get(branch_id)
         if branch_dir:
             manifest_path = branch_dir / BRANCH_MANIFEST_FILE
             if manifest_path.exists():
                 manifest = BranchManifest.from_file(manifest_path)
-                self._manifests[manifest.id] = manifest
-                self._paths[manifest.id] = branch_dir
+                self._manifests[branch_id] = manifest
+                self._paths[branch_id] = branch_dir
 
         try:
             instance = await self.load_branch(branch_id)

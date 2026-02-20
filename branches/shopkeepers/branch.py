@@ -4,19 +4,18 @@ CSV-based trade log importer and price analysis for Minecraft shopkeeper data.
 """
 
 import asyncio
+from pathlib import Path
 
 import discord
 from discord import app_commands
 from discord.ext import tasks
-import aiosqlite
-from pathlib import Path
 
 from oak import OakBranch
 from oak.context import BranchContext
-from oak.constants import EMBED_DESCRIPTION_MAX, truncate_for_embed_field
+from oak.constants import EMBED_DESCRIPTION_MAX
+from oak.utils import truncate_for_embed_field
 
 from .helpers import (
-    get_db_path,
     get_csv_directory,
     is_admin,
     validate_config,
@@ -163,7 +162,6 @@ class Shopkeepers(OakBranch):
 
     def __init__(self, ctx: BranchContext):
         super().__init__(ctx)
-        self.db_path = get_db_path()
 
         # Validate config
         is_valid, errors = validate_config(self.config)
@@ -193,7 +191,7 @@ class Shopkeepers(OakBranch):
         self._auto_import_task = None
         self._import_lock = asyncio.Lock()
 
-        self.log.info(f"Shopkeepers branch initialized (db: {self.db_path})")
+        self.log.info("Shopkeepers branch initialized")
 
     async def on_enable(self):
         """Initialize database, run migrations, sync currencies."""
@@ -227,7 +225,7 @@ class Shopkeepers(OakBranch):
         Resets any items no longer in the currency list to is_currency=0.
         """
         try:
-            async with aiosqlite.connect(self.db_path) as db:
+            async with self.db.transaction() as conn:
                 # Collect configured currency item_keys
                 currency_keys = set()
                 for currency in self.currencies:
@@ -238,7 +236,7 @@ class Shopkeepers(OakBranch):
                     currency_keys.add(item_key)
 
                     # Upsert: update if exists
-                    await db.execute(
+                    await conn.execute(
                         """UPDATE items SET is_currency = 1, emerald_value = ?
                         WHERE item_key = ?""",
                         (emerald_value, item_key),
@@ -247,19 +245,18 @@ class Shopkeepers(OakBranch):
                 # Reset items no longer in the currency list
                 if currency_keys:
                     placeholders = ",".join("?" for _ in currency_keys)
-                    await db.execute(
+                    await conn.execute(
                         f"""UPDATE items SET is_currency = 0, emerald_value = 0.0
                         WHERE is_currency = 1 AND item_key NOT IN ({placeholders})""",
                         tuple(currency_keys),
                     )
                 else:
                     # No currencies configured, reset all
-                    await db.execute(
+                    await conn.execute(
                         "UPDATE items SET is_currency = 0, emerald_value = 0.0 WHERE is_currency = 1"
                     )
 
-                await db.commit()
-                self.log.info(f"Currency sync complete ({len(currency_keys)} currencies configured)")
+            self.log.info(f"Currency sync complete ({len(currency_keys)} currencies configured)")
         except Exception as e:
             self.log.error(f"Error syncing currencies: {e}", exc_info=True)
 
@@ -336,7 +333,7 @@ class Shopkeepers(OakBranch):
         try:
             async with self._import_lock:
                 result = await import_all(
-                    self.db_path, self.csv_directory,
+                    self.db, self.csv_directory,
                     self.plugin_identity_keys, self.currencies,
                 )
 
@@ -375,15 +372,9 @@ class Shopkeepers(OakBranch):
 
         await interaction.response.defer(ephemeral=True)
 
-        if self._import_lock.locked():
-            await interaction.followup.send(
-                "An import is already in progress. Please wait.", ephemeral=True,
-            )
-            return
-
         async with self._import_lock:
             result = await import_all(
-                self.db_path, self.csv_directory,
+                self.db, self.csv_directory,
                 self.plugin_identity_keys, self.currencies,
             )
 
@@ -415,40 +406,39 @@ class Shopkeepers(OakBranch):
     ) -> list[app_commands.Choice[str]]:
         """Shared autocomplete for item searches. Returns up to 25 items."""
         try:
-            async with aiosqlite.connect(self.db_path) as db:
-                if current.strip():
-                    escaped = self._escape_like(current.lower())
-                    query = """
-                        SELECT i.item_key, i.display_name, i.search_name,
-                               COALESCE(SUM(ps.total_volume), 0) AS vol
-                        FROM items i
-                        LEFT JOIN price_summary ps ON ps.item_id = i.id
-                        WHERE i.is_currency = 0 AND i.search_name LIKE ? ESCAPE '\\'
-                        GROUP BY i.id
-                        ORDER BY vol DESC
-                        LIMIT 25
-                    """
-                    rows = await db.execute_fetchall(query, (f"%{escaped}%",))
-                else:
-                    query = """
-                        SELECT i.item_key, i.display_name, i.search_name,
-                               COALESCE(SUM(ps.total_volume), 0) AS vol
-                        FROM items i
-                        LEFT JOIN price_summary ps ON ps.item_id = i.id
-                        WHERE i.is_currency = 0
-                        GROUP BY i.id
-                        ORDER BY vol DESC
-                        LIMIT 25
-                    """
-                    rows = await db.execute_fetchall(query)
+            if current.strip():
+                escaped = self._escape_like(current.lower())
+                query = """
+                    SELECT i.item_key, i.display_name, i.search_name,
+                           COALESCE(SUM(ps.total_volume), 0) AS vol
+                    FROM items i
+                    LEFT JOIN price_summary ps ON ps.item_id = i.id
+                    WHERE i.is_currency = 0 AND i.search_name LIKE ? ESCAPE '\\'
+                    GROUP BY i.id
+                    ORDER BY vol DESC
+                    LIMIT 25
+                """
+                rows = await self.db.fetchall(query, (f"%{escaped}%",))
+            else:
+                query = """
+                    SELECT i.item_key, i.display_name, i.search_name,
+                           COALESCE(SUM(ps.total_volume), 0) AS vol
+                    FROM items i
+                    LEFT JOIN price_summary ps ON ps.item_id = i.id
+                    WHERE i.is_currency = 0
+                    GROUP BY i.id
+                    ORDER BY vol DESC
+                    LIMIT 25
+                """
+                rows = await self.db.fetchall(query)
 
-                return [
-                    app_commands.Choice(
-                        name=format_item_name(row[1], row[2])[:100],
-                        value=row[0],
-                    )
-                    for row in rows
-                ]
+            return [
+                app_commands.Choice(
+                    name=format_item_name(row[1], row[2])[:100],
+                    value=row[0],
+                )
+                for row in rows
+            ]
         except Exception as e:
             self.log.error(f"Item autocomplete error: {e}", exc_info=True)
             return []
@@ -458,29 +448,28 @@ class Shopkeepers(OakBranch):
     ) -> list[app_commands.Choice[str]]:
         """Shared autocomplete for player searches. Returns up to 25 players."""
         try:
-            async with aiosqlite.connect(self.db_path) as db:
-                if current.strip():
-                    escaped = self._escape_like(current)
-                    query = """
-                        SELECT last_name, uuid FROM players
-                        WHERE last_name LIKE ? ESCAPE '\\' COLLATE NOCASE
-                        ORDER BY last_seen DESC
-                        LIMIT 25
-                    """
-                    rows = await db.execute_fetchall(query, (f"%{escaped}%",))
-                else:
-                    # Show most recently active players when empty
-                    query = """
-                        SELECT last_name, uuid FROM players
-                        ORDER BY last_seen DESC
-                        LIMIT 25
-                    """
-                    rows = await db.execute_fetchall(query)
+            if current.strip():
+                escaped = self._escape_like(current)
+                query = """
+                    SELECT last_name, uuid FROM players
+                    WHERE last_name LIKE ? ESCAPE '\\' COLLATE NOCASE
+                    ORDER BY last_seen DESC
+                    LIMIT 25
+                """
+                rows = await self.db.fetchall(query, (f"%{escaped}%",))
+            else:
+                # Show most recently active players when empty
+                query = """
+                    SELECT last_name, uuid FROM players
+                    ORDER BY last_seen DESC
+                    LIMIT 25
+                """
+                rows = await self.db.fetchall(query)
 
-                return [
-                    app_commands.Choice(name=row[0][:100], value=row[0])
-                    for row in rows
-                ]
+            return [
+                app_commands.Choice(name=row[0][:100], value=row[0])
+                for row in rows
+            ]
         except Exception as e:
             self.log.error(f"Player autocomplete error: {e}", exc_info=True)
             return []
@@ -498,98 +487,97 @@ class Shopkeepers(OakBranch):
         period_days = days if days is not None else self.price_history_days
 
         try:
-            async with aiosqlite.connect(self.db_path) as db:
-                # Exact match on item_key
-                row = await db.execute_fetchall(
-                    "SELECT id, item_key, display_name, search_name FROM items WHERE item_key = ?",
-                    (item,),
+            # Exact match on item_key
+            row = await self.db.fetchall(
+                "SELECT id, item_key, display_name, search_name FROM items WHERE item_key = ?",
+                (item,),
+            )
+            # Fallback: fuzzy match on search_name
+            if not row:
+                escaped_item = self._escape_like(item.lower())
+                row = await self.db.fetchall(
+                    "SELECT id, item_key, display_name, search_name FROM items WHERE search_name LIKE ? ESCAPE '\\' ORDER BY LENGTH(search_name) ASC LIMIT 1",
+                    (f"%{escaped_item}%",),
                 )
-                # Fallback: fuzzy match on search_name
-                if not row:
-                    escaped_item = self._escape_like(item.lower())
-                    row = await db.execute_fetchall(
-                        "SELECT id, item_key, display_name, search_name FROM items WHERE search_name LIKE ? ESCAPE '\\' ORDER BY LENGTH(search_name) ASC LIMIT 1",
-                        (f"%{escaped_item}%",),
-                    )
-                if not row:
-                    await interaction.followup.send(f"No item found matching **{item[:100]}**.", ephemeral=True)
-                    return
+            if not row:
+                await interaction.followup.send(f"No item found matching **{item[:100]}**.", ephemeral=True)
+                return
 
-                item_id, item_key, display_name, search_name = row[0]
-                name = format_item_name(display_name, search_name)
+            item_id, item_key, display_name, search_name = row[0]
+            name = format_item_name(display_name, search_name)
 
-                # Fetch all individual trade prices for true median calculation
-                all_prices = await db.execute_fetchall(
-                    """SELECT emerald_cost_per_unit FROM trades
-                       WHERE result_item_id = ? AND trade_date >= date('now', ?)
-                         AND emerald_cost_per_unit IS NOT NULL
-                         AND shop_type != 'admin'
-                       ORDER BY emerald_cost_per_unit""",
-                    (item_id, f"-{period_days} days"),
-                )
+            # Fetch all individual trade prices for true median calculation
+            all_prices = await self.db.fetchall(
+                """SELECT emerald_cost_per_unit FROM trades
+                   WHERE result_item_id = ? AND trade_date >= date('now', ?)
+                     AND emerald_cost_per_unit IS NOT NULL
+                     AND shop_type != 'admin'
+                   ORDER BY emerald_cost_per_unit""",
+                (item_id, f"-{period_days} days"),
+            )
 
-                # Calculate true median from individual trades
-                median_p = None
-                if all_prices:
-                    prices = [p[0] for p in all_prices]
-                    n = len(prices)
-                    if n % 2 == 1:
-                        median_p = prices[n // 2]
-                    else:
-                        median_p = (prices[n // 2 - 1] + prices[n // 2]) / 2
+            # Calculate true median from individual trades
+            median_p = None
+            if all_prices:
+                prices = [p[0] for p in all_prices]
+                n = len(prices)
+                if n % 2 == 1:
+                    median_p = prices[n // 2]
+                else:
+                    median_p = (prices[n // 2 - 1] + prices[n // 2]) / 2
 
-                # Aggregate price data over configured period
-                stats = await db.execute_fetchall(
-                    """SELECT AVG(avg_price), MIN(min_price), MAX(max_price),
-                              SUM(total_volume), SUM(trade_count)
-                       FROM price_summary
-                       WHERE item_id = ? AND trade_date >= date('now', ?)""",
-                    (item_id, f"-{period_days} days"),
-                )
+            # Aggregate price data over configured period
+            stats = await self.db.fetchall(
+                """SELECT AVG(avg_price), MIN(min_price), MAX(max_price),
+                          SUM(total_volume), SUM(trade_count)
+                   FROM price_summary
+                   WHERE item_id = ? AND trade_date >= date('now', ?)""",
+                (item_id, f"-{period_days} days"),
+            )
 
-                avg_p, min_p, max_p, volume, trades = stats[0] if stats else (None, None, None, None, None)
+            avg_p, min_p, max_p, volume, trades = stats[0] if stats else (None, None, None, None, None)
 
-                # Build embed with per-unit and per-stack (x64) prices
-                embed = discord.Embed(title=f"Price: {name}", color=self.embed_color)
+            # Build embed with per-unit and per-stack (x64) prices
+            embed = discord.Embed(title=f"Price: {name}", color=self.embed_color)
 
-                # Per-unit prices
-                embed.add_field(name="Avg", value=format_price(avg_p), inline=True)
-                embed.add_field(name="Median", value=format_price(median_p), inline=True)
-                embed.add_field(name="Min / Max", value=f"{format_price(min_p)} / {format_price(max_p)}", inline=True)
+            # Per-unit prices
+            embed.add_field(name="Avg", value=format_price(avg_p), inline=True)
+            embed.add_field(name="Median", value=format_price(median_p), inline=True)
+            embed.add_field(name="Min / Max", value=f"{format_price(min_p)} / {format_price(max_p)}", inline=True)
 
-                # Per-stack prices (x64)
-                stack_avg = avg_p * 64 if avg_p else None
-                stack_median = median_p * 64 if median_p else None
-                stack_min = min_p * 64 if min_p else None
-                stack_max = max_p * 64 if max_p else None
+            # Per-stack prices (x64)
+            stack_avg = avg_p * 64 if avg_p else None
+            stack_median = median_p * 64 if median_p else None
+            stack_min = min_p * 64 if min_p else None
+            stack_max = max_p * 64 if max_p else None
 
-                embed.add_field(name="Stack Avg (x64)", value=format_price(stack_avg), inline=True)
-                embed.add_field(name="Stack Median", value=format_price(stack_median), inline=True)
-                embed.add_field(name="Stack Min / Max", value=f"{format_price(stack_min)} / {format_price(stack_max)}", inline=True)
+            embed.add_field(name="Stack Avg (x64)", value=format_price(stack_avg), inline=True)
+            embed.add_field(name="Stack Median", value=format_price(stack_median), inline=True)
+            embed.add_field(name="Stack Min / Max", value=f"{format_price(stack_min)} / {format_price(stack_max)}", inline=True)
 
-                # Stats row
-                embed.add_field(name="Volume", value=f"{int(volume):,}" if volume else "0", inline=True)
-                embed.add_field(name="Trades", value=f"{int(trades):,}" if trades else "0", inline=True)
-                embed.add_field(name="Period", value=f"Last {period_days} days", inline=True)
+            # Stats row
+            embed.add_field(name="Volume", value=f"{int(volume):,}" if volume else "0", inline=True)
+            embed.add_field(name="Trades", value=f"{int(trades):,}" if trades else "0", inline=True)
+            embed.add_field(name="Period", value=f"Last {period_days} days", inline=True)
 
-                # Recent history (last 10 daily entries)
-                history = await db.execute_fetchall(
-                    """SELECT trade_date, avg_price, total_volume
-                       FROM price_summary
-                       WHERE item_id = ?
-                       ORDER BY trade_date DESC
-                       LIMIT 10""",
-                    (item_id,),
-                )
-                if history:
-                    lines = []
-                    for h_date, h_price, h_vol in history:
-                        date_short = h_date[5:]  # MM-DD
-                        lines.append(f"`{date_short}` {format_price(h_price)} ({int(h_vol):,} vol)")
-                    embed.add_field(name="Recent History", value=truncate_for_embed_field("\n".join(lines)), inline=False)
+            # Recent history (last 10 daily entries)
+            history = await self.db.fetchall(
+                """SELECT trade_date, avg_price, total_volume
+                   FROM price_summary
+                   WHERE item_id = ?
+                   ORDER BY trade_date DESC
+                   LIMIT 10""",
+                (item_id,),
+            )
+            if history:
+                lines = []
+                for h_date, h_price, h_vol in history:
+                    date_short = h_date[5:]  # MM-DD
+                    lines.append(f"`{date_short}` {format_price(h_price)} ({int(h_vol):,} vol)")
+                embed.add_field(name="Recent History", value=truncate_for_embed_field("\n".join(lines)), inline=False)
 
-                embed.set_footer(text=f"Item key: {item_key} | Stack prices assume x64")
-                await interaction.followup.send(embed=embed, ephemeral=not public)
+            embed.set_footer(text=f"Item key: {item_key} | Stack prices assume x64")
+            await interaction.followup.send(embed=embed, ephemeral=not public)
 
         except Exception as e:
             self.log.error(f"Error in /price command: {e}", exc_info=True)
@@ -615,40 +603,39 @@ class Shopkeepers(OakBranch):
         await interaction.response.defer(ephemeral=not public)
 
         try:
-            async with aiosqlite.connect(self.db_path) as db:
-                max_rows = self.top_entries * 3
-                order_map = {"expensive": "price DESC", "volume": "vol DESC", "trades": "tc DESC"}
-                having = "HAVING tc >= 5" if sort_by == "expensive" else ""
+            max_rows = self.top_entries * 3
+            order_map = {"expensive": "price DESC", "volume": "vol DESC", "trades": "tc DESC"}
+            having = "HAVING tc >= 5" if sort_by == "expensive" else ""
 
-                query = f"""
-                    SELECT i.display_name, i.search_name, i.item_key,
-                           AVG(ps.avg_price) AS price,
-                           SUM(ps.total_volume) AS vol,
-                           SUM(ps.trade_count) AS tc
-                    FROM price_summary ps
-                    JOIN items i ON i.id = ps.item_id
-                    WHERE i.is_currency = 0
-                    GROUP BY ps.item_id
-                    {having}
-                    ORDER BY {order_map.get(sort_by, "tc DESC")}
-                    LIMIT ?
-                """
-                rows = await db.execute_fetchall(query, (max_rows,))
+            query = f"""
+                SELECT i.display_name, i.search_name, i.item_key,
+                       AVG(ps.avg_price) AS price,
+                       SUM(ps.total_volume) AS vol,
+                       SUM(ps.trade_count) AS tc
+                FROM price_summary ps
+                JOIN items i ON i.id = ps.item_id
+                WHERE i.is_currency = 0
+                GROUP BY ps.item_id
+                {having}
+                ORDER BY {order_map.get(sort_by, "tc DESC")}
+                LIMIT ?
+            """
+            rows = await self.db.fetchall(query, (max_rows,))
 
-                if not rows:
-                    await interaction.followup.send("No trade data available yet.", ephemeral=True)
-                    return
+            if not rows:
+                await interaction.followup.send("No trade data available yet.", ephemeral=True)
+                return
 
-                sort_labels = {"trades": "Most Trades", "expensive": "Most Expensive", "volume": "Highest Volume"}
-                pages = self._build_pages(
-                    rows, self.top_entries,
-                    f"Top Items -- {sort_labels.get(sort_by, sort_by)}",
-                    lambda i, row: (
-                        f"**{i}.** {format_item_name(row[0], row[1])} -- "
-                        f"{format_price(row[3])} | {int(row[4]):,} vol | {int(row[5]):,} trades"
-                    ),
-                )
-                await self._send_paginated(interaction, pages, ephemeral=not public)
+            sort_labels = {"trades": "Most Trades", "expensive": "Most Expensive", "volume": "Highest Volume"}
+            pages = self._build_pages(
+                rows, self.top_entries,
+                f"Top Items -- {sort_labels.get(sort_by, sort_by)}",
+                lambda i, row: (
+                    f"**{i}.** {format_item_name(row[0], row[1])} -- "
+                    f"{format_price(row[3])} | {int(row[4]):,} vol | {int(row[5]):,} trades"
+                ),
+            )
+            await self._send_paginated(interaction, pages, ephemeral=not public)
 
         except Exception as e:
             self.log.error(f"Error in /top command: {e}", exc_info=True)
@@ -665,43 +652,42 @@ class Shopkeepers(OakBranch):
         await interaction.response.defer(ephemeral=not public)
 
         try:
-            async with aiosqlite.connect(self.db_path) as db:
-                escaped_query = self._escape_like(query.lower())
-                rows = await db.execute_fetchall(
-                    """SELECT i.item_key, i.display_name, i.search_name,
-                              i.plugin_id, i.material_type,
-                              AVG(ps.avg_price) AS price,
-                              COALESCE(SUM(ps.total_volume), 0) AS vol,
-                              COALESCE(SUM(ps.trade_count), 0) AS tc
-                       FROM items i
-                       LEFT JOIN price_summary ps ON ps.item_id = i.id
-                       WHERE i.item_key = ? OR i.search_name LIKE ? ESCAPE '\\'
-                       GROUP BY i.id
-                       ORDER BY tc DESC
-                       LIMIT 25""",
-                    (query, f"%{escaped_query}%"),
+            escaped_query = self._escape_like(query.lower())
+            rows = await self.db.fetchall(
+                """SELECT i.item_key, i.display_name, i.search_name,
+                          i.plugin_id, i.material_type,
+                          AVG(ps.avg_price) AS price,
+                          COALESCE(SUM(ps.total_volume), 0) AS vol,
+                          COALESCE(SUM(ps.trade_count), 0) AS tc
+                   FROM items i
+                   LEFT JOIN price_summary ps ON ps.item_id = i.id
+                   WHERE i.item_key = ? OR i.search_name LIKE ? ESCAPE '\\'
+                   GROUP BY i.id
+                   ORDER BY tc DESC
+                   LIMIT 25""",
+                (query, f"%{escaped_query}%"),
+            )
+
+            if not rows:
+                await interaction.followup.send(f"No items found matching **{query[:100]}**.", ephemeral=True)
+                return
+
+            def _fmt_search(i, row):
+                ikey, dname, sname, plugin_id, mat_type, price, vol, tc = row
+                name = format_item_name(dname, sname)
+                source = plugin_id or mat_type
+                return (
+                    f"**{name}**\n"
+                    f"{format_price(price)} | {int(vol):,} vol | {int(tc):,} trades | `{source}`"
                 )
 
-                if not rows:
-                    await interaction.followup.send(f"No items found matching **{query[:100]}**.", ephemeral=True)
-                    return
-
-                def _fmt_search(i, row):
-                    ikey, dname, sname, plugin_id, mat_type, price, vol, tc = row
-                    name = format_item_name(dname, sname)
-                    source = plugin_id or mat_type
-                    return (
-                        f"**{name}**\n"
-                        f"{format_price(price)} | {int(vol):,} vol | {int(tc):,} trades | `{source}`"
-                    )
-
-                pages = self._build_pages(
-                    rows, self.trades_per_page,
-                    f"Search: {query[:100]}", _fmt_search,
-                    footer_extra=f"{len(rows)} results",
-                    separator="\n\n",
-                )
-                await self._send_paginated(interaction, pages, ephemeral=not public)
+            pages = self._build_pages(
+                rows, self.trades_per_page,
+                f"Search: {query[:100]}", _fmt_search,
+                footer_extra=f"{len(rows)} results",
+                separator="\n\n",
+            )
+            await self._send_paginated(interaction, pages, ephemeral=not public)
 
         except Exception as e:
             self.log.error(f"Error in /search command: {e}", exc_info=True)
@@ -722,86 +708,85 @@ class Shopkeepers(OakBranch):
         await interaction.response.defer(ephemeral=not public)
 
         try:
-            async with aiosqlite.connect(self.db_path) as db:
-                # Resolve player identifier to UUID
-                # If it looks like a UUID (contains dashes and is long), use directly
-                # Otherwise, look up by name
-                if "-" in player and len(player) > 30:
-                    player_uuid = player
-                    # Try to get the name from players table
-                    name_row = await db.execute_fetchall(
-                        "SELECT last_name FROM players WHERE uuid = ?", (player_uuid,)
-                    )
-                    player_name = name_row[0][0] if name_row else None
-                else:
-                    # Look up by name (case-insensitive)
-                    uuid_row = await db.execute_fetchall(
-                        "SELECT uuid, last_name FROM players WHERE last_name = ? COLLATE NOCASE",
-                        (player,),
-                    )
-                    if not uuid_row:
-                        await interaction.followup.send(
-                            f"No player found with name **{player[:100]}**. Try using their UUID instead.",
-                            ephemeral=True,
-                        )
-                        return
-                    player_uuid = uuid_row[0][0]
-                    player_name = uuid_row[0][1]
-
-                # Basic stats
-                stats = await db.execute_fetchall(
-                    """SELECT COUNT(*) AS trade_count,
-                              SUM(trade_count) AS total_tx,
-                              MIN(trade_date) AS first_trade,
-                              MAX(trade_date) AS last_trade,
-                              COUNT(DISTINCT result_item_id) AS unique_items
-                       FROM trades WHERE player_uuid = ?""",
-                    (player_uuid,),
+            # Resolve player identifier to UUID
+            # If it looks like a UUID (contains dashes and is long), use directly
+            # Otherwise, look up by name
+            if "-" in player and len(player) > 30:
+                player_uuid = player
+                # Try to get the name from players table
+                name_row = await self.db.fetchall(
+                    "SELECT last_name FROM players WHERE uuid = ?", (player_uuid,)
                 )
-                trade_count, total_tx, first_trade, last_trade, unique_items = stats[0]
-
-                if not trade_count:
-                    await interaction.followup.send(f"No trades found for player `{player_uuid}`.", ephemeral=True)
+                player_name = name_row[0][0] if name_row else None
+            else:
+                # Look up by name (case-insensitive)
+                uuid_row = await self.db.fetchall(
+                    "SELECT uuid, last_name FROM players WHERE last_name = ? COLLATE NOCASE",
+                    (player,),
+                )
+                if not uuid_row:
+                    await interaction.followup.send(
+                        f"No player found with name **{player[:100]}**. Try using their UUID instead.",
+                        ephemeral=True,
+                    )
                     return
+                player_uuid = uuid_row[0][0]
+                player_name = uuid_row[0][1]
 
-                # Total spent
-                spent_row = await db.execute_fetchall(
-                    "SELECT SUM(emerald_cost_total) FROM trades WHERE player_uuid = ? AND emerald_cost_total IS NOT NULL",
-                    (player_uuid,),
-                )
-                total_spent = spent_row[0][0] if spent_row and spent_row[0][0] else 0
+            # Basic stats
+            stats = await self.db.fetchall(
+                """SELECT COUNT(*) AS trade_count,
+                          SUM(trade_count) AS total_tx,
+                          MIN(trade_date) AS first_trade,
+                          MAX(trade_date) AS last_trade,
+                          COUNT(DISTINCT result_item_id) AS unique_items
+                   FROM trades WHERE player_uuid = ?""",
+                (player_uuid,),
+            )
+            trade_count, total_tx, first_trade, last_trade, unique_items = stats[0]
 
-                # Build title with name if available
-                title = f"Player Stats: {player_name}" if player_name else "Player Stats"
-                embed = discord.Embed(title=title, color=self.embed_color)
-                embed.add_field(name="UUID", value=f"`{player_uuid}`", inline=False)
-                embed.add_field(name="Trades", value=f"{trade_count:,}", inline=True)
-                embed.add_field(name="Transactions", value=f"{int(total_tx):,}", inline=True)
-                embed.add_field(name="Unique Items", value=f"{unique_items:,}", inline=True)
-                embed.add_field(name="Total Spent", value=format_price(total_spent), inline=True)
-                embed.add_field(name="First Trade", value=first_trade, inline=True)
-                embed.add_field(name="Last Trade", value=last_trade, inline=True)
+            if not trade_count:
+                await interaction.followup.send(f"No trades found for player `{player_uuid}`.", ephemeral=True)
+                return
 
-                # Top 10 purchased items by volume (excluding currencies)
-                top_items = await db.execute_fetchall(
-                    """SELECT i.display_name, i.search_name,
-                              SUM(t.result_amount * t.trade_count) AS vol
-                       FROM trades t
-                       JOIN items i ON i.id = t.result_item_id
-                       WHERE t.player_uuid = ? AND i.is_currency = 0
-                       GROUP BY t.result_item_id
-                       ORDER BY vol DESC
-                       LIMIT 10""",
-                    (player_uuid,),
-                )
-                if top_items:
-                    lines = []
-                    for dname, sname, vol in top_items:
-                        name = format_item_name(dname, sname)
-                        lines.append(f"* {name} -- {int(vol):,}")
-                    embed.add_field(name="Top Purchased Items", value=truncate_for_embed_field("\n".join(lines)), inline=False)
+            # Total spent
+            spent_row = await self.db.fetchall(
+                "SELECT SUM(emerald_cost_total) FROM trades WHERE player_uuid = ? AND emerald_cost_total IS NOT NULL",
+                (player_uuid,),
+            )
+            total_spent = spent_row[0][0] if spent_row and spent_row[0][0] else 0
 
-                await interaction.followup.send(embed=embed, ephemeral=not public)
+            # Build title with name if available
+            title = f"Player Stats: {player_name}" if player_name else "Player Stats"
+            embed = discord.Embed(title=title, color=self.embed_color)
+            embed.add_field(name="UUID", value=f"`{player_uuid}`", inline=False)
+            embed.add_field(name="Trades", value=f"{trade_count:,}", inline=True)
+            embed.add_field(name="Transactions", value=f"{int(total_tx):,}", inline=True)
+            embed.add_field(name="Unique Items", value=f"{unique_items:,}", inline=True)
+            embed.add_field(name="Total Spent", value=format_price(total_spent), inline=True)
+            embed.add_field(name="First Trade", value=first_trade, inline=True)
+            embed.add_field(name="Last Trade", value=last_trade, inline=True)
+
+            # Top 10 purchased items by volume (excluding currencies)
+            top_items = await self.db.fetchall(
+                """SELECT i.display_name, i.search_name,
+                          SUM(t.result_amount * t.trade_count) AS vol
+                   FROM trades t
+                   JOIN items i ON i.id = t.result_item_id
+                   WHERE t.player_uuid = ? AND i.is_currency = 0
+                   GROUP BY t.result_item_id
+                   ORDER BY vol DESC
+                   LIMIT 10""",
+                (player_uuid,),
+            )
+            if top_items:
+                lines = []
+                for dname, sname, vol in top_items:
+                    name = format_item_name(dname, sname)
+                    lines.append(f"* {name} -- {int(vol):,}")
+                embed.add_field(name="Top Purchased Items", value=truncate_for_embed_field("\n".join(lines)), inline=False)
+
+            await interaction.followup.send(embed=embed, ephemeral=not public)
 
         except Exception as e:
             self.log.error(f"Error in /player command: {e}", exc_info=True)
@@ -822,102 +807,101 @@ class Shopkeepers(OakBranch):
         await interaction.response.defer(ephemeral=not public)
 
         try:
-            async with aiosqlite.connect(self.db_path) as db:
-                # Resolve owner identifier to UUID
-                if "-" in owner and len(owner) > 30:
-                    owner_uuid = owner
-                    # Try to get the name from players table
-                    name_row = await db.execute_fetchall(
-                        "SELECT last_name FROM players WHERE uuid = ?", (owner_uuid,)
-                    )
-                    owner_name = name_row[0][0] if name_row else None
-                else:
-                    # Look up by name (case-insensitive)
-                    uuid_row = await db.execute_fetchall(
-                        "SELECT uuid, last_name FROM players WHERE last_name = ? COLLATE NOCASE",
-                        (owner,),
-                    )
-                    if not uuid_row:
-                        await interaction.followup.send(
-                            f"No player found with name **{owner[:100]}**. Try using their UUID instead.",
-                            ephemeral=True,
-                        )
-                        return
-                    owner_uuid = uuid_row[0][0]
-                    owner_name = uuid_row[0][1]
-
-                # Overview stats
-                stats = await db.execute_fetchall(
-                    """SELECT COUNT(*) AS trade_count,
-                              SUM(trade_count) AS total_tx,
-                              COUNT(DISTINCT player_uuid) AS unique_customers,
-                              COUNT(DISTINCT shop_uuid) AS shop_count,
-                              MIN(trade_date) AS first_trade,
-                              MAX(trade_date) AS last_trade
-                       FROM trades WHERE shop_owner_uuid = ?""",
-                    (owner_uuid,),
+            # Resolve owner identifier to UUID
+            if "-" in owner and len(owner) > 30:
+                owner_uuid = owner
+                # Try to get the name from players table
+                name_row = await self.db.fetchall(
+                    "SELECT last_name FROM players WHERE uuid = ?", (owner_uuid,)
                 )
-                trade_count, total_tx, customers, shops, first_trade, last_trade = stats[0]
-
-                if not trade_count:
-                    await interaction.followup.send(f"No trades found for shop owner `{owner_uuid}`.", ephemeral=True)
+                owner_name = name_row[0][0] if name_row else None
+            else:
+                # Look up by name (case-insensitive)
+                uuid_row = await self.db.fetchall(
+                    "SELECT uuid, last_name FROM players WHERE last_name = ? COLLATE NOCASE",
+                    (owner,),
+                )
+                if not uuid_row:
+                    await interaction.followup.send(
+                        f"No player found with name **{owner[:100]}**. Try using their UUID instead.",
+                        ephemeral=True,
+                    )
                     return
+                owner_uuid = uuid_row[0][0]
+                owner_name = uuid_row[0][1]
 
-                # Total revenue
-                rev_row = await db.execute_fetchall(
-                    "SELECT SUM(emerald_cost_total) FROM trades WHERE shop_owner_uuid = ? AND emerald_cost_total IS NOT NULL",
-                    (owner_uuid,),
-                )
-                total_revenue = rev_row[0][0] if rev_row and rev_row[0][0] else 0
+            # Overview stats
+            stats = await self.db.fetchall(
+                """SELECT COUNT(*) AS trade_count,
+                          SUM(trade_count) AS total_tx,
+                          COUNT(DISTINCT player_uuid) AS unique_customers,
+                          COUNT(DISTINCT shop_uuid) AS shop_count,
+                          MIN(trade_date) AS first_trade,
+                          MAX(trade_date) AS last_trade
+                   FROM trades WHERE shop_owner_uuid = ?""",
+                (owner_uuid,),
+            )
+            trade_count, total_tx, customers, shops, first_trade, last_trade = stats[0]
 
-                # Build title with name if available
-                title = f"Shop Owner Stats: {owner_name}" if owner_name else "Shop Owner Stats"
-                embed = discord.Embed(title=title, color=self.embed_color)
-                embed.add_field(name="Owner UUID", value=f"`{owner_uuid}`", inline=False)
-                embed.add_field(name="Trades", value=f"{trade_count:,}", inline=True)
-                embed.add_field(name="Transactions", value=f"{int(total_tx):,}", inline=True)
-                embed.add_field(name="Unique Customers", value=f"{customers:,}", inline=True)
-                embed.add_field(name="Shops", value=f"{shops:,}", inline=True)
-                embed.add_field(name="Total Revenue", value=format_price(total_revenue), inline=True)
-                embed.add_field(name="First Trade", value=first_trade, inline=True)
-                embed.add_field(name="Last Trade", value=last_trade, inline=True)
+            if not trade_count:
+                await interaction.followup.send(f"No trades found for shop owner `{owner_uuid}`.", ephemeral=True)
+                return
 
-                # Top 10 sold items
-                top_items = await db.execute_fetchall(
-                    """SELECT i.display_name, i.search_name,
-                              SUM(t.result_amount * t.trade_count) AS vol
-                       FROM trades t
-                       JOIN items i ON i.id = t.result_item_id
-                       WHERE t.shop_owner_uuid = ? AND i.is_currency = 0
-                       GROUP BY t.result_item_id
-                       ORDER BY vol DESC
-                       LIMIT 10""",
-                    (owner_uuid,),
-                )
-                if top_items:
-                    lines = []
-                    for dname, sname, vol in top_items:
-                        name = format_item_name(dname, sname)
-                        lines.append(f"* {name} -- {int(vol):,}")
-                    embed.add_field(name="Top Sold Items", value=truncate_for_embed_field("\n".join(lines)), inline=False)
+            # Total revenue
+            rev_row = await self.db.fetchall(
+                "SELECT SUM(emerald_cost_total) FROM trades WHERE shop_owner_uuid = ? AND emerald_cost_total IS NOT NULL",
+                (owner_uuid,),
+            )
+            total_revenue = rev_row[0][0] if rev_row and rev_row[0][0] else 0
 
-                # Shop locations (top 5 by trade count)
-                locations = await db.execute_fetchall(
-                    """SELECT shop_world, shop_x, shop_y, shop_z, COUNT(*) AS tc
-                       FROM trades
-                       WHERE shop_owner_uuid = ?
-                       GROUP BY shop_uuid, shop_world, shop_x, shop_y, shop_z
-                       ORDER BY tc DESC
-                       LIMIT 5""",
-                    (owner_uuid,),
-                )
-                if locations:
-                    loc_lines = []
-                    for world, x, y, z, tc in locations:
-                        loc_lines.append(f"* {world} ({x}, {y}, {z}) -- {tc:,} trades")
-                    embed.add_field(name="Shop Locations", value=truncate_for_embed_field("\n".join(loc_lines)), inline=False)
+            # Build title with name if available
+            title = f"Shop Owner Stats: {owner_name}" if owner_name else "Shop Owner Stats"
+            embed = discord.Embed(title=title, color=self.embed_color)
+            embed.add_field(name="Owner UUID", value=f"`{owner_uuid}`", inline=False)
+            embed.add_field(name="Trades", value=f"{trade_count:,}", inline=True)
+            embed.add_field(name="Transactions", value=f"{int(total_tx):,}", inline=True)
+            embed.add_field(name="Unique Customers", value=f"{customers:,}", inline=True)
+            embed.add_field(name="Shops", value=f"{shops:,}", inline=True)
+            embed.add_field(name="Total Revenue", value=format_price(total_revenue), inline=True)
+            embed.add_field(name="First Trade", value=first_trade, inline=True)
+            embed.add_field(name="Last Trade", value=last_trade, inline=True)
 
-                await interaction.followup.send(embed=embed, ephemeral=not public)
+            # Top 10 sold items
+            top_items = await self.db.fetchall(
+                """SELECT i.display_name, i.search_name,
+                          SUM(t.result_amount * t.trade_count) AS vol
+                   FROM trades t
+                   JOIN items i ON i.id = t.result_item_id
+                   WHERE t.shop_owner_uuid = ? AND i.is_currency = 0
+                   GROUP BY t.result_item_id
+                   ORDER BY vol DESC
+                   LIMIT 10""",
+                (owner_uuid,),
+            )
+            if top_items:
+                lines = []
+                for dname, sname, vol in top_items:
+                    name = format_item_name(dname, sname)
+                    lines.append(f"* {name} -- {int(vol):,}")
+                embed.add_field(name="Top Sold Items", value=truncate_for_embed_field("\n".join(lines)), inline=False)
+
+            # Shop locations (top 5 by trade count)
+            locations = await self.db.fetchall(
+                """SELECT shop_world, shop_x, shop_y, shop_z, COUNT(*) AS tc
+                   FROM trades
+                   WHERE shop_owner_uuid = ?
+                   GROUP BY shop_uuid, shop_world, shop_x, shop_y, shop_z
+                   ORDER BY tc DESC
+                   LIMIT 5""",
+                (owner_uuid,),
+            )
+            if locations:
+                loc_lines = []
+                for world, x, y, z, tc in locations:
+                    loc_lines.append(f"* {world} ({x}, {y}, {z}) -- {tc:,} trades")
+                embed.add_field(name="Shop Locations", value=truncate_for_embed_field("\n".join(loc_lines)), inline=False)
+
+            await interaction.followup.send(embed=embed, ephemeral=not public)
 
         except Exception as e:
             self.log.error(f"Error in /shop command: {e}", exc_info=True)
@@ -943,36 +927,35 @@ class Shopkeepers(OakBranch):
         await interaction.response.defer(ephemeral=True)
 
         try:
-            async with aiosqlite.connect(self.db_path) as db:
-                # Total trades
-                total_trades = (await db.execute_fetchall("SELECT COUNT(*) FROM trades"))[0][0]
-                # Total items
-                total_items = (await db.execute_fetchall("SELECT COUNT(*) FROM items"))[0][0]
-                # Total unique players
-                total_players = (await db.execute_fetchall("SELECT COUNT(DISTINCT player_uuid) FROM trades"))[0][0]
-                # Total unique owners
-                total_owners = (await db.execute_fetchall(
-                    "SELECT COUNT(DISTINCT shop_owner_uuid) FROM trades WHERE shop_owner_uuid IS NOT NULL"
-                ))[0][0]
-                # Date range
-                date_range = (await db.execute_fetchall(
-                    "SELECT MIN(trade_date), MAX(trade_date) FROM trades"
-                ))[0]
-                # Shop type breakdown
-                shop_types = await db.execute_fetchall(
-                    "SELECT shop_type, COUNT(*) FROM trades GROUP BY shop_type ORDER BY COUNT(*) DESC"
-                )
-                # World breakdown
-                worlds = await db.execute_fetchall(
-                    "SELECT shop_world, COUNT(*) FROM trades GROUP BY shop_world ORDER BY COUNT(*) DESC"
-                )
-                # Imported files
-                file_count = (await db.execute_fetchall("SELECT COUNT(*) FROM imported_files"))[0][0]
-                # Price summary entries
-                ps_count = (await db.execute_fetchall("SELECT COUNT(*) FROM price_summary"))[0][0]
+            # Total trades
+            total_trades = (await self.db.fetchall("SELECT COUNT(*) FROM trades"))[0][0]
+            # Total items
+            total_items = (await self.db.fetchall("SELECT COUNT(*) FROM items"))[0][0]
+            # Total unique players
+            total_players = (await self.db.fetchall("SELECT COUNT(DISTINCT player_uuid) FROM trades"))[0][0]
+            # Total unique owners
+            total_owners = (await self.db.fetchall(
+                "SELECT COUNT(DISTINCT shop_owner_uuid) FROM trades WHERE shop_owner_uuid IS NOT NULL"
+            ))[0][0]
+            # Date range
+            date_range = (await self.db.fetchall(
+                "SELECT MIN(trade_date), MAX(trade_date) FROM trades"
+            ))[0]
+            # Shop type breakdown
+            shop_types = await self.db.fetchall(
+                "SELECT shop_type, COUNT(*) FROM trades GROUP BY shop_type ORDER BY COUNT(*) DESC"
+            )
+            # World breakdown
+            worlds = await self.db.fetchall(
+                "SELECT shop_world, COUNT(*) FROM trades GROUP BY shop_world ORDER BY COUNT(*) DESC"
+            )
+            # Imported files
+            file_count = (await self.db.fetchall("SELECT COUNT(*) FROM imported_files"))[0][0]
+            # Price summary entries
+            ps_count = (await self.db.fetchall("SELECT COUNT(*) FROM price_summary"))[0][0]
 
             # DB file size
-            db_size_bytes = Path(self.db_path).stat().st_size
+            db_size_bytes = self.db.path.stat().st_size
             if db_size_bytes >= 1_048_576:
                 db_size = f"{db_size_bytes / 1_048_576:.1f} MB"
             else:
@@ -1033,173 +1016,172 @@ class Shopkeepers(OakBranch):
         await interaction.response.defer(ephemeral=True)
 
         try:
-            async with aiosqlite.connect(self.db_path) as db:
-                # Parameterized date filter
-                if period > 0:
-                    date_clause = "AND t.trade_date >= date('now', ?)"
-                    date_params = (f"-{period} days",)
-                    period_label = f"Last {period} days"
-                else:
-                    date_clause = ""
-                    date_params = ()
-                    period_label = "All time"
+            # Parameterized date filter
+            if period > 0:
+                date_clause = "AND t.trade_date >= date('now', ?)"
+                date_params = (f"-{period} days",)
+                period_label = f"Last {period} days"
+            else:
+                date_clause = ""
+                date_params = ()
+                period_label = "All time"
 
-                # Total currency SPENT at admin shops (sinks)
-                sink_query = f"""
-                    SELECT COALESCE(SUM(t.emerald_cost_total), 0), COUNT(*)
-                    FROM trades t
-                    JOIN items i ON i.id = t.result_item_id
-                    WHERE t.shop_type = 'admin'
-                      AND t.emerald_cost_total IS NOT NULL
-                      AND i.is_currency = 0
-                      {date_clause}
-                """
-                sink_result = await db.execute_fetchall(sink_query, date_params)
-                total_sunk, sink_trades = sink_result[0] if sink_result else (0, 0)
+            # Total currency SPENT at admin shops (sinks)
+            sink_query = f"""
+                SELECT COALESCE(SUM(t.emerald_cost_total), 0), COUNT(*)
+                FROM trades t
+                JOIN items i ON i.id = t.result_item_id
+                WHERE t.shop_type = 'admin'
+                  AND t.emerald_cost_total IS NOT NULL
+                  AND i.is_currency = 0
+                  {date_clause}
+            """
+            sink_result = await self.db.fetchall(sink_query, date_params)
+            total_sunk, sink_trades = sink_result[0] if sink_result else (0, 0)
 
-                # Total currency EARNED from admin shops (faucets)
-                # Excludes currency conversion shops (e.g., EMB <-> CEMB)
-                faucet_query = f"""
-                    SELECT COALESCE(SUM(t.result_amount * t.trade_count * ri.emerald_value), 0), COUNT(*)
-                    FROM trades t
-                    JOIN items ri ON ri.id = t.result_item_id
-                    JOIN items i1 ON i1.id = t.item1_id
-                    WHERE t.shop_type = 'admin'
-                      AND ri.is_currency = 1
-                      AND i1.is_currency = 0
-                      {date_clause}
-                """
-                faucet_result = await db.execute_fetchall(faucet_query, date_params)
-                total_fauceted, faucet_trades = faucet_result[0] if faucet_result else (0, 0)
+            # Total currency EARNED from admin shops (faucets)
+            # Excludes currency conversion shops (e.g., EMB <-> CEMB)
+            faucet_query = f"""
+                SELECT COALESCE(SUM(t.result_amount * t.trade_count * ri.emerald_value), 0), COUNT(*)
+                FROM trades t
+                JOIN items ri ON ri.id = t.result_item_id
+                JOIN items i1 ON i1.id = t.item1_id
+                WHERE t.shop_type = 'admin'
+                  AND ri.is_currency = 1
+                  AND i1.is_currency = 0
+                  {date_clause}
+            """
+            faucet_result = await self.db.fetchall(faucet_query, date_params)
+            total_fauceted, faucet_trades = faucet_result[0] if faucet_result else (0, 0)
 
-                # Net flow (negative = healthy sink, positive = inflation)
-                net_flow = total_fauceted - total_sunk
+            # Net flow (negative = healthy sink, positive = inflation)
+            net_flow = total_fauceted - total_sunk
 
-                # Top 10 sink items (what players BUY most from admin shops)
-                top_sinks_query = f"""
-                    SELECT i.display_name, i.search_name,
-                           SUM(t.emerald_cost_total) AS total_cost,
-                           SUM(t.result_amount * t.trade_count) AS total_volume,
-                           COUNT(*) AS trade_count
-                    FROM trades t
-                    JOIN items i ON i.id = t.result_item_id
-                    WHERE t.shop_type = 'admin'
-                      AND t.emerald_cost_total IS NOT NULL
-                      AND i.is_currency = 0
-                      {date_clause}
-                    GROUP BY t.result_item_id
-                    ORDER BY total_cost DESC
-                    LIMIT 10
-                """
-                top_sinks = await db.execute_fetchall(top_sinks_query, date_params)
+            # Top 10 sink items (what players BUY most from admin shops)
+            top_sinks_query = f"""
+                SELECT i.display_name, i.search_name,
+                       SUM(t.emerald_cost_total) AS total_cost,
+                       SUM(t.result_amount * t.trade_count) AS total_volume,
+                       COUNT(*) AS trade_count
+                FROM trades t
+                JOIN items i ON i.id = t.result_item_id
+                WHERE t.shop_type = 'admin'
+                  AND t.emerald_cost_total IS NOT NULL
+                  AND i.is_currency = 0
+                  {date_clause}
+                GROUP BY t.result_item_id
+                ORDER BY total_cost DESC
+                LIMIT 10
+            """
+            top_sinks = await self.db.fetchall(top_sinks_query, date_params)
 
-                # Top 10 faucet items (what players SELL most to admin shops)
-                top_faucets_query = f"""
-                    SELECT i.display_name, i.search_name,
-                           SUM(t.result_amount * t.trade_count * ri.emerald_value) AS total_earned,
-                           SUM(t.item1_amount * t.trade_count) AS total_volume,
-                           COUNT(*) AS trade_count
-                    FROM trades t
-                    JOIN items i ON i.id = t.item1_id
-                    JOIN items ri ON ri.id = t.result_item_id
-                    WHERE t.shop_type = 'admin'
-                      AND ri.is_currency = 1
-                      AND i.is_currency = 0
-                      {date_clause}
-                    GROUP BY t.item1_id
-                    ORDER BY total_earned DESC
-                    LIMIT 10
-                """
-                top_faucets = await db.execute_fetchall(top_faucets_query, date_params)
+            # Top 10 faucet items (what players SELL most to admin shops)
+            top_faucets_query = f"""
+                SELECT i.display_name, i.search_name,
+                       SUM(t.result_amount * t.trade_count * ri.emerald_value) AS total_earned,
+                       SUM(t.item1_amount * t.trade_count) AS total_volume,
+                       COUNT(*) AS trade_count
+                FROM trades t
+                JOIN items i ON i.id = t.item1_id
+                JOIN items ri ON ri.id = t.result_item_id
+                WHERE t.shop_type = 'admin'
+                  AND ri.is_currency = 1
+                  AND i.is_currency = 0
+                  {date_clause}
+                GROUP BY t.item1_id
+                ORDER BY total_earned DESC
+                LIMIT 10
+            """
+            top_faucets = await self.db.fetchall(top_faucets_query, date_params)
 
-                # Daily breakdown (last 14 days for display)
-                daily_query = """
-                    SELECT
-                        t.trade_date,
-                        COALESCE(SUM(CASE WHEN ri.is_currency = 0 THEN t.emerald_cost_total ELSE 0 END), 0) AS daily_sink,
-                        COALESCE(SUM(CASE WHEN ri.is_currency = 1 AND i1.is_currency = 0 THEN t.result_amount * t.trade_count * ri.emerald_value ELSE 0 END), 0) AS daily_faucet
-                    FROM trades t
-                    JOIN items ri ON ri.id = t.result_item_id
-                    LEFT JOIN items i1 ON i1.id = t.item1_id
-                    WHERE t.shop_type = 'admin'
-                      AND t.trade_date >= date('now', ?)
-                    GROUP BY t.trade_date
-                    ORDER BY t.trade_date DESC
-                """
-                daily_data = await db.execute_fetchall(daily_query, ("-14 days",))
+            # Daily breakdown (last 14 days for display)
+            daily_query = """
+                SELECT
+                    t.trade_date,
+                    COALESCE(SUM(CASE WHEN ri.is_currency = 0 THEN t.emerald_cost_total ELSE 0 END), 0) AS daily_sink,
+                    COALESCE(SUM(CASE WHEN ri.is_currency = 1 AND i1.is_currency = 0 THEN t.result_amount * t.trade_count * ri.emerald_value ELSE 0 END), 0) AS daily_faucet
+                FROM trades t
+                JOIN items ri ON ri.id = t.result_item_id
+                LEFT JOIN items i1 ON i1.id = t.item1_id
+                WHERE t.shop_type = 'admin'
+                  AND t.trade_date >= date('now', ?)
+                GROUP BY t.trade_date
+                ORDER BY t.trade_date DESC
+            """
+            daily_data = await self.db.fetchall(daily_query, ("-14 days",))
 
-                # Build embed
-                embed = discord.Embed(
-                    title="Economy Analysis -- Admin Shops",
-                    color=self.embed_color,
-                )
+            # Build embed
+            embed = discord.Embed(
+                title="Economy Analysis -- Admin Shops",
+                color=self.embed_color,
+            )
 
-                # Flow indicators
-                if net_flow < 0:
-                    flow_indicator = "Net Sink (Healthy)"
-                elif net_flow > 0:
-                    flow_indicator = "Net Faucet (Inflation)"
-                else:
-                    flow_indicator = "Balanced"
+            # Flow indicators
+            if net_flow < 0:
+                flow_indicator = "Net Sink (Healthy)"
+            elif net_flow > 0:
+                flow_indicator = "Net Faucet (Inflation)"
+            else:
+                flow_indicator = "Balanced"
 
+            embed.add_field(
+                name="Currency Sunk",
+                value=f"{format_price(total_sunk)}\n({sink_trades:,} trades)",
+                inline=True,
+            )
+            embed.add_field(
+                name="Currency Fauceted",
+                value=f"{format_price(total_fauceted)}\n({faucet_trades:,} trades)",
+                inline=True,
+            )
+            embed.add_field(
+                name="Net Flow",
+                value=f"{format_price(abs(net_flow))}\n{flow_indicator}",
+                inline=True,
+            )
+
+            # Top sinks
+            if top_sinks:
+                sink_lines = []
+                for dname, sname, cost, vol, tc in top_sinks[:5]:
+                    name = format_item_name(dname, sname)
+                    sink_lines.append(f"* {name}: {format_price(cost)}")
                 embed.add_field(
-                    name="Currency Sunk",
-                    value=f"{format_price(total_sunk)}\n({sink_trades:,} trades)",
+                    name="Top Sinks (Players Buy)",
+                    value=truncate_for_embed_field("\n".join(sink_lines)),
                     inline=True,
                 )
+
+            # Top faucets
+            if top_faucets:
+                faucet_lines = []
+                for dname, sname, earned, vol, tc in top_faucets[:5]:
+                    name = format_item_name(dname, sname)
+                    faucet_lines.append(f"* {name}: {format_price(earned)}")
                 embed.add_field(
-                    name="Currency Fauceted",
-                    value=f"{format_price(total_fauceted)}\n({faucet_trades:,} trades)",
+                    name="Top Faucets (Players Sell)",
+                    value=truncate_for_embed_field("\n".join(faucet_lines)),
                     inline=True,
                 )
+
+            # Daily trend
+            if daily_data:
+                trend_lines = []
+                for date, daily_sink, daily_faucet in daily_data[:7]:
+                    date_short = date[5:]  # MM-DD
+                    net = daily_faucet - daily_sink
+                    arrow = "v" if net < 0 else "^" if net > 0 else "="
+                    trend_lines.append(
+                        f"`{date_short}` {arrow} S:{format_price(daily_sink)} F:{format_price(daily_faucet)}"
+                    )
                 embed.add_field(
-                    name="Net Flow",
-                    value=f"{format_price(abs(net_flow))}\n{flow_indicator}",
-                    inline=True,
+                    name="Daily Trend (Last 7 Days)",
+                    value=truncate_for_embed_field("\n".join(trend_lines)),
+                    inline=False,
                 )
 
-                # Top sinks
-                if top_sinks:
-                    sink_lines = []
-                    for dname, sname, cost, vol, tc in top_sinks[:5]:
-                        name = format_item_name(dname, sname)
-                        sink_lines.append(f"* {name}: {format_price(cost)}")
-                    embed.add_field(
-                        name="Top Sinks (Players Buy)",
-                        value=truncate_for_embed_field("\n".join(sink_lines)),
-                        inline=True,
-                    )
-
-                # Top faucets
-                if top_faucets:
-                    faucet_lines = []
-                    for dname, sname, earned, vol, tc in top_faucets[:5]:
-                        name = format_item_name(dname, sname)
-                        faucet_lines.append(f"* {name}: {format_price(earned)}")
-                    embed.add_field(
-                        name="Top Faucets (Players Sell)",
-                        value=truncate_for_embed_field("\n".join(faucet_lines)),
-                        inline=True,
-                    )
-
-                # Daily trend
-                if daily_data:
-                    trend_lines = []
-                    for date, daily_sink, daily_faucet in daily_data[:7]:
-                        date_short = date[5:]  # MM-DD
-                        net = daily_faucet - daily_sink
-                        arrow = "v" if net < 0 else "^" if net > 0 else "="
-                        trend_lines.append(
-                            f"`{date_short}` {arrow} S:{format_price(daily_sink)} F:{format_price(daily_faucet)}"
-                        )
-                    embed.add_field(
-                        name="Daily Trend (Last 7 Days)",
-                        value=truncate_for_embed_field("\n".join(trend_lines)),
-                        inline=False,
-                    )
-
-                embed.set_footer(text=f"Period: {period_label} | S=Sink, F=Faucet")
-                await interaction.followup.send(embed=embed, ephemeral=True)
+            embed.set_footer(text=f"Period: {period_label} | S=Sink, F=Faucet")
+            await interaction.followup.send(embed=embed, ephemeral=True)
 
         except Exception as e:
             self.log.error(f"Error in /economy command: {e}", exc_info=True)
@@ -1228,59 +1210,58 @@ class Shopkeepers(OakBranch):
         await interaction.response.defer(ephemeral=True)
 
         try:
-            async with aiosqlite.connect(self.db_path) as db:
-                if period > 0:
-                    date_clause = "AND t.trade_date >= date('now', ?)"
-                    date_params = (f"-{period} days",)
-                    period_label = f"Last {period} days"
-                else:
-                    date_clause = ""
-                    date_params = ()
-                    period_label = "All time"
+            if period > 0:
+                date_clause = "AND t.trade_date >= date('now', ?)"
+                date_params = (f"-{period} days",)
+                period_label = f"Last {period} days"
+            else:
+                date_clause = ""
+                date_params = ()
+                period_label = "All time"
 
-                query = f"""
-                    SELECT i.display_name, i.search_name, i.item_key,
-                           SUM(t.emerald_cost_total) AS total_cost,
-                           SUM(t.result_amount * t.trade_count) AS total_volume,
-                           COUNT(*) AS trade_count,
-                           AVG(t.emerald_cost_per_unit) AS avg_price
-                    FROM trades t
-                    JOIN items i ON i.id = t.result_item_id
-                    WHERE t.shop_type = 'admin'
-                      AND t.emerald_cost_total IS NOT NULL
-                      AND i.is_currency = 0
-                      {date_clause}
-                    GROUP BY t.result_item_id
-                    ORDER BY total_cost DESC
-                    LIMIT 30
-                """
-                rows = await db.execute_fetchall(query, date_params)
+            query = f"""
+                SELECT i.display_name, i.search_name, i.item_key,
+                       SUM(t.emerald_cost_total) AS total_cost,
+                       SUM(t.result_amount * t.trade_count) AS total_volume,
+                       COUNT(*) AS trade_count,
+                       AVG(t.emerald_cost_per_unit) AS avg_price
+                FROM trades t
+                JOIN items i ON i.id = t.result_item_id
+                WHERE t.shop_type = 'admin'
+                  AND t.emerald_cost_total IS NOT NULL
+                  AND i.is_currency = 0
+                  {date_clause}
+                GROUP BY t.result_item_id
+                ORDER BY total_cost DESC
+                LIMIT 30
+            """
+            rows = await self.db.fetchall(query, date_params)
 
-                if not rows:
-                    await interaction.followup.send(
-                        f"No sink data found for {period_label.lower()}.", ephemeral=True
-                    )
-                    return
-
-                total_sunk = sum(row[3] for row in rows)
-
-                def _fmt_sink(i, row):
-                    dname, sname, ikey, cost, vol, tc, avg = row
-                    name = format_item_name(dname, sname)
-                    pct = (cost / total_sunk * 100) if total_sunk > 0 else 0
-                    source = f" `{ikey}`" if not ikey.startswith("minecraft:") or ikey.count(":") > 1 else ""
-                    return (
-                        f"**{i}.** {name}{source}\n"
-                        f"   {format_price(cost)} ({pct:.1f}%) | "
-                        f"{int(vol):,} items | {tc:,} trades"
-                    )
-
-                pages = self._build_pages(
-                    rows, self.top_entries,
-                    "Economy Sinks -- Admin Shops", _fmt_sink,
-                    footer_extra=f"{period_label} | Total: {format_price(total_sunk)}",
+            if not rows:
+                await interaction.followup.send(
+                    f"No sink data found for {period_label.lower()}.", ephemeral=True
                 )
-                await self._send_paginated(interaction, pages)
+                return
+
+            total_sunk = sum(row[3] for row in rows)
+
+            def _fmt_sink(i, row):
+                dname, sname, ikey, cost, vol, tc, avg = row
+                name = format_item_name(dname, sname)
+                pct = (cost / total_sunk * 100) if total_sunk > 0 else 0
+                source = f" `{ikey}`" if not ikey.startswith("minecraft:") or ikey.count(":") > 1 else ""
+                return (
+                    f"**{i}.** {name}{source}\n"
+                    f"   {format_price(cost)} ({pct:.1f}%) | "
+                    f"{int(vol):,} items | {tc:,} trades"
+                )
+
+            pages = self._build_pages(
+                rows, self.top_entries,
+                "Economy Sinks -- Admin Shops", _fmt_sink,
+                footer_extra=f"{period_label} | Total: {format_price(total_sunk)}",
+            )
+            await self._send_paginated(interaction, pages)
 
         except Exception as e:
             self.log.error(f"Error in /sinks command: {e}", exc_info=True)
@@ -1309,61 +1290,60 @@ class Shopkeepers(OakBranch):
         await interaction.response.defer(ephemeral=True)
 
         try:
-            async with aiosqlite.connect(self.db_path) as db:
-                if period > 0:
-                    date_clause = "AND t.trade_date >= date('now', ?)"
-                    date_params = (f"-{period} days",)
-                    period_label = f"Last {period} days"
-                else:
-                    date_clause = ""
-                    date_params = ()
-                    period_label = "All time"
+            if period > 0:
+                date_clause = "AND t.trade_date >= date('now', ?)"
+                date_params = (f"-{period} days",)
+                period_label = f"Last {period} days"
+            else:
+                date_clause = ""
+                date_params = ()
+                period_label = "All time"
 
-                query = f"""
-                    SELECT i.display_name, i.search_name, i.item_key,
-                           SUM(t.result_amount * t.trade_count * ri.emerald_value) AS total_earned,
-                           SUM(t.item1_amount * t.trade_count) AS total_volume,
-                           COUNT(*) AS trade_count,
-                           AVG(t.result_amount * ri.emerald_value / NULLIF(t.item1_amount, 0)) AS avg_price_per_item
-                    FROM trades t
-                    JOIN items i ON i.id = t.item1_id
-                    JOIN items ri ON ri.id = t.result_item_id
-                    WHERE t.shop_type = 'admin'
-                      AND ri.is_currency = 1
-                      AND i.is_currency = 0
-                      {date_clause}
-                    GROUP BY t.item1_id
-                    ORDER BY total_earned DESC
-                    LIMIT 30
-                """
-                rows = await db.execute_fetchall(query, date_params)
+            query = f"""
+                SELECT i.display_name, i.search_name, i.item_key,
+                       SUM(t.result_amount * t.trade_count * ri.emerald_value) AS total_earned,
+                       SUM(t.item1_amount * t.trade_count) AS total_volume,
+                       COUNT(*) AS trade_count,
+                       AVG(t.result_amount * ri.emerald_value / NULLIF(t.item1_amount, 0)) AS avg_price_per_item
+                FROM trades t
+                JOIN items i ON i.id = t.item1_id
+                JOIN items ri ON ri.id = t.result_item_id
+                WHERE t.shop_type = 'admin'
+                  AND ri.is_currency = 1
+                  AND i.is_currency = 0
+                  {date_clause}
+                GROUP BY t.item1_id
+                ORDER BY total_earned DESC
+                LIMIT 30
+            """
+            rows = await self.db.fetchall(query, date_params)
 
-                if not rows:
-                    await interaction.followup.send(
-                        f"No faucet data found for {period_label.lower()}.", ephemeral=True
-                    )
-                    return
-
-                total_fauceted = sum(row[3] for row in rows if row[3])
-
-                def _fmt_faucet(i, row):
-                    dname, sname, ikey, earned, vol, tc, avg = row
-                    name = format_item_name(dname, sname)
-                    earned = earned or 0
-                    pct = (earned / total_fauceted * 100) if total_fauceted > 0 else 0
-                    source = f" `{ikey}`" if not ikey.startswith("minecraft:") or ikey.count(":") > 1 else ""
-                    return (
-                        f"**{i}.** {name}{source}\n"
-                        f"   {format_price(earned)} ({pct:.1f}%) | "
-                        f"{int(vol):,} items | {tc:,} trades"
-                    )
-
-                pages = self._build_pages(
-                    rows, self.top_entries,
-                    "Economy Faucets -- Admin Shops", _fmt_faucet,
-                    footer_extra=f"{period_label} | Total: {format_price(total_fauceted)}",
+            if not rows:
+                await interaction.followup.send(
+                    f"No faucet data found for {period_label.lower()}.", ephemeral=True
                 )
-                await self._send_paginated(interaction, pages)
+                return
+
+            total_fauceted = sum(row[3] for row in rows if row[3])
+
+            def _fmt_faucet(i, row):
+                dname, sname, ikey, earned, vol, tc, avg = row
+                name = format_item_name(dname, sname)
+                earned = earned or 0
+                pct = (earned / total_fauceted * 100) if total_fauceted > 0 else 0
+                source = f" `{ikey}`" if not ikey.startswith("minecraft:") or ikey.count(":") > 1 else ""
+                return (
+                    f"**{i}.** {name}{source}\n"
+                    f"   {format_price(earned)} ({pct:.1f}%) | "
+                    f"{int(vol):,} items | {tc:,} trades"
+                )
+
+            pages = self._build_pages(
+                rows, self.top_entries,
+                "Economy Faucets -- Admin Shops", _fmt_faucet,
+                footer_extra=f"{period_label} | Total: {format_price(total_fauceted)}",
+            )
+            await self._send_paginated(interaction, pages)
 
         except Exception as e:
             self.log.error(f"Error in /faucets command: {e}", exc_info=True)
@@ -1400,77 +1380,76 @@ class Shopkeepers(OakBranch):
         await interaction.response.defer(ephemeral=not public)
 
         try:
-            async with aiosqlite.connect(self.db_path) as db:
-                # Compare average price in recent period vs previous period
-                # Recent: last N days, Previous: N days before that
-                half_period = period // 2
+            # Compare average price in recent period vs previous period
+            # Recent: last N days, Previous: N days before that
+            half_period = period // 2
 
-                query = """
-                    WITH recent AS (
-                        SELECT item_id, AVG(avg_price) AS recent_avg, SUM(trade_count) AS recent_trades
-                        FROM price_summary
-                        WHERE trade_date >= date('now', ?)
-                        GROUP BY item_id
-                        HAVING recent_trades >= 3
-                    ),
-                    previous AS (
-                        SELECT item_id, AVG(avg_price) AS prev_avg
-                        FROM price_summary
-                        WHERE trade_date >= date('now', ?) AND trade_date < date('now', ?)
-                        GROUP BY item_id
-                    )
-                    SELECT i.display_name, i.search_name, i.item_key,
-                           r.recent_avg, p.prev_avg,
-                           r.recent_trades,
-                           ((r.recent_avg - p.prev_avg) / p.prev_avg) * 100 AS pct_change
-                    FROM recent r
-                    JOIN previous p ON r.item_id = p.item_id
-                    JOIN items i ON i.id = r.item_id
-                    WHERE i.is_currency = 0 AND p.prev_avg > 0
-                """
+            query = """
+                WITH recent AS (
+                    SELECT item_id, AVG(avg_price) AS recent_avg, SUM(trade_count) AS recent_trades
+                    FROM price_summary
+                    WHERE trade_date >= date('now', ?)
+                    GROUP BY item_id
+                    HAVING recent_trades >= 3
+                ),
+                previous AS (
+                    SELECT item_id, AVG(avg_price) AS prev_avg
+                    FROM price_summary
+                    WHERE trade_date >= date('now', ?) AND trade_date < date('now', ?)
+                    GROUP BY item_id
+                )
+                SELECT i.display_name, i.search_name, i.item_key,
+                       r.recent_avg, p.prev_avg,
+                       r.recent_trades,
+                       ((r.recent_avg - p.prev_avg) / p.prev_avg) * 100 AS pct_change
+                FROM recent r
+                JOIN previous p ON r.item_id = p.item_id
+                JOIN items i ON i.id = r.item_id
+                WHERE i.is_currency = 0 AND p.prev_avg > 0
+            """
 
-                if direction == "up":
-                    query += " AND pct_change > 0 ORDER BY pct_change DESC LIMIT 20"
-                elif direction == "down":
-                    query += " AND pct_change < 0 ORDER BY pct_change ASC LIMIT 20"
-                else:
-                    query += " ORDER BY ABS(pct_change) DESC LIMIT 20"
+            if direction == "up":
+                query += " AND pct_change > 0 ORDER BY pct_change DESC LIMIT 20"
+            elif direction == "down":
+                query += " AND pct_change < 0 ORDER BY pct_change ASC LIMIT 20"
+            else:
+                query += " ORDER BY ABS(pct_change) DESC LIMIT 20"
 
-                rows = await db.execute_fetchall(
-                    query,
-                    (f"-{half_period} days", f"-{period} days", f"-{half_period} days"),
+            rows = await self.db.fetchall(
+                query,
+                (f"-{half_period} days", f"-{period} days", f"-{half_period} days"),
+            )
+
+            if not rows:
+                await interaction.followup.send(
+                    f"Not enough price data to calculate trends for the last {period} days.",
+                    ephemeral=True,
+                )
+                return
+
+            direction_labels = {
+                "both": "Biggest Changes",
+                "up": "Rising Prices",
+                "down": "Falling Prices",
+            }
+
+            def _fmt_trend(i, row):
+                dname, sname, ikey, recent, prev, trades, pct = row
+                name = format_item_name(dname, sname)
+                arrow = "^" if pct > 0 else "v"
+                sign = "+" if pct > 0 else ""
+                return (
+                    f"**{i}.** {arrow} {name}\n"
+                    f"   {format_price(prev)} -> {format_price(recent)} ({sign}{pct:.1f}%)"
                 )
 
-                if not rows:
-                    await interaction.followup.send(
-                        f"Not enough price data to calculate trends for the last {period} days.",
-                        ephemeral=True,
-                    )
-                    return
-
-                direction_labels = {
-                    "both": "Biggest Changes",
-                    "up": "Rising Prices",
-                    "down": "Falling Prices",
-                }
-
-                def _fmt_trend(i, row):
-                    dname, sname, ikey, recent, prev, trades, pct = row
-                    name = format_item_name(dname, sname)
-                    arrow = "^" if pct > 0 else "v"
-                    sign = "+" if pct > 0 else ""
-                    return (
-                        f"**{i}.** {arrow} {name}\n"
-                        f"   {format_price(prev)} -> {format_price(recent)} ({sign}{pct:.1f}%)"
-                    )
-
-                pages = self._build_pages(
-                    rows, self.top_entries,
-                    f"Trending Items -- {direction_labels.get(direction)}",
-                    _fmt_trend,
-                    footer_extra=f"Last {period} days",
-                )
-                await self._send_paginated(interaction, pages, ephemeral=not public)
+            pages = self._build_pages(
+                rows, self.top_entries,
+                f"Trending Items -- {direction_labels.get(direction)}",
+                _fmt_trend,
+                footer_extra=f"Last {period} days",
+            )
+            await self._send_paginated(interaction, pages, ephemeral=not public)
 
         except Exception as e:
             self.log.error(f"Error in /trending command: {e}", exc_info=True)
@@ -1492,41 +1471,40 @@ class Shopkeepers(OakBranch):
         await interaction.response.defer(ephemeral=not public)
 
         try:
-            async with aiosqlite.connect(self.db_path) as db:
-                max_rows = self.top_entries * 3
-                order_map = {"revenue": "revenue DESC", "customers": "customers DESC", "trades": "trade_count DESC"}
-                extra_where = "AND t.emerald_cost_total IS NOT NULL" if sort_by == "revenue" else ""
+            max_rows = self.top_entries * 3
+            order_map = {"revenue": "revenue DESC", "customers": "customers DESC", "trades": "trade_count DESC"}
+            extra_where = "AND t.emerald_cost_total IS NOT NULL" if sort_by == "revenue" else ""
 
-                query = f"""
-                    SELECT t.shop_owner_uuid,
-                           p.last_name,
-                           SUM(t.emerald_cost_total) AS revenue,
-                           COUNT(*) AS trade_count,
-                           COUNT(DISTINCT t.player_uuid) AS customers
-                    FROM trades t
-                    LEFT JOIN players p ON p.uuid = t.shop_owner_uuid
-                    WHERE t.shop_owner_uuid IS NOT NULL {extra_where}
-                    GROUP BY t.shop_owner_uuid
-                    ORDER BY {order_map.get(sort_by, "trade_count DESC")}
-                    LIMIT ?
-                """
-                rows = await db.execute_fetchall(query, (max_rows,))
+            query = f"""
+                SELECT t.shop_owner_uuid,
+                       p.last_name,
+                       SUM(t.emerald_cost_total) AS revenue,
+                       COUNT(*) AS trade_count,
+                       COUNT(DISTINCT t.player_uuid) AS customers
+                FROM trades t
+                LEFT JOIN players p ON p.uuid = t.shop_owner_uuid
+                WHERE t.shop_owner_uuid IS NOT NULL {extra_where}
+                GROUP BY t.shop_owner_uuid
+                ORDER BY {order_map.get(sort_by, "trade_count DESC")}
+                LIMIT ?
+            """
+            rows = await self.db.fetchall(query, (max_rows,))
 
-                if not rows:
-                    await interaction.followup.send("No shop owner data available yet.", ephemeral=True)
-                    return
+            if not rows:
+                await interaction.followup.send("No shop owner data available yet.", ephemeral=True)
+                return
 
-                sort_labels = {"revenue": "Top Revenue", "trades": "Most Trades", "customers": "Most Customers"}
-                pages = self._build_pages(
-                    rows, self.top_entries,
-                    f"Shop Leaderboard -- {sort_labels.get(sort_by)}",
-                    lambda i, row: (
-                        f"**{i}.** {row[1] if row[1] else row[0][:8] + '...'}\n"
-                        f"   {format_price(row[2]) if row[2] else 'N/A'} | "
-                        f"{row[3]:,} trades | {row[4]:,} customers"
-                    ),
-                )
-                await self._send_paginated(interaction, pages, ephemeral=not public)
+            sort_labels = {"revenue": "Top Revenue", "trades": "Most Trades", "customers": "Most Customers"}
+            pages = self._build_pages(
+                rows, self.top_entries,
+                f"Shop Leaderboard -- {sort_labels.get(sort_by)}",
+                lambda i, row: (
+                    f"**{i}.** {row[1] if row[1] else row[0][:8] + '...'}\n"
+                    f"   {format_price(row[2]) if row[2] else 'N/A'} | "
+                    f"{row[3]:,} trades | {row[4]:,} customers"
+                ),
+            )
+            await self._send_paginated(interaction, pages, ephemeral=not public)
 
         except Exception as e:
             self.log.error(f"Error in /shops command: {e}", exc_info=True)
@@ -1548,41 +1526,40 @@ class Shopkeepers(OakBranch):
         await interaction.response.defer(ephemeral=not public)
 
         try:
-            async with aiosqlite.connect(self.db_path) as db:
-                max_rows = self.top_entries * 3
-                order_map = {"spending": "spending DESC", "items": "unique_items DESC", "trades": "trade_count DESC"}
-                extra_where = "WHERE t.emerald_cost_total IS NOT NULL" if sort_by == "spending" else ""
+            max_rows = self.top_entries * 3
+            order_map = {"spending": "spending DESC", "items": "unique_items DESC", "trades": "trade_count DESC"}
+            extra_where = "WHERE t.emerald_cost_total IS NOT NULL" if sort_by == "spending" else ""
 
-                query = f"""
-                    SELECT t.player_uuid,
-                           p.last_name,
-                           SUM(t.emerald_cost_total) AS spending,
-                           COUNT(*) AS trade_count,
-                           COUNT(DISTINCT t.result_item_id) AS unique_items
-                    FROM trades t
-                    LEFT JOIN players p ON p.uuid = t.player_uuid
-                    {extra_where}
-                    GROUP BY t.player_uuid
-                    ORDER BY {order_map.get(sort_by, "trade_count DESC")}
-                    LIMIT ?
-                """
-                rows = await db.execute_fetchall(query, (max_rows,))
+            query = f"""
+                SELECT t.player_uuid,
+                       p.last_name,
+                       SUM(t.emerald_cost_total) AS spending,
+                       COUNT(*) AS trade_count,
+                       COUNT(DISTINCT t.result_item_id) AS unique_items
+                FROM trades t
+                LEFT JOIN players p ON p.uuid = t.player_uuid
+                {extra_where}
+                GROUP BY t.player_uuid
+                ORDER BY {order_map.get(sort_by, "trade_count DESC")}
+                LIMIT ?
+            """
+            rows = await self.db.fetchall(query, (max_rows,))
 
-                if not rows:
-                    await interaction.followup.send("No player data available yet.", ephemeral=True)
-                    return
+            if not rows:
+                await interaction.followup.send("No player data available yet.", ephemeral=True)
+                return
 
-                sort_labels = {"spending": "Top Spenders", "trades": "Most Trades", "items": "Most Unique Items"}
-                pages = self._build_pages(
-                    rows, self.top_entries,
-                    f"Player Leaderboard -- {sort_labels.get(sort_by)}",
-                    lambda i, row: (
-                        f"**{i}.** {row[1] if row[1] else row[0][:8] + '...'}\n"
-                        f"   {format_price(row[2]) if row[2] else 'N/A'} | "
-                        f"{row[3]:,} trades | {row[4]:,} items"
-                    ),
-                )
-                await self._send_paginated(interaction, pages, ephemeral=not public)
+            sort_labels = {"spending": "Top Spenders", "trades": "Most Trades", "items": "Most Unique Items"}
+            pages = self._build_pages(
+                rows, self.top_entries,
+                f"Player Leaderboard -- {sort_labels.get(sort_by)}",
+                lambda i, row: (
+                    f"**{i}.** {row[1] if row[1] else row[0][:8] + '...'}\n"
+                    f"   {format_price(row[2]) if row[2] else 'N/A'} | "
+                    f"{row[3]:,} trades | {row[4]:,} items"
+                ),
+            )
+            await self._send_paginated(interaction, pages, ephemeral=not public)
 
         except Exception as e:
             self.log.error(f"Error in /players command: {e}", exc_info=True)

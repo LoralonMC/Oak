@@ -45,6 +45,7 @@ branches/shopkeepers/csv_data/
 # Configuration files with secrets
 db_config.ini
 config.ini
+branches/*/config.yml
 
 # IDE
 .vscode/

@@ -133,22 +133,44 @@ min_len = self.setting("validation", "min_length", default=10)
 
 Always provide a `default=` so the branch works even if the key is missing.
 
-### Fresh config reads in views and tasks
+### Accessing config from views, modals, and handlers
 
-`self.config` is set once at load time. If you need to re-read config from separate files (views, helpers, tasks that run outside the branch class), define a helper function:
+Views, modals, and handler functions don't have access to the branch instance. Use the **module-level configure pattern** to share the database and config references:
 
 ```python
-# helpers.py
-from pathlib import Path
-import yaml
+# views.py
+_db = None
+_config: dict = {}
 
-def get_branch_config() -> dict:
-    config_path = Path(__file__).parent / "config.yml"
-    with open(config_path) as f:
-        return yaml.safe_load(f) or {}
+def configure(db, config: dict) -> None:
+    """Called from on_enable() to set module-level refs."""
+    global _db, _config
+    _db = db
+    _config = config
 ```
 
-Use this sparingly — in most cases, passing values from the branch class is cleaner.
+Call it in your branch's `on_enable`:
+
+```python
+from .views import configure as configure_views
+
+async def on_enable(self) -> None:
+    if self.db:
+        await self.db.initialize(SCHEMA)
+    configure_views(self.db, self.config)
+```
+
+Then in views, modals, or handlers, import at function scope to get the current values:
+
+```python
+# handlers.py
+async def handle_vote(interaction):
+    from .views import _db, _config
+    row = await _db.fetchone("SELECT ...", (interaction.message.id,))
+    manager_roles = _config.get("settings", {}).get("manager_role_ids", [])
+```
+
+Function-level imports work because Python re-reads the module attribute each call, so they always see the latest value set by `configure()`.
 
 ## 4. Branch Lifecycle
 
@@ -296,19 +318,19 @@ async def on_enable(self) -> None:
 
 Each migration runs once — the framework tracks applied migrations in an `_oak_migrations` table. Migration names must be unique.
 
-### Advanced: raw connection access
+### Transactions
 
-For multi-statement transactions, use the raw connection with the write lock:
+For multiple writes that must succeed or fail together, use `transaction()`:
 
 ```python
-conn = self.db.connect()
-async with self.db.write_lock:
+async with self.db.transaction() as conn:
     await conn.execute("UPDATE polls SET closed_at = ? WHERE id = ?", (now, poll_id))
     await conn.execute("DELETE FROM poll_votes WHERE poll_id = ?", (poll_id,))
-    await conn.commit()
 ```
 
-Use this when you need multiple writes in a single transaction. The convenience methods (`execute`, `fetchone`, `fetchall`) are preferred for single operations.
+The context manager acquires the write lock, issues `BEGIN IMMEDIATE`, and commits on success or rolls back on error. Keep Discord API calls **outside** the transaction to avoid holding the lock during slow network operations.
+
+For read-only access to the raw `aiosqlite.Connection` (e.g. for type annotations or helpers that receive it), use `self.db.raw_connection()`.
 
 ## 6. Slash Commands
 

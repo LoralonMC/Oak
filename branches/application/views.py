@@ -5,13 +5,29 @@ Handles all view components (buttons, etc.) for the application system.
 
 import discord
 from discord.ui import View, button
-import aiosqlite
 import json
 import asyncio
 import logging
-from .helpers import get_embed_colors
+from .helpers import get_embed_colors, is_staff, get_application_questions, paginate_application_embed
 
 logger = logging.getLogger(__name__)
+
+# ── Module-level state (set by configure()) ──────────────────────────
+_db = None
+_config: dict = {}
+
+
+def configure(db, config: dict) -> None:
+    """Set module-level database and config references.
+
+    Called from Application.on_enable() so that persistent views
+    (which have no reference to the branch instance) can access
+    the database and configuration.
+    """
+    global _db, _config
+    _db = db
+    _config = config
+
 
 # Status emoji mapping used across application views
 STATUS_EMOJI = {
@@ -54,7 +70,7 @@ _APP_BUTTON_ID_MAP = {
 class ContinueView(View):
     """View with Continue button for multi-page applications."""
 
-    def __init__(self, step: int = 0, answers: list = None, get_config_func=None, get_questions_func=None, get_db_path_func=None, *, legacy: bool = False):
+    def __init__(self, step: int = 0, answers: list = None, *, legacy: bool = False):
         super().__init__(timeout=None)
         if not legacy:
             for child in self.children:
@@ -62,75 +78,66 @@ class ContinueView(View):
                     child.custom_id = _CONTINUE_ID_MAP[child.custom_id]
         self.step = step
         self.answers = answers if answers is not None else []
-        self.get_config = get_config_func
-        self.get_questions = get_questions_func
-        self.get_db_path = get_db_path_func
 
     @button(label="Continue", style=discord.ButtonStyle.green, custom_id="continue_application")
     async def continue_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         from .modals import ApplicationModal
-        from .helpers import get_application_config, get_application_questions, get_db_path
-
-        # Post-restart recovery: callback functions may be None after bot restart
-        config_func = self.get_config if self.get_config else get_application_config
-        questions_func = self.get_questions if self.get_questions else get_application_questions
-        db_path_func = self.get_db_path if self.get_db_path else get_db_path
 
         step = self.step
         answers = self.answers
 
-        # If answers are empty (lost after restart), recover partial answers from DB
-        if not answers and db_path_func:
+        # Post-restart recovery: answers may be empty after bot restart
+        if not answers and _db:
             try:
-                async with aiosqlite.connect(db_path_func()) as db:
-                    async with db.execute(
-                        "SELECT answers FROM applications WHERE channel_id = ?",
-                        (interaction.channel.id,)
-                    ) as cursor:
-                        row = await cursor.fetchone()
-                    if row and row[0]:
-                        answers = json.loads(row[0])
-                        # Calculate which modal step to resume from
-                        questions_per_page = 5
-                        step = len(answers) // questions_per_page
-                        logger.info(f"Recovered {len(answers)} partial answers from DB, resuming at step {step}")
+                row = await _db.fetchone(
+                    "SELECT answers FROM applications WHERE channel_id = ?",
+                    (interaction.channel.id,)
+                )
+                if row and row[0]:
+                    answers = json.loads(row[0])
+                    questions_per_page = 5
+                    step = len(answers) // questions_per_page
+                    logger.info(f"Recovered {len(answers)} partial answers from DB, resuming at step {step}")
             except Exception as e:
                 logger.error(f"Failed to recover partial answers from DB: {e}")
 
         await interaction.response.send_modal(
-            ApplicationModal(
-                step=step,
-                answers=answers,
-                get_config_func=config_func,
-                get_questions_func=questions_func,
-                get_db_path_func=db_path_func
-            )
+            ApplicationModal(step=step, answers=answers)
         )
 
 
 class PostSubmissionView(View):
     """View with Read and Manage buttons for submitted applications."""
 
-    def __init__(self, get_db_path_func=None, *, legacy: bool = False):
+    def __init__(self, *, legacy: bool = False):
         super().__init__(timeout=None)
         if not legacy:
             for child in self.children:
                 if hasattr(child, 'custom_id') and child.custom_id in _POST_SUBMISSION_ID_MAP:
                     child.custom_id = _POST_SUBMISSION_ID_MAP[child.custom_id]
-        self.get_db_path = get_db_path_func
 
     @button(label="Read", style=discord.ButtonStyle.gray, custom_id="admin_read")
     async def read(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Read button - displays application answers."""
-        from .helpers import paginate_application_embed, get_application_questions
+        colors = get_embed_colors(_config)
+        reviewer_role_ids = _config.get("settings", {}).get("reviewer_role_ids", [])
+
+        # C1: Staff permission check for read button
+        if not is_staff(interaction.user, reviewer_role_ids):
+            await interaction.response.send_message(
+                embed=discord.Embed(
+                    description="❌ You don't have permission to read applications.",
+                    color=colors["error"]
+                ),
+                ephemeral=True
+            )
+            return
 
         try:
-            async with aiosqlite.connect(self.get_db_path()) as db:
-                async with db.execute(
-                    "SELECT user_id, answers FROM applications WHERE channel_id = ?",
-                    (interaction.channel.id,)
-                ) as cursor:
-                    row = await cursor.fetchone()
+            row = await _db.fetchone(
+                "SELECT user_id, answers FROM applications WHERE channel_id = ?",
+                (interaction.channel.id,)
+            )
 
             if not row:
                 await interaction.response.send_message("No application data found.", ephemeral=True)
@@ -138,16 +145,18 @@ class PostSubmissionView(View):
 
             applicant_id, answers_json = row
             answers = json.loads(answers_json)
-            # get_member may return None if the user left the server
             applicant = interaction.guild.get_member(applicant_id)
+            questions = get_application_questions(_config)
 
-            embeds = paginate_application_embed(applicant, answers, get_application_questions)
+            embeds = paginate_application_embed(applicant, answers, questions, colors)
 
             try:
                 await interaction.response.send_message(embed=embeds[0], ephemeral=True)
             except discord.HTTPException as exc:
                 logger.error(f"Failed to send first embed: {exc}")
-                await interaction.response.send_message("Failed to send application data.", ephemeral=True)
+                # m12: Check if response was consumed before trying again
+                if not interaction.response.is_done():
+                    await interaction.response.send_message("Failed to send application data.", ephemeral=True)
                 return
 
             # If multiple embeds (pagination), send as additional followups
@@ -161,32 +170,34 @@ class PostSubmissionView(View):
         except Exception as e:
             logger.error(f"Error reading application: {e}")
             try:
-                await interaction.response.send_message("An error occurred while reading the application.", ephemeral=True)
+                if not interaction.response.is_done():
+                    await interaction.response.send_message("An error occurred while reading the application.", ephemeral=True)
+                else:
+                    await interaction.followup.send("An error occurred while reading the application.", ephemeral=True)
             except Exception as err:
                 logger.error(f"Failed to send error response: {err}")
 
     @button(label="Manage", style=discord.ButtonStyle.primary, custom_id="admin_manage")
     async def manage(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Manage button - opens management options."""
-        from .helpers import is_staff
+        colors = get_embed_colors(_config)
+        reviewer_role_ids = _config.get("settings", {}).get("reviewer_role_ids", [])
 
         try:
-            async with aiosqlite.connect(self.get_db_path()) as db:
-                async with db.execute(
-                    "SELECT user_id FROM applications WHERE channel_id = ?",
-                    (interaction.channel.id,)
-                ) as cursor:
-                    row = await cursor.fetchone()
+            row = await _db.fetchone(
+                "SELECT user_id FROM applications WHERE channel_id = ?",
+                (interaction.channel.id,)
+            )
 
             if not row:
                 await interaction.response.send_message("No application data found.", ephemeral=True)
                 return
 
-            if not is_staff(interaction.user):
+            if not is_staff(interaction.user, reviewer_role_ids):
                 await interaction.response.send_message(
                     embed=discord.Embed(
                         description="❌ You don't have permission to manage applications.",
-                        color=get_embed_colors()["error"]
+                        color=colors["error"]
                     ),
                     ephemeral=True
                 )
@@ -196,16 +207,19 @@ class PostSubmissionView(View):
                 embed=discord.Embed(
                     title="Manage Application",
                     description="Select an action below.",
-                    color=get_embed_colors()["info"]
+                    color=colors["info"]
                 ),
-                view=ManageView(get_db_path_func=self.get_db_path),
+                view=ManageView(),
                 ephemeral=True
             )
 
         except Exception as e:
             logger.error(f"Error in manage button: {e}")
             try:
-                await interaction.response.send_message("An error occurred.", ephemeral=True)
+                if not interaction.response.is_done():
+                    await interaction.response.send_message("An error occurred.", ephemeral=True)
+                else:
+                    await interaction.followup.send("An error occurred.", ephemeral=True)
             except Exception as err:
                 logger.error(f"Failed to send error response: {err}")
 
@@ -213,25 +227,24 @@ class PostSubmissionView(View):
 class ManageView(View):
     """View with management actions for applications (Accept, Decline, Background Check, etc.)."""
 
-    def __init__(self, get_db_path_func=None, *, legacy: bool = False):
+    def __init__(self, *, legacy: bool = False):
         super().__init__(timeout=None)
         if not legacy:
             for child in self.children:
                 if hasattr(child, 'custom_id') and child.custom_id in _MANAGE_ID_MAP:
                     child.custom_id = _MANAGE_ID_MAP[child.custom_id]
-        self.get_db_path = get_db_path_func
 
     async def _check_staff(self, interaction: discord.Interaction) -> bool:
         """Check if the interacting user has staff permissions.
 
         Returns True if authorized, False otherwise (sends ephemeral denial message).
         """
-        from .helpers import is_staff
-        if not is_staff(interaction.user):
+        reviewer_role_ids = _config.get("settings", {}).get("reviewer_role_ids", [])
+        if not is_staff(interaction.user, reviewer_role_ids):
             await interaction.response.send_message(
                 embed=discord.Embed(
                     description="You do not have permission to manage applications.",
-                    color=get_embed_colors()["error"]
+                    color=get_embed_colors(_config)["error"]
                 ),
                 ephemeral=True
             )
@@ -246,46 +259,44 @@ class ManageView(View):
 
         # Defer first since acceptance involves multiple slow operations
         await interaction.response.defer(ephemeral=True)
+        colors = get_embed_colors(_config)
 
-        async with aiosqlite.connect(self.get_db_path()) as db:
-            async with db.execute(
-                "SELECT user_id, status FROM applications WHERE channel_id = ?",
-                (interaction.channel.id,)
-            ) as cursor:
-                row = await cursor.fetchone()
+        row = await _db.fetchone(
+            "SELECT user_id, status FROM applications WHERE channel_id = ?",
+            (interaction.channel.id,)
+        )
 
-            if not row:
-                await interaction.followup.send("No application data found.", ephemeral=True)
-                return
+        if not row:
+            await interaction.followup.send("No application data found.", ephemeral=True)
+            return
 
-            applicant_id, current_status = row
+        applicant_id, current_status = row
 
-            # Only accept applications that are currently pending
-            if current_status != 'pending':
-                await interaction.followup.send(
-                    embed=discord.Embed(
-                        description=f"Cannot accept: application status is **{current_status}**, expected **pending**.",
-                        color=get_embed_colors()["error"]
-                    ),
-                    ephemeral=True
-                )
-                return
-
-            # Use WHERE status = 'pending' to prevent double-acceptance race condition
-            cursor = await db.execute(
-                "UPDATE applications SET status = 'accepted' WHERE channel_id = ? AND status = 'pending'",
-                (interaction.channel.id,)
+        # Only accept applications that are currently pending
+        if current_status != 'pending':
+            await interaction.followup.send(
+                embed=discord.Embed(
+                    description=f"Cannot accept: application status is **{current_status}**, expected **pending**.",
+                    color=colors["error"]
+                ),
+                ephemeral=True
             )
-            if cursor.rowcount == 0:
-                await interaction.followup.send(
-                    embed=discord.Embed(
-                        description="Application was already processed by another reviewer.",
-                        color=get_embed_colors()["warning"]
-                    ),
-                    ephemeral=True
-                )
-                return
-            await db.commit()
+            return
+
+        # Use WHERE status = 'pending' to prevent double-acceptance race condition
+        cursor = await _db.execute(
+            "UPDATE applications SET status = 'accepted' WHERE channel_id = ? AND status = 'pending'",
+            (interaction.channel.id,)
+        )
+        if cursor.rowcount == 0:
+            await interaction.followup.send(
+                embed=discord.Embed(
+                    description="Application was already processed by another reviewer.",
+                    color=colors["warning"]
+                ),
+                ephemeral=True
+            )
+            return
 
         applicant = interaction.guild.get_member(applicant_id)
         dm_failed = False
@@ -301,7 +312,7 @@ class ManageView(View):
                             "A staff member will reach out to arrange your next steps. Welcome aboard, and thank you for your interest in helping our community!\n\n"
                             "*Please keep an eye on this channel for further instructions.*"
                         ),
-                        color=get_embed_colors()["success"]
+                        color=colors["success"]
                     )
                 )
             except discord.Forbidden:
@@ -312,7 +323,7 @@ class ManageView(View):
             embed=discord.Embed(
                 title="Application Accepted",
                 description=f"<@{applicant_id}>, your application has been accepted!\nA staff member will reach out to arrange your next steps.",
-                color=get_embed_colors()["success"]
+                color=colors["success"]
             )
         )
 
@@ -320,14 +331,14 @@ class ManageView(View):
             await interaction.channel.send(
                 embed=discord.Embed(
                     description=f":warning: I couldn't DM <@{applicant_id}> about their acceptance (DMs closed).",
-                    color=get_embed_colors()["warning"]
+                    color=colors["warning"]
                 )
             )
         else:
             await interaction.channel.send(
                 embed=discord.Embed(
                     description=f"<@{applicant_id}> has been notified via DM.",
-                    color=get_embed_colors()["success"]
+                    color=colors["success"]
                 )
             )
 
@@ -339,16 +350,14 @@ class ManageView(View):
         if not await self._check_staff(interaction):
             return
 
-        from .helpers import get_application_config
-
-        config = get_application_config()
-        accepted_category_id = config.get("settings", {}).get("accepted_category_id", 0)
+        colors = get_embed_colors(_config)
+        accepted_category_id = _config.get("settings", {}).get("accepted_category_id", 0)
 
         if not accepted_category_id:
             await interaction.response.send_message(
                 embed=discord.Embed(
                     description="accepted_category_id is not configured.",
-                    color=get_embed_colors()["error"]
+                    color=colors["error"]
                 ),
                 ephemeral=True
             )
@@ -359,19 +368,17 @@ class ManageView(View):
             await interaction.response.send_message(
                 embed=discord.Embed(
                     description=f"Accepted category (ID: {accepted_category_id}) not found in this server.",
-                    color=get_embed_colors()["error"]
+                    color=colors["error"]
                 ),
                 ephemeral=True
             )
             return
 
         # Verify application status is 'accepted' before moving
-        async with aiosqlite.connect(self.get_db_path()) as db:
-            async with db.execute(
-                "SELECT status FROM applications WHERE channel_id = ?",
-                (interaction.channel.id,)
-            ) as cursor:
-                row = await cursor.fetchone()
+        row = await _db.fetchone(
+            "SELECT status FROM applications WHERE channel_id = ?",
+            (interaction.channel.id,)
+        )
 
         if not row:
             await interaction.response.send_message("No application data found.", ephemeral=True)
@@ -381,7 +388,7 @@ class ManageView(View):
             await interaction.response.send_message(
                 embed=discord.Embed(
                     description=f"Cannot move: application status is **{row[0]}**, expected **accepted**.",
-                    color=get_embed_colors()["error"]
+                    color=colors["error"]
                 ),
                 ephemeral=True
             )
@@ -399,12 +406,10 @@ class ManageView(View):
         from .modals import DeclineReasonModal
 
         # Get applicant_id and check status
-        async with aiosqlite.connect(self.get_db_path()) as db:
-            async with db.execute(
-                "SELECT user_id, status FROM applications WHERE channel_id = ?",
-                (interaction.channel.id,)
-            ) as cursor:
-                row = await cursor.fetchone()
+        row = await _db.fetchone(
+            "SELECT user_id, status FROM applications WHERE channel_id = ?",
+            (interaction.channel.id,)
+        )
 
         if not row:
             await interaction.response.send_message("No application data found.", ephemeral=True)
@@ -417,13 +422,13 @@ class ManageView(View):
             await interaction.response.send_message(
                 embed=discord.Embed(
                     description=f"Cannot decline: application status is **{current_status}**, expected **pending**.",
-                    color=get_embed_colors()["error"]
+                    color=get_embed_colors(_config)["error"]
                 ),
                 ephemeral=True
             )
             return
 
-        await interaction.response.send_modal(DeclineReasonModal(applicant_id, get_db_path_func=self.get_db_path))
+        await interaction.response.send_modal(DeclineReasonModal(applicant_id))
 
     @button(label="Background Check", style=discord.ButtonStyle.secondary, custom_id="admin_bgcheck")
     async def bgcheck(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -432,15 +437,14 @@ class ManageView(View):
             return
 
         from .background_check import fetch_playtime_embed
-        from .helpers import get_application_config
+
+        colors = get_embed_colors(_config)
 
         # Get MC name and applicant_id from DB
-        async with aiosqlite.connect(self.get_db_path()) as db:
-            async with db.execute(
-                "SELECT user_id, answers FROM applications WHERE channel_id = ?",
-                (interaction.channel.id,)
-            ) as cursor:
-                row = await cursor.fetchone()
+        row = await _db.fetchone(
+            "SELECT user_id, answers FROM applications WHERE channel_id = ?",
+            (interaction.channel.id,)
+        )
 
         if not row:
             await interaction.response.send_message("No application data found.", ephemeral=True)
@@ -452,17 +456,16 @@ class ManageView(View):
         mc_name = answers[0] if answers and len(answers) > 0 else None
 
         # Playtime
-        playtime_embed = await fetch_playtime_embed(mc_name) if mc_name else None
+        playtime_embed = await fetch_playtime_embed(mc_name, _config) if mc_name else None
 
         # Punishment history
         embed = discord.Embed(
             title=f"Background Check: {mc_name or 'Unknown'}",
-            color=get_embed_colors()["warning"]
+            color=colors["warning"]
         )
         embed.description = "**Playtime:** (see below)\n"
 
-        config = get_application_config()
-        punishment_forum_id = config.get("settings", {}).get("punishment_forum_channel_id", 0)
+        punishment_forum_id = _config.get("settings", {}).get("punishment_forum_channel_id", 0)
 
         if punishment_forum_id:
             punishment_channel = interaction.guild.get_channel(punishment_forum_id)
@@ -512,14 +515,13 @@ class ManageView(View):
         if not await self._check_staff(interaction):
             return
 
+        colors = get_embed_colors(_config)
 
         # Get current applicant's user_id
-        async with aiosqlite.connect(self.get_db_path()) as db:
-            async with db.execute(
-                "SELECT user_id FROM applications WHERE channel_id = ?",
-                (interaction.channel.id,)
-            ) as cursor:
-                row = await cursor.fetchone()
+        row = await _db.fetchone(
+            "SELECT user_id FROM applications WHERE channel_id = ?",
+            (interaction.channel.id,)
+        )
 
         if not row:
             await interaction.response.send_message("No application data found.", ephemeral=True)
@@ -528,22 +530,20 @@ class ManageView(View):
         applicant_id = row[0]
 
         # Fetch all previous applications for this user (excluding current one)
-        async with aiosqlite.connect(self.get_db_path()) as db:
-            async with db.execute("""
-                SELECT app_index, status, submitted_at, answers, channel_id, denied_at, denial_reason
-                FROM applications
-                WHERE user_id = ? AND channel_id != ?
-                ORDER BY submitted_at DESC
-                LIMIT 10
-            """, (applicant_id, interaction.channel.id)) as cursor:
-                previous_apps = [row async for row in cursor]
+        previous_apps = await _db.fetchall("""
+            SELECT app_index, status, submitted_at, answers, channel_id, denied_at, denial_reason
+            FROM applications
+            WHERE user_id = ? AND channel_id != ?
+            ORDER BY submitted_at DESC
+            LIMIT 10
+        """, (applicant_id, interaction.channel.id))
 
         if not previous_apps:
             await interaction.response.send_message(
                 embed=discord.Embed(
                     title="Application History",
                     description=f"<@{applicant_id}> has no previous applications on record.",
-                    color=get_embed_colors()["info"]
+                    color=colors["info"]
                 ),
                 ephemeral=True
             )
@@ -554,7 +554,7 @@ class ManageView(View):
         summary_embed = discord.Embed(
             title=f"Application History: {applicant.display_name if applicant else 'Unknown User'}",
             description=f"Found **{len(previous_apps)}** previous application(s). Select one below to view full details.",
-            color=get_embed_colors()["info"]
+            color=colors["info"]
         )
 
         if applicant:
@@ -579,7 +579,7 @@ class ManageView(View):
         # Add dropdown to view specific application details
         await interaction.response.send_message(
             embed=summary_embed,
-            view=ApplicationHistoryView(applicant_id, previous_apps, self.get_db_path),
+            view=ApplicationHistoryView(applicant_id, previous_apps),
             ephemeral=True
         )
 
@@ -587,11 +587,10 @@ class ManageView(View):
 class ApplicationHistoryView(View):
     """View with dropdown to select and view previous applications."""
 
-    def __init__(self, applicant_id: int, previous_apps: list, get_db_path_func):
+    def __init__(self, applicant_id: int, previous_apps: list):
         super().__init__(timeout=300)  # 5 minute timeout
         self.applicant_id = applicant_id
         self.previous_apps = previous_apps
-        self.get_db_path = get_db_path_func
 
         # Create dropdown options
         options = []
@@ -621,8 +620,6 @@ class ApplicationHistoryView(View):
 
     async def select_callback(self, interaction: discord.Interaction):
         """Handle dropdown selection."""
-        from .helpers import get_application_questions, paginate_application_embed
-
         selected_app_index = int(self.select_menu.values[0])
 
         # Find the selected application
@@ -642,8 +639,11 @@ class ApplicationHistoryView(View):
         # Get applicant
         applicant = interaction.guild.get_member(self.applicant_id)
 
+        questions = get_application_questions(_config)
+        colors = get_embed_colors(_config)
+
         # Generate paginated embeds
-        embeds = paginate_application_embed(applicant, answers, get_application_questions)
+        embeds = paginate_application_embed(applicant, answers, questions, colors)
 
         # Add header info to first embed
         if embeds:
@@ -663,7 +663,7 @@ class ApplicationHistoryView(View):
         # Send embeds with status change buttons
         await interaction.response.send_message(
             embeds=embeds[:10],  # Discord limit of 10 embeds
-            view=StatusChangeView(app_index, self.get_db_path),
+            view=StatusChangeView(app_index),
             ephemeral=True
         )
 
@@ -671,10 +671,9 @@ class ApplicationHistoryView(View):
 class StatusChangeView(View):
     """View for manually changing application status without notifications."""
 
-    def __init__(self, app_index: int, get_db_path_func):
+    def __init__(self, app_index: int):
         super().__init__(timeout=300)
         self.app_index = app_index
-        self.get_db_path = get_db_path_func
 
     @button(label="Pending", style=discord.ButtonStyle.secondary, emoji="⏳")
     async def set_pending(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -698,35 +697,44 @@ class StatusChangeView(View):
 
     async def _update_status(self, interaction: discord.Interaction, new_status: str):
         """Update application status in database without sending notifications."""
-        from .helpers import is_staff
+        colors = get_embed_colors(_config)
+        reviewer_role_ids = _config.get("settings", {}).get("reviewer_role_ids", [])
 
         # Staff permission check
-        if not is_staff(interaction.user):
+        if not is_staff(interaction.user, reviewer_role_ids):
             await interaction.response.send_message(
                 embed=discord.Embed(
                     description="You do not have permission to change application status.",
-                    color=get_embed_colors()["error"]
+                    color=colors["error"]
                 ),
                 ephemeral=True
             )
             return
 
         try:
-            async with aiosqlite.connect(self.get_db_path()) as db:
-                # Update status for this specific application
-                await db.execute(
-                    "UPDATE applications SET status = ? WHERE app_index = ?",
-                    (new_status, self.app_index)
-                )
-                await db.commit()
+            # C2: Fetch old status for audit logging
+            old_row = await _db.fetchone(
+                "SELECT status FROM applications WHERE app_index = ?",
+                (self.app_index,)
+            )
+            old_status = old_row[0] if old_row else "unknown"
 
-            logger.info(f"Staff {interaction.user} changed app #{self.app_index} status to {new_status}")
+            # Update status for this specific application
+            await _db.execute(
+                "UPDATE applications SET status = ? WHERE app_index = ?",
+                (new_status, self.app_index)
+            )
+
+            logger.info(
+                f"Staff {interaction.user} ({interaction.user.id}) changed app #{self.app_index} "
+                f"status: {old_status} -> {new_status}"
+            )
 
             await interaction.response.send_message(
                 embed=discord.Embed(
                     title="Status Updated",
                     description=f"{STATUS_EMOJI.get(new_status, '')} Application #{self.app_index} status changed to **{new_status.title()}**",
-                    color=get_embed_colors()["success"]
+                    color=colors["success"]
                 ),
                 ephemeral=True
             )
@@ -737,7 +745,7 @@ class StatusChangeView(View):
                 embed=discord.Embed(
                     title="Error",
                     description="Failed to update application status. Please check logs.",
-                    color=get_embed_colors()["error"]
+                    color=colors["error"]
                 ),
                 ephemeral=True
             )
@@ -746,71 +754,63 @@ class StatusChangeView(View):
 class StartCancelView(View):
     """View for starting or cancelling an application."""
 
-    def __init__(self, get_config_func=None, get_questions_func=None, get_db_path_func=None, *, legacy: bool = False):
+    def __init__(self, *, legacy: bool = False):
         super().__init__(timeout=None)
         if not legacy:
             for child in self.children:
                 if hasattr(child, 'custom_id') and child.custom_id in _START_CANCEL_ID_MAP:
                     child.custom_id = _START_CANCEL_ID_MAP[child.custom_id]
-        self.get_config = get_config_func
-        self.get_questions = get_questions_func
-        self.get_db_path = get_db_path_func
 
     @button(label="Start Application", style=discord.ButtonStyle.green, custom_id="start_application")
     async def start(self, interaction: discord.Interaction, button: discord.ui.Button):
         from .modals import ApplicationModal
         await interaction.response.send_modal(
-            ApplicationModal(
-                step=0,
-                answers=[],
-                get_config_func=self.get_config,
-                get_questions_func=self.get_questions,
-                get_db_path_func=self.get_db_path
-            )
+            ApplicationModal(step=0, answers=[])
         )
 
     @button(label="Cancel", style=discord.ButtonStyle.red, custom_id="cancel_application")
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
-        from .helpers import get_db_path as _get_db_path
-        db_path_func = self.get_db_path if self.get_db_path else _get_db_path
+        colors = get_embed_colors(_config)
 
         # Verify the cancelling user is actually the applicant
+        row = await _db.fetchone(
+            "SELECT user_id FROM applications WHERE channel_id = ?",
+            (interaction.channel.id,)
+        )
+
+        if not row:
+            await interaction.response.send_message("No application data found.", ephemeral=True)
+            return
+
+        if row[0] != interaction.user.id:
+            await interaction.response.send_message(
+                embed=discord.Embed(
+                    description="Only the applicant can cancel their own application.",
+                    color=colors["error"]
+                ),
+                ephemeral=True
+            )
+            return
+
+        # Update DB status to cancelled before deleting the channel
         try:
-            async with aiosqlite.connect(db_path_func()) as db:
-                async with db.execute(
-                    "SELECT user_id FROM applications WHERE channel_id = ?",
-                    (interaction.channel.id,)
-                ) as cursor:
-                    row = await cursor.fetchone()
-
-                if not row:
-                    await interaction.response.send_message("No application data found.", ephemeral=True)
-                    return
-
-                if row[0] != interaction.user.id:
-                    await interaction.response.send_message(
-                        embed=discord.Embed(
-                            description="Only the applicant can cancel their own application.",
-                            color=get_embed_colors()["error"]
-                        ),
-                        ephemeral=True
-                    )
-                    return
-
-                # Update DB status to cancelled before deleting the channel
-                await db.execute(
-                    "UPDATE applications SET status = 'cancelled' WHERE channel_id = ?",
-                    (interaction.channel.id,)
-                )
-                await db.commit()
+            await _db.execute(
+                "UPDATE applications SET status = 'cancelled' WHERE channel_id = ?",
+                (interaction.channel.id,)
+            )
         except Exception as e:
             logger.error(f"Error during cancel DB update: {e}")
+            await interaction.response.send_message(
+                "An error occurred while cancelling. Please try again.",
+                ephemeral=True
+            )
+            return  # m11: Don't continue after DB error
 
         await interaction.response.send_message(
             embed=discord.Embed(
                 title="Application Cancelled",
                 description="Your application has been cancelled. This channel will now be deleted.",
-                color=get_embed_colors()["error"]
+                color=colors["error"]
             ),
             ephemeral=True
         )
@@ -824,44 +824,46 @@ class StartCancelView(View):
 class ApplicationButtonView(View):
     """View with the main Apply button."""
 
+    _creating_users: set[int] = set()  # M6: Class-level to share across instances
+
     def __init__(self, handle_application_start_func, *, legacy: bool = False):
         super().__init__(timeout=None)
         if not legacy:
             for child in self.children:
                 if hasattr(child, 'custom_id') and child.custom_id in _APP_BUTTON_ID_MAP:
                     child.custom_id = _APP_BUTTON_ID_MAP[child.custom_id]
-        self._creating_users = set()
         self.handle_application_start = handle_application_start_func
 
     @button(label="Apply for Staff", style=discord.ButtonStyle.green, custom_id="apply_button")
     async def apply(self, interaction: discord.Interaction, button: discord.ui.Button):
         user_id = interaction.user.id
+        colors = get_embed_colors(_config)
 
         # Prevent race condition
-        if user_id in self._creating_users:
+        if user_id in ApplicationButtonView._creating_users:
             await interaction.response.send_message(
                 embed=discord.Embed(
                     title="Application Already in Progress",
                     description="⏳ Your application is already being created. Please wait...",
-                    color=get_embed_colors()["warning"]
+                    color=colors["warning"]
                 ),
                 ephemeral=True
             )
             return
 
         # Mark user as creating an application
-        self._creating_users.add(user_id)
+        ApplicationButtonView._creating_users.add(user_id)
 
         try:
             await interaction.response.send_message(
                 embed=discord.Embed(
                     title="Creating Application Channel",
                     description="⏳ Please wait while your application channel is created...",
-                    color=get_embed_colors()["info"]
+                    color=colors["info"]
                 ),
                 ephemeral=True
             )
             await self.handle_application_start(interaction)
         finally:
             # Always remove user from creating set
-            self._creating_users.discard(user_id)
+            ApplicationButtonView._creating_users.discard(user_id)

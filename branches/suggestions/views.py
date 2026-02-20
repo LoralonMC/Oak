@@ -5,11 +5,22 @@ import logging
 import discord
 from discord import Interaction, ui
 
-import aiosqlite
-
-from .helpers import get_db_path, get_manager_role_ids
-
 logger = logging.getLogger(__name__)
+
+# ── Module-level state (set by configure()) ──────────────────────────
+_db = None
+_config: dict = {}
+
+
+def configure(db, config: dict) -> None:
+    """Set module-level database and config references.
+
+    Called from Suggestions.on_enable() so that persistent views
+    and handlers can access the database and configuration.
+    """
+    global _db, _config
+    _db = db
+    _config = config
 
 
 _SUGGESTIONS_ID_MAP = {
@@ -63,7 +74,7 @@ class ManageSuggestionView(ui.View):
             return False
 
         user_role_ids = [role.id for role in interaction.user.roles]
-        manager_role_ids = get_manager_role_ids()
+        manager_role_ids = _config.get("settings", {}).get("manager_role_ids", [])
 
         if not any(role_id in manager_role_ids for role_id in user_role_ids):
             await interaction.response.send_message("You no longer have permission to manage suggestions.", ephemeral=True)
@@ -97,31 +108,37 @@ class ManageSuggestionView(ui.View):
 
         thread_deleted = False
 
-        async with aiosqlite.connect(get_db_path()) as db:
-            cursor = await db.execute("SELECT thread_id FROM suggestions WHERE message_id = ?", (self.message_id,))
-            row = await cursor.fetchone()
+        # Fetch suggestion info
+        row = await _db.fetchone(
+            "SELECT id, thread_id FROM suggestions WHERE message_id = ?", (self.message_id,)
+        )
 
-            if row:
-                thread_id = row[0]
-                thread_channel = interaction.guild.get_thread(thread_id)
-                if not thread_channel:
-                    try:
-                        thread_channel = await interaction.client.fetch_channel(thread_id)
-                    except (discord.NotFound, discord.HTTPException):
-                        thread_channel = None
+        if row:
+            suggestion_id, thread_id = row
 
-                if thread_channel:
-                    try:
-                        await thread_channel.delete()
-                        thread_deleted = True
-                    except discord.Forbidden:
-                        logger.warning(f"Missing permissions to delete thread {thread_id}")
-                    except discord.HTTPException:
-                        logger.warning(f"Failed to delete thread {thread_id}")
+            # Delete thread if it exists
+            thread_channel = interaction.guild.get_thread(thread_id)
+            if not thread_channel:
+                try:
+                    thread_channel = await interaction.client.fetch_channel(thread_id)
+                except (discord.NotFound, discord.HTTPException):
+                    thread_channel = None
 
-            await db.execute("DELETE FROM suggestions WHERE message_id = ?", (self.message_id,))
-            await db.commit()
+            if thread_channel:
+                try:
+                    await thread_channel.delete()
+                    thread_deleted = True
+                except discord.Forbidden:
+                    logger.warning(f"Missing permissions to delete thread {thread_id}")
+                except discord.HTTPException:
+                    logger.warning(f"Failed to delete thread {thread_id}")
 
+            # M6: Delete votes and suggestion atomically
+            async with _db.transaction() as conn:
+                await conn.execute("DELETE FROM suggestion_votes WHERE suggestion_id = ?", (suggestion_id,))
+                await conn.execute("DELETE FROM suggestions WHERE message_id = ?", (self.message_id,))
+
+        # Delete the Discord message
         try:
             channel = None
             if self.channel_id:

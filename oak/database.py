@@ -7,8 +7,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sqlite3
+import warnings
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import AsyncIterator
 
 import aiosqlite
 
@@ -20,6 +24,19 @@ CREATE TABLE IF NOT EXISTS _oak_migrations (
     applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 )
 """
+
+
+async def _execute_script(conn: aiosqlite.Connection, sql: str) -> None:
+    """Execute a multi-statement SQL script without breaking the transaction.
+
+    Unlike ``executescript()`` which issues an implicit COMMIT first,
+    this splits on ``;`` and runs each statement via ``execute()``,
+    preserving the caller's transaction context.
+    """
+    for statement in sql.split(";"):
+        statement = statement.strip()
+        if statement:
+            await conn.execute(statement)
 
 
 @dataclass
@@ -54,8 +71,8 @@ class BranchDatabase:
         await self._conn.execute("PRAGMA busy_timeout=5000")
         # Create migration tracking table
         await self._conn.execute(_MIGRATIONS_TABLE)
-        # Run the branch's schema
-        await self._conn.executescript(schema)
+        # Run the branch's schema (split manually to avoid implicit COMMIT)
+        await _execute_script(self._conn, schema)
         await self._conn.commit()
         logger.info(f"Database initialized at {self._path}")
 
@@ -81,18 +98,48 @@ class BranchDatabase:
 
                 logger.info(f"Running migration: {migration.name}")
                 try:
-                    await self._conn.executescript(migration.sql)
-                    await self._conn.execute(
-                        "INSERT INTO _oak_migrations (name) VALUES (?)",
-                        (migration.name,),
-                    )
-                    await self._conn.commit()
+                    await _execute_script(self._conn, migration.sql)
+                except sqlite3.OperationalError as e:
+                    if "duplicate column name" in str(e):
+                        # Column already exists (migration was applied before tracking).
+                        logger.info(
+                            f"Migration '{migration.name}' already applied (column exists), recording it"
+                        )
+                    else:
+                        logger.error(
+                            f"Migration '{migration.name}' failed: {e}",
+                            exc_info=True,
+                        )
+                        raise
                 except Exception as e:
                     logger.error(
                         f"Migration '{migration.name}' failed: {e}",
                         exc_info=True,
                     )
                     raise
+                await self._conn.execute(
+                    "INSERT INTO _oak_migrations (name) VALUES (?)",
+                    (migration.name,),
+                )
+                await self._conn.commit()
+
+    @asynccontextmanager
+    async def transaction(self) -> AsyncIterator[aiosqlite.Connection]:
+        """Context manager for explicit transactions.
+
+        Acquires the write lock, issues ``BEGIN IMMEDIATE``, yields the
+        raw connection, and commits on success or rolls back on error.
+        """
+        if not self._conn:
+            raise RuntimeError("Database not initialized")
+        async with self._write_lock:
+            await self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                yield self._conn
+                await self._conn.commit()
+            except BaseException:
+                await self._conn.rollback()
+                raise
 
     async def execute(self, query: str, params: tuple = ()) -> aiosqlite.Cursor:
         """Execute a write query (INSERT/UPDATE/DELETE) with lock."""
@@ -122,7 +169,7 @@ class BranchDatabase:
         """Return the write lock for advanced use."""
         return self._write_lock
 
-    def connect(self) -> aiosqlite.Connection:
+    def raw_connection(self) -> aiosqlite.Connection:
         """Return the raw persistent connection for advanced use.
 
         Warning: callers using this connection directly bypass the write lock.
@@ -132,6 +179,23 @@ class BranchDatabase:
         if not self._conn:
             raise RuntimeError("Database not initialized")
         return self._conn
+
+    def connect(self) -> aiosqlite.Connection:
+        """Return the raw persistent connection.
+
+        .. deprecated:: Use ``raw_connection()`` instead.
+        """
+        warnings.warn(
+            "BranchDatabase.connect() is deprecated, use raw_connection() instead",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.raw_connection()
+
+    @property
+    def path(self) -> Path:
+        """Return the database file path."""
+        return self._path
 
     async def close(self) -> None:
         """Close the persistent connection."""

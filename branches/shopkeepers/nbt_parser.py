@@ -110,6 +110,29 @@ POTION_NAMES = {
 }
 
 
+# Pre-compiled regex patterns used per-row for performance
+_RE_STORED_ENCHANTS_BUKKIT = re.compile(r"stored-enchants:\s*\{([^}]+)\}")
+_RE_ENCHANT_ENTRY = re.compile(r"'minecraft:([^']+)':\s*(\d+)")
+_RE_STORED_ENCHANTS_COMPONENTS = re.compile(r"'minecraft:stored_enchantments':\s*'([^']+)'")
+_RE_ENCHANT_JSON_ENTRY = re.compile(r'"minecraft:([^"]+)":(\d+)')
+_RE_POTION_BUKKIT = re.compile(r"potion-type:\s*'minecraft:([^']+)'")
+_RE_POTION_COMPONENTS = re.compile(r"""'minecraft:potion_contents':\s*'\{potion:"+minecraft:([^"]+)""")
+_RE_CUSTOM_NAME_COMPONENTS = re.compile(r"'minecraft:custom_name':\s*'(.*?)'(?:\s*[,}])")
+_RE_DISPLAY_NAME_BUKKIT = re.compile(r"display-name:\s*'(\{.+?\})'")
+_RE_CUSTOM_BASE64 = re.compile(r"custom:\s*([A-Za-z0-9+/=]+)")
+_RE_TEXT_MATCHES = re.compile(r'""text"":""([^"]+)""|"text":"([^"]+)"|text:""+([^"]+)""+|text:"([^"]*)"')
+_RE_ITEM_TAG = re.compile(r'^\[#\d+\]$')
+_RE_PLAIN_STRING = re.compile(r'^"(.+)"$')
+_RE_ITEMSADDER = re.compile(r'itemsadder:\{id:"+([^"]+)"+,namespace:"+([^"]+)"+\}')
+_RE_CONTAINER = re.compile(r"'minecraft:container':\s*'\[([^\]]+)\]'")
+_RE_CONTAINER_ENTRY = re.compile(r'\{item:\{([^}]+)\},slot:\d+\}')
+_RE_CONTAINER_ID = re.compile(r'id:\s*"*minecraft:([^",]+)"*')
+_RE_CONTAINER_COUNT = re.compile(r'count:\s*(\d+)')
+_RE_INTERNAL_BASE64 = re.compile(r"internal:\s*([A-Za-z0-9+/=]+)")
+_RE_SECTION_SIGN = re.compile(r"§.")
+_RE_MULTI_SPACE = re.compile(r"\s+")
+
+
 def parse_item_metadata(material_type: str, metadata: str, plugin_identity_keys: list = None) -> dict:
     """
     Parse NBT metadata to extract item identity information.
@@ -217,22 +240,18 @@ def _extract_stored_enchantments(metadata: str) -> tuple[str, str] | None:
     matches = []
 
     # Try Bukkit format first: stored-enchants: {'minecraft:riptide': 3}
-    bukkit_match = re.search(r"stored-enchants:\s*\{([^}]+)\}", metadata)
+    bukkit_match = _RE_STORED_ENCHANTS_BUKKIT.search(metadata)
     if bukkit_match:
         enchants_content = bukkit_match.group(1)
-        enchant_pattern = r"'minecraft:([^']+)':\s*(\d+)"
-        matches = re.findall(enchant_pattern, enchants_content)
+        matches = _RE_ENCHANT_ENTRY.findall(enchants_content)
 
     # Try 1.20.5+ components format: 'minecraft:stored_enchantments': '{"minecraft:silk_touch":1}'
     if not matches:
-        components_match = re.search(
-            r"'minecraft:stored_enchantments':\s*'([^']+)'", metadata
-        )
+        components_match = _RE_STORED_ENCHANTS_COMPONENTS.search(metadata)
         if components_match:
             enchants_json = components_match.group(1)
             # Parse the JSON-like string: "minecraft:enchant":level
-            enchant_pattern = r'"minecraft:([^"]+)":(\d+)'
-            matches = re.findall(enchant_pattern, enchants_json)
+            matches = _RE_ENCHANT_JSON_ENTRY.findall(enchants_json)
 
     if not matches:
         return None
@@ -277,16 +296,14 @@ def _extract_potion_type(metadata: str) -> tuple[str, str] | None:
     potion_id = None
 
     # Try Bukkit format: potion-type: 'minecraft:long_fire_resistance'
-    bukkit_match = re.search(r"potion-type:\s*'minecraft:([^']+)'", metadata)
+    bukkit_match = _RE_POTION_BUKKIT.search(metadata)
     if bukkit_match:
         potion_id = bukkit_match.group(1)
 
     # Try 1.20.5+ components format: 'minecraft:potion_contents': '{potion:"minecraft:..."}'
     # Handles both single quotes and double-escaped quotes
     if not potion_id:
-        components_match = re.search(
-            r"""'minecraft:potion_contents':\s*'\{potion:"+minecraft:([^"]+)""", metadata
-        )
+        components_match = _RE_POTION_COMPONENTS.search(metadata)
         if components_match:
             potion_id = components_match.group(1)
 
@@ -323,23 +340,19 @@ def _extract_custom_name(metadata: str) -> str | None:
     custom_name_value = None
 
     # Try 1.20.5+ components format first: 'minecraft:custom_name': '...'
-    custom_name_match = re.search(
-        r"'minecraft:custom_name':\s*'(.*?)'(?:\s*[,}])", metadata
-    )
+    custom_name_match = _RE_CUSTOM_NAME_COMPONENTS.search(metadata)
     if custom_name_match:
         custom_name_value = custom_name_match.group(1)
 
     # Try Bukkit format: display-name: '{"text":"Name",...}'
     if not custom_name_value:
-        display_name_match = re.search(
-            r"display-name:\s*'(\{.+?\})'", metadata
-        )
+        display_name_match = _RE_DISPLAY_NAME_BUKKIT.search(metadata)
         if display_name_match:
             custom_name_value = display_name_match.group(1)
 
     # Try old Bukkit base64 format: custom: <base64> containing display.Name
     if not custom_name_value:
-        custom_match = re.search(r"custom:\s*([A-Za-z0-9+/=]+)", metadata)
+        custom_match = _RE_CUSTOM_BASE64.search(metadata)
         if custom_match:
             custom_name_value = _extract_display_name_from_nbt(custom_match.group(1))
 
@@ -351,22 +364,19 @@ def _extract_custom_name(metadata: str) -> str | None:
     # - JSON format with double-double quotes: ""text"":""Name"" (Bukkit display-name)
     # - JSON format with single quotes: "text":"Name"
     # - NBT format: text:"Name" or text:""+Name""+
-    text_matches = re.findall(
-        r'""text"":""([^"]+)""|"text":"([^"]+)"|text:""+([^"]+)""+|text:"([^"]*)"',
-        custom_name_value
-    )
+    text_matches = _RE_TEXT_MATCHES.findall(custom_name_value)
 
     if text_matches:
         # Flatten the tuple matches and filter out empty strings
         parts = [t[0] or t[1] or t[2] or t[3] for t in text_matches if any(t)]
         # Filter out item number tags like [#81], [#123] - these are identification tags
-        parts = [p for p in parts if p and not re.match(r'^\[#\d+\]$', p)]
+        parts = [p for p in parts if p and not _RE_ITEM_TAG.match(p)]
         if parts:
             return "".join(parts).strip()
 
     # Plain string fallback: check for bare '"SomeName"' pattern
     # (e.g. '"Invisible Item Frame"')
-    plain_match = re.search(r'^"(.+)"$', custom_name_value)
+    plain_match = _RE_PLAIN_STRING.search(custom_name_value)
     if plain_match:
         return plain_match.group(1)
 
@@ -446,7 +456,7 @@ def _extract_plugin_id(metadata: str, identity_keys: list) -> str | None:
     """
     # Pre-decode base64 blob if present (old Bukkit format)
     nbt_blob = None
-    custom_match = re.search(r"custom:\s*([A-Za-z0-9+/=]+)", metadata)
+    custom_match = _RE_CUSTOM_BASE64.search(metadata)
     if custom_match:
         nbt_blob = _decode_custom_nbt(custom_match.group(1))
 
@@ -456,9 +466,7 @@ def _extract_plugin_id(metadata: str, identity_keys: list) -> str | None:
             # Try 1.20.5+ components format - handles both quote styles:
             # - itemsadder:{id:"emeraldkey",namespace:"emeraldset"} (single quotes)
             # - itemsadder:{id:""emeraldkey"",namespace:""emeraldset""} (double-double quotes)
-            ia_match = re.search(
-                r'itemsadder:\{id:"+([^"]+)"+,namespace:"+([^"]+)"+\}', metadata
-            )
+            ia_match = _RE_ITEMSADDER.search(metadata)
             if ia_match:
                 return f"itemsadder:{ia_match.group(2)}:{ia_match.group(1)}"
 
@@ -624,11 +632,11 @@ def _normalize_display_name(name: str) -> str:
         Normalized lowercase name
     """
     # Strip section sign color codes (e.g. §a, §l, §r)
-    name = re.sub(r"§.", "", name)
+    name = _RE_SECTION_SIGN.sub("", name)
     # Trim whitespace
     name = name.strip()
     # Collapse multiple spaces to single
-    name = re.sub(r"\s+", " ", name)
+    name = _RE_MULTI_SPACE.sub(" ", name)
     # Lowercase
     return name.lower()
 
@@ -690,17 +698,17 @@ def parse_shulker_contents(metadata: str) -> tuple[str, int] | None:
     items = {}
 
     # Try 1.20.5+ components format first (more common in newer data)
-    container_match = re.search(r"'minecraft:container':\s*'\[([^\]]+)\]'", metadata)
+    container_match = _RE_CONTAINER.search(metadata)
     if container_match:
         container_content = container_match.group(1)
         # Parse items: {item:{count:64,id:"minecraft:gunpowder"},slot:0}
         # or with escaped quotes: {item:{count:64,id:""minecraft:gunpowder""},slot:0}
         # Find all item entries
-        entries = re.findall(r'\{item:\{([^}]+)\},slot:\d+\}', container_content)
+        entries = _RE_CONTAINER_ENTRY.findall(container_content)
         for entry in entries:
             # Extract id and count from each entry
-            id_match = re.search(r'id:\s*"*minecraft:([^",]+)"*', entry)
-            count_match = re.search(r'count:\s*(\d+)', entry)
+            id_match = _RE_CONTAINER_ID.search(entry)
+            count_match = _RE_CONTAINER_COUNT.search(entry)
             if id_match and count_match:
                 item_id = f"minecraft:{id_match.group(1)}"
                 count = int(count_match.group(1))
@@ -708,7 +716,7 @@ def parse_shulker_contents(metadata: str) -> tuple[str, int] | None:
 
     # Try Bukkit format with base64 internal data
     if not items:
-        internal_match = re.search(r"internal:\s*([A-Za-z0-9+/=]+)", metadata)
+        internal_match = _RE_INTERNAL_BASE64.search(metadata)
         if internal_match:
             try:
                 encoded = internal_match.group(1)
@@ -778,7 +786,7 @@ def _parse_shulker_nbt(data: bytes) -> dict[str, int]:
                 # Read the 4-byte big-endian int
                 count_pos = count_start + count_idx + 8  # 1 + 2 + 5 = 8 bytes for tag header
                 if count_pos + 4 <= len(data):
-                    count = struct.unpack('>I', data[count_pos:count_pos+4])[0]
+                    count = struct.unpack('>i', data[count_pos:count_pos+4])[0]
 
                     # Accumulate counts by item ID
                     if item_id.startswith("minecraft:"):

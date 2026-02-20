@@ -79,7 +79,14 @@ class AdminBranch(OakBranch):
         await interaction.response.defer(ephemeral=True)
 
         try:
-            await self.bot.loader.load_branch(branch_name)
+            instance = await self.bot.loader.load_branch(branch_name)
+
+            # If bot is already ready, fire on_ready for the newly loaded branch
+            if getattr(self.bot, "_ready_fired", False):
+                try:
+                    await instance.on_ready()
+                except Exception:
+                    self.log.exception(f"on_ready() failed for loaded branch '{branch_name}'")
 
             guild = discord.Object(id=self.bot.guild_id)
             self.bot.tree.copy_global_to(guild=guild)

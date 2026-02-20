@@ -4,38 +4,23 @@ Shared utility functions for the ticket system.
 """
 
 import discord
-import yaml
 import hashlib
 import json
 import logging
 import re
-import aiosqlite
-import asyncio
-from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 
-def get_db_path():
-    """Get the database path for this branch."""
-    return str(Path(__file__).parent / "data.db")
+def get_embed_colors(config: dict) -> dict:
+    """Get embed colors from config dict.
 
+    Args:
+        config: Tickets configuration dictionary
 
-def get_tickets_config():
-    """Load tickets config from config.yml."""
-    config_path = Path(__file__).parent / "config.yml"
-    try:
-        with open(config_path, "r", encoding="utf-8") as f:
-            config = yaml.safe_load(f) or {}
-        return config
-    except Exception as e:
-        logger.error(f"Failed to load tickets config: {e}")
-        return {}
-
-
-def get_embed_colors():
-    """Get embed colors from config."""
-    config = get_tickets_config()
+    Returns:
+        Dict mapping color names to integer values
+    """
     colors = config.get("settings", {}).get("ui", {}).get("colors", {})
     return {
         "open": colors.get("open", 0x5865F2),
@@ -46,28 +31,19 @@ def get_embed_colors():
     }
 
 
-def get_staff_role_ids():
-    """Get staff role IDs from config."""
-    config = get_tickets_config()
-    return config.get("settings", {}).get("staff_role_ids", [])
-
-
-def is_staff(interaction: discord.Interaction, staff_role_ids: list = None) -> bool:
+def is_staff(interaction: discord.Interaction, staff_role_ids: list) -> bool:
     """
     Check if user has staff permissions.
 
     Args:
         interaction: Discord interaction
-        staff_role_ids: Optional list of staff role IDs (will load from config if None)
+        staff_role_ids: List of staff role IDs
 
     Returns:
         True if user is staff, False otherwise
     """
     if interaction.guild is None:
         return False
-
-    if staff_role_ids is None:
-        staff_role_ids = get_staff_role_ids()
 
     # Administrators always have access
     if interaction.user.guild_permissions.administrator:
@@ -77,7 +53,7 @@ def is_staff(interaction: discord.Interaction, staff_role_ids: list = None) -> b
     return any(role.id in staff_role_ids for role in interaction.user.roles)
 
 
-def can_manage_ticket_category(interaction: discord.Interaction, category: str) -> bool:
+def can_manage_ticket_category(interaction: discord.Interaction, category: str, config: dict) -> bool:
     """
     Check if user can manage tickets in a specific category.
 
@@ -88,6 +64,7 @@ def can_manage_ticket_category(interaction: discord.Interaction, category: str) 
     Args:
         interaction: Discord interaction
         category: Ticket category key
+        config: Tickets configuration dictionary
 
     Returns:
         True if user can manage this category, False otherwise
@@ -98,8 +75,6 @@ def can_manage_ticket_category(interaction: discord.Interaction, category: str) 
     # Administrators always have access
     if interaction.user.guild_permissions.administrator:
         return True
-
-    config = get_tickets_config()
 
     # Check global staff roles
     global_staff_role_ids = config.get("settings", {}).get("staff_role_ids", [])
@@ -117,7 +92,7 @@ def can_manage_ticket_category(interaction: discord.Interaction, category: str) 
     return False
 
 
-def can_bypass_duplicate_check(interaction: discord.Interaction) -> bool:
+def can_bypass_duplicate_check(interaction: discord.Interaction, config: dict) -> bool:
     """
     Check if user can bypass the 1 ticket per category restriction.
 
@@ -125,6 +100,7 @@ def can_bypass_duplicate_check(interaction: discord.Interaction) -> bool:
 
     Args:
         interaction: Discord interaction
+        config: Tickets configuration dictionary
 
     Returns:
         True if user can bypass duplicate check, False otherwise
@@ -132,7 +108,6 @@ def can_bypass_duplicate_check(interaction: discord.Interaction) -> bool:
     if interaction.guild is None:
         return False
 
-    config = get_tickets_config()
     bypass_role_ids = config.get("settings", {}).get("bypass_duplicate_check_role_ids", [])
 
     # Administrators can always bypass
@@ -181,71 +156,47 @@ def sanitize_name(name: str, user_id: int = None) -> str:
     return sanitized.lower()
 
 
-async def get_next_ticket_number(category: str, db: aiosqlite.Connection, max_retries: int = 3) -> int:
+async def get_next_ticket_number(category: str, conn) -> int:
     """
-    Generate next ticket number with race condition protection.
+    Get the next ticket number for a category.
 
-    Uses IMMEDIATE transaction to prevent concurrent writes and retries on collision.
+    Should be called within a ``db.transaction()`` for race-safe usage.
+    The UNIQUE INDEX on (category, ticket_number) prevents duplicates.
 
     Args:
         category: Ticket category key
-        db: Database connection
-        max_retries: Maximum number of retry attempts
+        conn: Raw aiosqlite connection (from a transaction context)
 
     Returns:
         Next ticket number for this category
     """
-    for attempt in range(max_retries):
-        try:
-            # Use IMMEDIATE transaction to lock database
-            await db.execute("BEGIN IMMEDIATE")
-
-            # Get max number for this category
-            cursor = await db.execute(
-                "SELECT MAX(ticket_number) FROM tickets WHERE category = ?",
-                (category,)
-            )
-            row = await cursor.fetchone()
-            max_num = row[0] if row and row[0] else 0
-            next_num = max_num + 1
-
-            # Commit transaction
-            await db.commit()
-
-            return next_num
-        except aiosqlite.IntegrityError:
-            # Collision detected, rollback and retry
-            await db.rollback()
-            if attempt == max_retries - 1:
-                raise
-            await asyncio.sleep(0.1 * (attempt + 1))  # Exponential backoff
-        except Exception:
-            await db.rollback()
-            raise
+    cursor = await conn.execute(
+        "SELECT MAX(ticket_number) FROM tickets WHERE category = ?",
+        (category,)
+    )
+    row = await cursor.fetchone()
+    return (row[0] or 0) + 1
 
 
-async def has_active_ticket(user_id: int, category: str, db_path: str) -> tuple:
+async def has_active_ticket(user_id: int, category: str, db) -> tuple:
     """
     Check if user has an active ticket in the given category.
 
     Args:
         user_id: Discord user ID
         category: Ticket category key
-        db_path: Path to database
+        db: BranchDatabase instance
 
     Returns:
         Tuple of (has_ticket: bool, thread_id: int or None)
     """
-    async with aiosqlite.connect(db_path) as db:
-        cursor = await db.execute(
-            "SELECT thread_id FROM tickets WHERE user_id = ? AND category = ? AND status = 'open'",
-            (user_id, category)
-        )
-        row = await cursor.fetchone()
-
-        if row:
-            return True, row[0]
-        return False, None
+    row = await db.fetchone(
+        "SELECT thread_id FROM tickets WHERE user_id = ? AND category = ? AND status = 'open'",
+        (user_id, category)
+    )
+    if row:
+        return True, row[0]
+    return False, None
 
 
 def hash_config(config: dict) -> str:
@@ -320,7 +271,7 @@ def validate_config(config: dict) -> tuple:
     return (len(errors) == 0, errors)
 
 
-def format_log_embed(event_type: str, ticket_data: dict, user: discord.User = None, reason: str = None) -> discord.Embed:
+def format_log_embed(event_type: str, ticket_data: dict, user: discord.User = None, reason: str = None, colors: dict = None) -> discord.Embed:
     """
     Create a formatted embed for logging ticket events.
 
@@ -329,11 +280,16 @@ def format_log_embed(event_type: str, ticket_data: dict, user: discord.User = No
         ticket_data: Dictionary with ticket information
         user: User who performed the action (optional)
         reason: Reason for closing (optional)
+        colors: Embed color dict (from get_embed_colors)
 
     Returns:
         Discord embed for logging
     """
-    colors = get_embed_colors()
+    if colors is None:
+        colors = {
+            "open": 0x5865F2, "closed": 0x99AAB5,
+            "log_created": 0x57F287, "log_closed": 0xED4245, "log_reopened": 0xFEE75C
+        }
 
     if event_type == 'created':
         embed = discord.Embed(

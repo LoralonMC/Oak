@@ -108,7 +108,7 @@ class StatusChannels(OakBranch):
                     else:
                         self.log.error(f"Failed to update member channel: {e}")
                 except Exception as e:
-                    self.log.error(f"Unexpected error updating member channel: {e}")
+                    self.log.error(f"Unexpected error updating member channel: {e}", exc_info=True)
 
             # Update Minecraft player count channel
             if player_channel_id:
@@ -152,7 +152,7 @@ class StatusChannels(OakBranch):
                     self.log.error(f"Unexpected error updating online channel: {e}", exc_info=True)
 
         except Exception as e:
-            self.log.error(f"Critical error in update_status_channels: {e}")
+            self.log.error(f"Critical error in update_status_channels: {e}", exc_info=True)
 
     @update_status_channels.error
     async def update_status_channels_error(self, error: Exception) -> None:

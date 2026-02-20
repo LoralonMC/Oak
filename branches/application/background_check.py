@@ -7,7 +7,7 @@ import asyncio
 import discord
 import mysql.connector
 import logging
-from .helpers import get_application_config, get_embed_colors
+from .helpers import get_embed_colors
 
 logger = logging.getLogger(__name__)
 
@@ -83,24 +83,25 @@ def _sync_fetch_playtime(db_config: dict, mc_name: str) -> dict:
                 logger.error(f"Error closing connection: {e}")
 
 
-async def fetch_playtime_embed(mc_name: str) -> discord.Embed:
+async def fetch_playtime_embed(mc_name: str, config: dict) -> discord.Embed:
     """
     Fetch playtime data from Plan DB/MySQL.
 
     Args:
         mc_name: Minecraft username
+        config: Application configuration dictionary
 
     Returns:
         Discord embed with playtime information
     """
-    config = get_application_config()
+    colors = get_embed_colors(config)
     mysql_config = config.get("settings", {}).get("mysql", {})
 
     if not mysql_config.get("enabled", False):
         return discord.Embed(
             title="Playtime Data",
             description="MySQL/Plan is not enabled in config.",
-            color=get_embed_colors()["error"]
+            color=colors["error"]
         )
 
     # Build MySQL connection config
@@ -109,6 +110,7 @@ async def fetch_playtime_embed(mc_name: str) -> discord.Embed:
         "user": mysql_config.get("user"),
         "password": mysql_config.get("password"),
         "database": mysql_config.get("database"),
+        "connect_timeout": 10,
     }
 
     # Run blocking MySQL operations in a thread to avoid blocking the event loop
@@ -118,21 +120,21 @@ async def fetch_playtime_embed(mc_name: str) -> discord.Embed:
         return discord.Embed(
             title="Playtime Data",
             description="A database error occurred while fetching playtime data.",
-            color=get_embed_colors()["error"]
+            color=colors["error"]
         )
 
     if result["error"] == "unexpected":
         return discord.Embed(
             title="Playtime Data",
             description="An unexpected error occurred while fetching playtime data.",
-            color=get_embed_colors()["error"]
+            color=colors["error"]
         )
 
     if not result["found"]:
         return discord.Embed(
             title="Playtime Data",
             description=f"No player found with username **{mc_name}**.",
-            color=get_embed_colors()["warning"]
+            color=colors["warning"]
         )
 
     stats = result["stats"]
@@ -146,7 +148,7 @@ async def fetch_playtime_embed(mc_name: str) -> discord.Embed:
         embed = discord.Embed(
             title="Playtime Data",
             description=f"Playtime for **{mc_name}**",
-            color=get_embed_colors()["info"]
+            color=colors["info"]
         )
         embed.add_field(name="Last 30 days", value=fmt(stats['last_30_days']))
         embed.add_field(name="Last 7 days", value=fmt(stats['last_7_days']))
@@ -154,7 +156,7 @@ async def fetch_playtime_embed(mc_name: str) -> discord.Embed:
         embed = discord.Embed(
             title="Playtime Data",
             description=f"No playtime stats found for **{mc_name}**.",
-            color=get_embed_colors()["warning"]
+            color=colors["warning"]
         )
 
     return embed

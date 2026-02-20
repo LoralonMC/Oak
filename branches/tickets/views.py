@@ -4,13 +4,11 @@ Discord UI components for ticket interactions.
 """
 
 import discord
-import aiosqlite
+import sqlite3
 import asyncio
 import logging
 import time
 from .helpers import (
-    get_tickets_config,
-    get_db_path,
     get_embed_colors,
     can_manage_ticket_category,
     can_bypass_duplicate_check,
@@ -23,6 +21,18 @@ from .helpers import (
 from .modals import CloseReasonModal
 
 logger = logging.getLogger(__name__)
+
+# Module-level references, set by configure()
+_db = None
+_config: dict = {}
+
+
+def configure(db, config: dict) -> None:
+    """Set module-level DB and config references. Called from branch on_enable."""
+    global _db, _config
+    _db = db
+    _config = config
+
 
 # Rate limiting: Track last ticket creation time per user
 _last_ticket_creation: dict[int, float] = {}
@@ -46,13 +56,12 @@ class TicketPanelView(discord.ui.View):
 
     def __init__(self, *, legacy: bool = False):
         super().__init__(timeout=None)
-        self.config = get_tickets_config()
         self.legacy = legacy
         self._build_buttons()
 
     def _build_buttons(self):
         """Build category buttons from config."""
-        categories = self.config.get("settings", {}).get("categories", {})
+        categories = _config.get("settings", {}).get("categories", {})
 
         for cat_key, cat_config in categories.items():
             if not cat_config.get("enabled", True):
@@ -85,17 +94,15 @@ class TicketPanelView(discord.ui.View):
     def _create_button_callback(self, category_key: str, category_config: dict):
         """Create a callback function for a category button."""
         async def callback(interaction: discord.Interaction):
-            # Reload config to get fresh configuration on every button click
-            fresh_config = get_tickets_config()
-            fresh_category_config = fresh_config.get("settings", {}).get("categories", {}).get(category_key, {})
+            fresh_category_config = _config.get("settings", {}).get("categories", {}).get(category_key, {})
 
             # Fallback to original if category no longer exists
             if not fresh_category_config:
-                logger.warning(f"Category '{category_key}' not found in fresh config, using cached config")
+                logger.warning(f"Category '{category_key}' not found in config, using cached config")
                 fresh_category_config = category_config
 
             # Check rate limit BEFORE showing modal (better UX)
-            cooldown_seconds = fresh_config.get("settings", {}).get("rate_limit", {}).get("ticket_creation_cooldown_seconds", 60)
+            cooldown_seconds = _config.get("settings", {}).get("rate_limit", {}).get("ticket_creation_cooldown_seconds", 60)
 
             if cooldown_seconds > 0:
                 _cleanup_rate_limits(cooldown_seconds)
@@ -106,7 +113,7 @@ class TicketPanelView(discord.ui.View):
                 if time_since_last < cooldown_seconds:
                     remaining = int(cooldown_seconds - time_since_last)
                     await interaction.response.send_message(
-                        f"⏳ Please wait **{remaining} seconds** before creating another ticket.",
+                        f"\u23f3 Please wait **{remaining} seconds** before creating another ticket.",
                         ephemeral=True
                     )
                     logger.info(f"User {interaction.user.id} rate limited (cooldown: {remaining}s remaining)")
@@ -114,16 +121,16 @@ class TicketPanelView(discord.ui.View):
 
             # Check for existing active ticket BEFORE showing modal (better UX)
             # Users with bypass roles can create multiple tickets per category
-            if not can_bypass_duplicate_check(interaction):
+            if not can_bypass_duplicate_check(interaction, _config):
                 has_ticket, thread_id = await has_active_ticket(
                     interaction.user.id,
                     category_key,
-                    get_db_path()
+                    _db
                 )
 
                 if has_ticket:
                     await interaction.response.send_message(
-                        f"❌ You already have an open ticket in this category: <#{thread_id}>",
+                        f"\u274c You already have an open ticket in this category: <#{thread_id}>",
                         ephemeral=True
                     )
                     return
@@ -164,8 +171,7 @@ class TicketPanelView(discord.ui.View):
 
         try:
             # Get cooldown config
-            config = get_tickets_config()
-            cooldown_seconds = config.get("settings", {}).get("rate_limit", {}).get("ticket_creation_cooldown_seconds", 60)
+            cooldown_seconds = _config.get("settings", {}).get("rate_limit", {}).get("ticket_creation_cooldown_seconds", 60)
 
             # Re-check rate limit (user might have created another ticket while filling out modal)
             if cooldown_seconds > 0:
@@ -176,7 +182,7 @@ class TicketPanelView(discord.ui.View):
                 if time_since_last < cooldown_seconds:
                     remaining = int(cooldown_seconds - time_since_last)
                     await interaction.followup.send(
-                        f"⏳ Please wait **{remaining} seconds** before creating another ticket.",
+                        f"\u23f3 Please wait **{remaining} seconds** before creating another ticket.",
                         ephemeral=True
                     )
                     logger.info(f"User {interaction.user.id} rate limited after modal submission (cooldown: {remaining}s remaining)")
@@ -184,16 +190,16 @@ class TicketPanelView(discord.ui.View):
 
             # Re-check for existing active ticket (user might have created one while filling out modal)
             # Users with bypass roles can create multiple tickets per category
-            if not can_bypass_duplicate_check(interaction):
+            if not can_bypass_duplicate_check(interaction, _config):
                 has_ticket, thread_id = await has_active_ticket(
                     interaction.user.id,
                     category_key,
-                    get_db_path()
+                    _db
                 )
 
                 if has_ticket:
                     await interaction.followup.send(
-                        f"❌ You already have an open ticket in this category: <#{thread_id}>",
+                        f"\u274c You already have an open ticket in this category: <#{thread_id}>",
                         ephemeral=True
                     )
                     return
@@ -203,7 +209,7 @@ class TicketPanelView(discord.ui.View):
             missing_perms = check_permissions(channel)
             if missing_perms:
                 await interaction.followup.send(
-                    f"⚠️ I'm missing required permissions: {', '.join(missing_perms)}\n"
+                    f"\u26a0\ufe0f I'm missing required permissions: {', '.join(missing_perms)}\n"
                     "Please contact an administrator to fix this.",
                     ephemeral=True
                 )
@@ -212,23 +218,6 @@ class TicketPanelView(discord.ui.View):
             # Get naming pattern
             naming_pattern = category_config.get("naming_pattern", "ticket-{number}")
 
-            # Generate thread name
-            if "{number}" in naming_pattern:
-                async with aiosqlite.connect(get_db_path()) as db:
-                    ticket_number = await get_next_ticket_number(category_key, db)
-                thread_name = naming_pattern.replace("{number}", str(ticket_number))
-            elif "{nickname}" in naming_pattern:
-                nickname = sanitize_name(interaction.user.display_name, interaction.user.id)
-                thread_name = naming_pattern.replace("{nickname}", nickname)
-                ticket_number = None
-            elif "{username}" in naming_pattern:
-                username = sanitize_name(interaction.user.name, interaction.user.id)
-                thread_name = naming_pattern.replace("{username}", username)
-                ticket_number = None
-            else:
-                thread_name = f"ticket-{interaction.user.id}"
-                ticket_number = None
-
             # Determine auto-archive duration based on guild boost level
             # Level 0-1: Max 1 day (1440 min), Level 2-3: Max 7 days (10080 min)
             if interaction.guild.premium_tier >= 2:
@@ -236,65 +225,87 @@ class TicketPanelView(discord.ui.View):
             else:
                 auto_archive_duration = 1440   # 1 day
 
-            # Create private thread
+            # Combine SELECT MAX + INSERT in a single transaction
+            # to prevent ticket number races
+            thread = None
             try:
-                thread = await channel.create_thread(
-                    name=thread_name,
-                    type=discord.ChannelType.private_thread,
-                    auto_archive_duration=auto_archive_duration,
-                    invitable=False
-                )
-            except discord.HTTPException as e:
-                logger.error(f"Failed to create thread: {e}")
+                async with _db.transaction() as conn:
+                    # Generate thread name
+                    if "{number}" in naming_pattern:
+                        ticket_number = await get_next_ticket_number(category_key, conn)
+                        thread_name = naming_pattern.replace("{number}", str(ticket_number))
+                    elif "{nickname}" in naming_pattern:
+                        nickname = sanitize_name(interaction.user.display_name, interaction.user.id)
+                        thread_name = naming_pattern.replace("{nickname}", nickname)
+                        ticket_number = None
+                    elif "{username}" in naming_pattern:
+                        username = sanitize_name(interaction.user.name, interaction.user.id)
+                        thread_name = naming_pattern.replace("{username}", username)
+                        ticket_number = None
+                    else:
+                        thread_name = f"ticket-{interaction.user.id}"
+                        ticket_number = None
+
+                    # Create private thread
+                    try:
+                        thread = await channel.create_thread(
+                            name=thread_name,
+                            type=discord.ChannelType.private_thread,
+                            auto_archive_duration=auto_archive_duration,
+                            invitable=False
+                        )
+                    except discord.HTTPException as e:
+                        logger.error(f"Failed to create thread: {e}")
+                        await interaction.followup.send(
+                            "\u26a0\ufe0f Failed to create your ticket thread. This might be due to Discord's thread limit (1000 active threads per channel). "
+                            "Please contact an administrator.",
+                            ephemeral=True
+                        )
+                        return  # transaction commits with no DB changes
+
+                    # Insert ticket record atomically with number generation
+                    await conn.execute(
+                        """INSERT INTO tickets
+                        (thread_id, user_id, category, ticket_number, status, created_at)
+                        VALUES (?, ?, ?, ?, 'open', datetime('now'))""",
+                        (thread.id, interaction.user.id, category_key, ticket_number)
+                    )
+
+            except sqlite3.IntegrityError:
+                # Race condition - user created ticket between check and creation
+                if thread:
+                    try:
+                        await thread.delete(reason="Duplicate ticket (race condition)")
+                    except discord.HTTPException:
+                        pass
                 await interaction.followup.send(
-                    "⚠️ Failed to create your ticket thread. This might be due to Discord's thread limit (1000 active threads per channel). "
-                    "Please contact an administrator.",
+                    "\u274c You already have an open ticket in this category. Please try again.",
                     ephemeral=True
                 )
                 return
+            except Exception as e:
+                # DB operation failed - clean up orphaned thread if it was created
+                logger.error(f"DB operation failed for ticket: {e}", exc_info=True)
+                if thread:
+                    try:
+                        await thread.delete(reason="Orphan cleanup: DB operation failed")
+                    except discord.HTTPException:
+                        pass
+                await interaction.followup.send(
+                    "\u274c An error occurred while saving your ticket. Please try again.",
+                    ephemeral=True
+                )
+                return
+
+            # Update rate limit timestamp on successful ticket creation
+            if cooldown_seconds > 0:
+                _last_ticket_creation[interaction.user.id] = time.time()
 
             # Add user to thread
             try:
                 await thread.add_user(interaction.user)
             except discord.HTTPException as e:
                 logger.error(f"Failed to add user to thread: {e}")
-
-            # Save to database
-            try:
-                async with aiosqlite.connect(get_db_path()) as db:
-                    try:
-                        await db.execute(
-                            """INSERT INTO tickets
-                            (thread_id, user_id, category, ticket_number, status, created_at)
-                            VALUES (?, ?, ?, ?, 'open', datetime('now'))""",
-                            (thread.id, interaction.user.id, category_key, ticket_number)
-                        )
-                        await db.commit()
-
-                        # Update rate limit timestamp on successful ticket creation
-                        if cooldown_seconds > 0:
-                            _last_ticket_creation[interaction.user.id] = time.time()
-
-                    except aiosqlite.IntegrityError:
-                        # Race condition - user created ticket between check and creation
-                        await thread.delete(reason="Duplicate ticket (race condition)")
-                        await interaction.followup.send(
-                            "❌ You already have an open ticket in this category. Please try again.",
-                            ephemeral=True
-                        )
-                        return
-            except Exception as e:
-                # DB insert failed - clean up the orphaned thread
-                logger.error(f"DB insert failed for ticket, deleting orphaned thread {thread.id}: {e}", exc_info=True)
-                try:
-                    await thread.delete(reason="Orphan cleanup: DB insert failed")
-                except discord.HTTPException as del_err:
-                    logger.error(f"Failed to delete orphaned thread {thread.id}: {del_err}")
-                await interaction.followup.send(
-                    "❌ An error occurred while saving your ticket. Please try again.",
-                    ephemeral=True
-                )
-                return
 
             # Prepare welcome message with role pings
             welcome_message = category_config.get("welcome_message", "Your ticket has been created!")
@@ -329,15 +340,16 @@ class TicketPanelView(discord.ui.View):
 
             # Confirm to user immediately
             await interaction.followup.send(
-                f"✅ Your ticket has been created: {thread.mention}",
+                f"\u2705 Your ticket has been created: {thread.mention}",
                 ephemeral=True
             )
 
             # Send welcome message
+            colors = get_embed_colors(_config)
             embed = discord.Embed(
-                title="🎫 Ticket Created",
+                title="\U0001f3ab Ticket Created",
                 description=welcome_message,
-                color=get_embed_colors()["open"]
+                color=colors["open"]
             )
 
             # Send welcome message with pings
@@ -354,7 +366,7 @@ class TicketPanelView(discord.ui.View):
             )
 
             # Log to log channel (async task)
-            log_channel_id = self.config.get("settings", {}).get("log_channel_id", 0)
+            log_channel_id = _config.get("settings", {}).get("log_channel_id", 0)
             if log_channel_id:
                 async def log_ticket():
                     log_channel = interaction.guild.get_channel(log_channel_id)
@@ -365,7 +377,8 @@ class TicketPanelView(discord.ui.View):
                                 "category": category_key,
                                 "thread_id": thread.id,
                                 "creator_id": interaction.user.id
-                            }
+                            },
+                            colors=colors
                         )
                         try:
                             await log_channel.send(embed=log_embed)
@@ -380,7 +393,7 @@ class TicketPanelView(discord.ui.View):
         except Exception as e:
             logger.error(f"Error creating ticket: {e}", exc_info=True)
             await interaction.followup.send(
-                "❌ An unexpected error occurred while creating your ticket. Please try again or contact an administrator.",
+                "\u274c An unexpected error occurred while creating your ticket. Please try again or contact an administrator.",
                 ephemeral=True
             )
 
@@ -392,6 +405,7 @@ class ConfirmCloseView(discord.ui.View):
         super().__init__(timeout=60)
         self.close_callback = close_callback
         self.author_id = author_id
+        self.source_interaction: discord.Interaction | None = None
 
     @discord.ui.button(
         label="Yes, Close Ticket",
@@ -421,7 +435,7 @@ class ConfirmCloseView(discord.ui.View):
             await interaction.response.send_message("Only the person who initiated the close can confirm.", ephemeral=True)
             return
         await interaction.response.send_message(
-            "❌ Ticket closure cancelled.",
+            "\u274c Ticket closure cancelled.",
             ephemeral=True
         )
         # Disable buttons
@@ -431,6 +445,16 @@ class ConfirmCloseView(discord.ui.View):
             await interaction.message.edit(content="Cancelled.", view=self)
         except discord.HTTPException:
             pass
+
+    async def on_timeout(self):
+        """Disable buttons when the view times out."""
+        for item in self.children:
+            item.disabled = True
+        if self.source_interaction:
+            try:
+                await self.source_interaction.edit_original_response(view=self)
+            except discord.HTTPException:
+                pass
 
 
 _TICKET_CONTROL_ID_MAP = {
@@ -459,10 +483,11 @@ class TicketControlView(discord.ui.View):
         # Show confirmation view
         confirm_view = ConfirmCloseView(close_callback=self._close_ticket, author_id=interaction.user.id)
         await interaction.response.send_message(
-            "⚠️ Are you sure you want to close this ticket?",
+            "\u26a0\ufe0f Are you sure you want to close this ticket?",
             view=confirm_view,
             ephemeral=True
         )
+        confirm_view.source_interaction = interaction
 
     @discord.ui.button(
         label="Close With Reason",
@@ -485,7 +510,7 @@ class TicketControlView(discord.ui.View):
         """
         if not isinstance(interaction.channel, discord.Thread):
             await interaction.response.send_message(
-                "❌ This command can only be used in ticket threads.",
+                "\u274c This command can only be used in ticket threads.",
                 ephemeral=True
             )
             return
@@ -495,34 +520,33 @@ class TicketControlView(discord.ui.View):
             await interaction.response.defer(ephemeral=True)
 
         thread = interaction.channel
+        colors = get_embed_colors(_config)
 
         # Get ticket from database
-        async with aiosqlite.connect(get_db_path()) as db:
-            cursor = await db.execute(
-                "SELECT user_id, category FROM tickets WHERE thread_id = ? AND status = 'open'",
-                (thread.id,)
+        ticket = await _db.fetchone(
+            "SELECT user_id, category FROM tickets WHERE thread_id = ? AND status = 'open'",
+            (thread.id,)
+        )
+
+        if not ticket:
+            await interaction.followup.send(
+                "\u274c This ticket is not found or already closed.",
+                ephemeral=True
             )
-            ticket = await cursor.fetchone()
+            return
 
-            if not ticket:
-                await interaction.followup.send(
-                    "❌ This ticket is not found or already closed.",
-                    ephemeral=True
-                )
-                return
+        creator_id, category = ticket
 
-            creator_id, category = ticket
+        # Check permissions - ticket creator or staff who can manage this category can close
+        is_creator = interaction.user.id == creator_id
+        can_manage = can_manage_ticket_category(interaction, category, _config)
 
-            # Check permissions - ticket creator or staff who can manage this category can close
-            is_creator = interaction.user.id == creator_id
-            can_manage = can_manage_ticket_category(interaction, category)
-
-            if not (is_creator or can_manage):
-                await interaction.followup.send(
-                    "❌ You don't have permission to close this ticket.",
-                    ephemeral=True
-                )
-                return
+        if not (is_creator or can_manage):
+            await interaction.followup.send(
+                "\u274c You don't have permission to close this ticket.",
+                ephemeral=True
+            )
+            return
 
         # Disable close buttons
         for item in self.children:
@@ -530,9 +554,9 @@ class TicketControlView(discord.ui.View):
 
         # Send closure message BEFORE archiving (archiving prevents sending messages)
         close_embed = discord.Embed(
-            title="🔒 Ticket Closed",
+            title="\U0001f512 Ticket Closed",
             description=f"This ticket has been closed by {interaction.user.mention}",
-            color=get_embed_colors()["closed"]
+            color=colors["closed"]
         )
 
         if reason:
@@ -548,22 +572,9 @@ class TicketControlView(discord.ui.View):
         except discord.HTTPException as e:
             logger.error(f"Failed to send close message: {e}")
 
-        # Now close thread (archived + locked = closed in Discord UI)
-        # CRITICAL: Must set BOTH archived and locked in a SINGLE edit call
-        # We do this BEFORE updating database to ensure consistent state
-        try:
-            await thread.edit(archived=True, locked=True)
-        except discord.HTTPException as e:
-            logger.error(f"Failed to close thread: {e}")
-            await interaction.followup.send(
-                "❌ Failed to close the ticket thread. Please check bot permissions and try again.",
-                ephemeral=True
-            )
-            return
-
-        # Update database and cancel reminders atomically after successfully closing thread
-        async with aiosqlite.connect(get_db_path()) as db:
-            cursor = await db.execute(
+        # Update database BEFORE archiving to prevent inconsistent state
+        async with _db.transaction() as conn:
+            cursor = await conn.execute(
                 """UPDATE tickets
                 SET status = 'closed', closed_by = ?, close_reason = ?, closed_at = datetime('now')
                 WHERE thread_id = ? AND status = 'open'""",
@@ -571,16 +582,30 @@ class TicketControlView(discord.ui.View):
             )
             if cursor.rowcount == 0:
                 logger.warning(f"Ticket {thread.id} was already closed by another user")
-            await db.execute(
+            await conn.execute(
                 "UPDATE ticket_reminders SET active = 0 WHERE ticket_thread_id = ? AND active = 1",
                 (thread.id,)
             )
-            await db.commit()
-            logger.info(f"Closed ticket {thread.id} and cancelled reminders")
+        logger.info(f"Closed ticket {thread.id} and cancelled reminders")
+
+        # Now close thread (archived + locked = closed in Discord UI)
+        try:
+            await thread.edit(archived=True, locked=True)
+        except discord.HTTPException as e:
+            logger.error(f"Failed to close thread: {e}")
+            # Revert DB since thread couldn't be archived
+            await _db.execute(
+                "UPDATE tickets SET status = 'open', closed_by = NULL, close_reason = NULL, closed_at = NULL WHERE thread_id = ?",
+                (thread.id,)
+            )
+            await interaction.followup.send(
+                "\u274c Failed to close the ticket thread. Please check bot permissions and try again.",
+                ephemeral=True
+            )
+            return
 
         # Log to log channel
-        config = get_tickets_config()
-        log_channel_id = config.get("settings", {}).get("log_channel_id", 0)
+        log_channel_id = _config.get("settings", {}).get("log_channel_id", 0)
         if log_channel_id:
             log_channel = interaction.guild.get_channel(log_channel_id)
             if log_channel:
@@ -592,7 +617,8 @@ class TicketControlView(discord.ui.View):
                         "creator_id": creator_id
                     },
                     user=interaction.user,
-                    reason=reason
+                    reason=reason,
+                    colors=colors
                 )
                 try:
                     await log_channel.send(embed=log_embed)
@@ -603,35 +629,32 @@ class TicketControlView(discord.ui.View):
 async def _stop_reminder(interaction: discord.Interaction, reminder_id: int):
     """Stop a reminder by ID. Shared logic for DynamicItem and legacy views."""
     try:
-        async with aiosqlite.connect(get_db_path()) as db:
-            cursor = await db.execute(
-                "SELECT user_id FROM ticket_reminders WHERE id = ?",
-                (reminder_id,)
+        row = await _db.fetchone(
+            "SELECT user_id FROM ticket_reminders WHERE id = ?",
+            (reminder_id,)
+        )
+
+        if not row:
+            await interaction.response.send_message(
+                "\u274c Reminder not found.",
+                ephemeral=True
             )
-            row = await cursor.fetchone()
+            return
 
-            if not row:
-                await interaction.response.send_message(
-                    "❌ Reminder not found.",
-                    ephemeral=True
-                )
-                return
-
-            if row[0] != interaction.user.id:
-                await interaction.response.send_message(
-                    "❌ You can only stop your own reminders.",
-                    ephemeral=True
-                )
-                return
-
-            await db.execute(
-                "UPDATE ticket_reminders SET active = 0 WHERE id = ?",
-                (reminder_id,)
+        if row[0] != interaction.user.id:
+            await interaction.response.send_message(
+                "\u274c You can only stop your own reminders.",
+                ephemeral=True
             )
-            await db.commit()
+            return
+
+        await _db.execute(
+            "UPDATE ticket_reminders SET active = 0 WHERE id = ?",
+            (reminder_id,)
+        )
 
         # Send acknowledgement BEFORE attempting message deletion
-        await interaction.response.send_message("🔕 Reminder stopped.", ephemeral=True)
+        await interaction.response.send_message("\U0001f515 Reminder stopped.", ephemeral=True)
 
         try:
             await interaction.message.delete()
@@ -643,7 +666,7 @@ async def _stop_reminder(interaction: discord.Interaction, reminder_id: int):
         logger.error(f"Error stopping reminder: {e}")
         if not interaction.response.is_done():
             await interaction.response.send_message(
-                "❌ Failed to stop reminder.",
+                "\u274c Failed to stop reminder.",
                 ephemeral=True
             )
 
@@ -653,34 +676,31 @@ async def _snooze_reminder(interaction: discord.Interaction, reminder_id: int, s
     try:
         from datetime import datetime, timedelta, timezone
 
-        async with aiosqlite.connect(get_db_path()) as db:
-            cursor = await db.execute(
-                "SELECT user_id FROM ticket_reminders WHERE id = ?",
-                (reminder_id,)
+        row = await _db.fetchone(
+            "SELECT user_id FROM ticket_reminders WHERE id = ?",
+            (reminder_id,)
+        )
+
+        if not row:
+            await interaction.response.send_message(
+                "\u274c Reminder not found.",
+                ephemeral=True
             )
-            row = await cursor.fetchone()
+            return
 
-            if not row:
-                await interaction.response.send_message(
-                    "❌ Reminder not found.",
-                    ephemeral=True
-                )
-                return
-
-            if row[0] != interaction.user.id:
-                await interaction.response.send_message(
-                    "❌ You can only snooze your own reminders.",
-                    ephemeral=True
-                )
-                return
-
-            new_time = datetime.now(timezone.utc) - timedelta(seconds=86400 - seconds)
-
-            await db.execute(
-                "UPDATE ticket_reminders SET last_reminded_at = ? WHERE id = ?",
-                (new_time.strftime('%Y-%m-%d %H:%M:%S'), reminder_id)
+        if row[0] != interaction.user.id:
+            await interaction.response.send_message(
+                "\u274c You can only snooze your own reminders.",
+                ephemeral=True
             )
-            await db.commit()
+            return
+
+        new_time = datetime.now(timezone.utc) - timedelta(seconds=86400 - seconds)
+
+        await _db.execute(
+            "UPDATE ticket_reminders SET last_reminded_at = ? WHERE id = ?",
+            (new_time.strftime('%Y-%m-%d %H:%M:%S'), reminder_id)
+        )
 
         if seconds < 3600:
             duration = f"{seconds // 60}m"
@@ -690,7 +710,7 @@ async def _snooze_reminder(interaction: discord.Interaction, reminder_id: int, s
             duration = f"{seconds // 86400}d"
 
         # Send acknowledgement BEFORE attempting message deletion
-        await interaction.response.send_message(f"⏰ Reminder snoozed for {duration}.", ephemeral=True)
+        await interaction.response.send_message(f"\u23f0 Reminder snoozed for {duration}.", ephemeral=True)
 
         try:
             await interaction.message.delete()
@@ -702,7 +722,7 @@ async def _snooze_reminder(interaction: discord.Interaction, reminder_id: int, s
         logger.error(f"Error snoozing reminder: {e}")
         if not interaction.response.is_done():
             await interaction.response.send_message(
-                "❌ Failed to snooze reminder.",
+                "\u274c Failed to snooze reminder.",
                 ephemeral=True
             )
 
@@ -804,14 +824,12 @@ def build_reminder_view(reminder_id: int) -> discord.ui.View:
 async def _lookup_legacy_reminder_id(interaction: discord.Interaction) -> int | None:
     """Look up reminder_id from the message that was interacted with."""
     try:
-        async with aiosqlite.connect(get_db_path()) as db:
-            cursor = await db.execute(
-                "SELECT id FROM ticket_reminders WHERE last_reminder_message_id = ? AND active = 1",
-                (interaction.message.id,)
-            )
-            row = await cursor.fetchone()
-            if row:
-                return row[0]
+        row = await _db.fetchone(
+            "SELECT id FROM ticket_reminders WHERE last_reminder_message_id = ? AND active = 1",
+            (interaction.message.id,)
+        )
+        if row:
+            return row[0]
     except Exception as e:
         logger.error(f"Failed to look up legacy reminder: {e}")
     return None

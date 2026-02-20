@@ -4,7 +4,6 @@ Shared utility functions for the shopkeepers system.
 """
 
 import discord
-import yaml
 import logging
 from pathlib import Path
 
@@ -16,62 +15,28 @@ def get_branch_dir():
     return Path(__file__).parent
 
 
-def get_db_path():
-    """Get the database path for this branch."""
-    return str(get_branch_dir() / "data.db")
-
-
-def get_csv_directory(config: dict = None) -> str:
+def get_csv_directory(config: dict) -> str:
     """
     Get the CSV directory path. Falls back to the local csv_data/ folder
     inside the branch directory if not configured.
     """
-    if config is None:
-        config = get_shopkeepers_config()
     csv_dir = config.get("settings", {}).get("csv_directory", "")
     if not csv_dir:
         csv_dir = str(get_branch_dir() / "csv_data")
     return csv_dir
 
 
-def get_shopkeepers_config():
-    """Load shopkeepers config from config.yml."""
-    config_path = Path(__file__).parent / "config.yml"
-    try:
-        with open(config_path, "r", encoding="utf-8") as f:
-            config = yaml.safe_load(f) or {}
-        return config
-    except Exception as e:
-        logger.error(f"Failed to load shopkeepers config: {e}")
-        return {}
-
-
-def get_embed_color():
-    """Get embed color from config."""
-    config = get_shopkeepers_config()
-    return config.get("settings", {}).get("ui", {}).get("embed_color", 0x50C878)
-
-
-def get_admin_role_ids():
-    """Get admin role IDs from config."""
-    config = get_shopkeepers_config()
-    return config.get("settings", {}).get("admin_role_ids", [])
-
-
-def is_admin(interaction: discord.Interaction, admin_role_ids: list = None) -> bool:
+def is_admin(interaction: discord.Interaction, admin_role_ids: list) -> bool:
     """
     Check if user has admin permissions.
 
     Args:
         interaction: Discord interaction
-        admin_role_ids: Optional list of admin role IDs (will load from config if None)
+        admin_role_ids: List of admin role IDs
 
     Returns:
         True if user is admin, False otherwise
     """
-    if admin_role_ids is None:
-        admin_role_ids = get_admin_role_ids()
-
     # Guild check — DMs have no guild permissions
     if interaction.guild is None:
         return False
@@ -131,13 +96,16 @@ def format_price(emeralds: float | None) -> str:
 
     parts = []
 
+    # Use round() to avoid float precision issues
+    emeralds = round(emeralds, 2)
+
     cemb = int(emeralds // 576)
-    remainder = emeralds - cemb * 576
+    remainder = round(emeralds - cemb * 576, 2)
     if cemb > 0:
         parts.append(f"{cemb:,} CEMB")
 
     emb = int(remainder // 9)
-    remainder = remainder - emb * 9
+    remainder = round(remainder - emb * 9, 2)
     if emb > 0:
         parts.append(f"{emb:,} EMB")
 

@@ -6,16 +6,15 @@ Thread-based support ticket system with category management.
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
-import aiosqlite
 import asyncio
+import sqlite3
 import time
 
 from oak import OakBranch
 from oak.context import BranchContext
+from oak.database import Migration
 
 from .helpers import (
-    get_db_path,
-    get_tickets_config,
     get_embed_colors,
     is_staff,
     can_manage_ticket_category,
@@ -33,6 +32,7 @@ from .views import (
     ReminderSnooze6hButton,
     ReminderSnooze1dButton,
     build_reminder_view,
+    configure as configure_views,
 )
 
 TICKETS_SCHEMA = """
@@ -97,15 +97,24 @@ class Tickets(OakBranch):
 
     def __init__(self, ctx: BranchContext):
         super().__init__(ctx)
-        self.db_path = get_db_path()
-        self.config = get_tickets_config()
+        self._thread_update_times: dict[int, float] = {}
+        self._registered_views: list = []
 
+    async def on_enable(self):
+        """Initialize database and register persistent views."""
+        if self.db:
+            await self.db.initialize(TICKETS_SCHEMA)
+
+        await self._run_migrations()
+
+        # Validate framework-provided config
         is_valid, errors = validate_config(self.config)
         if not is_valid:
             self.log.error(f"Tickets config validation failed: {errors}")
             for error in errors:
                 self.log.error(f"  - {error}")
 
+        # Extract settings from config
         settings = self.config.get("settings", {})
         self.ticket_panel_channel_id = settings.get("ticket_panel_channel_id", 0)
         self.log_channel_id = settings.get("log_channel_id", 0)
@@ -118,27 +127,8 @@ class Tickets(OakBranch):
         if self.staff_role_ids == [0]:
             self.log.warning("staff_role_ids contains placeholder value [0] - replace with actual role IDs")
 
-        self._thread_update_times: dict[int, float] = {}
-        self._registered_views: list = []
-
-        self.log.info(f"Tickets branch initialized (db: {self.db_path})")
-
-    async def on_enable(self):
-        """Initialize database and register persistent views."""
-        if self.db:
-            await self.db.initialize(TICKETS_SCHEMA)
-
-        await self._run_migrations()
-
-        self.config = get_tickets_config()
-        settings = self.config.get("settings", {})
-        self.ticket_panel_channel_id = settings.get("ticket_panel_channel_id", 0)
-        self.log_channel_id = settings.get("log_channel_id", 0)
-        self.staff_role_ids = settings.get("staff_role_ids", [])
-
-        anti_archive = settings.get("anti_archive", {})
-        self.anti_archive_enabled = anti_archive.get("enabled", True)
-        self.anti_archive_interval = anti_archive.get("check_interval_minutes", 30)
+        # Configure views module with DB and config references
+        configure_views(self.db, self.config)
 
         self.log.info("Registering persistent views for Tickets")
         panel_view = TicketPanelView()
@@ -170,21 +160,13 @@ class Tickets(OakBranch):
         await self.validate_panel()
 
     async def _run_migrations(self):
-        """Run database migrations for existing databases."""
-        try:
-            async with aiosqlite.connect(self.db_path) as db:
-                cursor = await db.execute("PRAGMA table_info(ticket_reminders)")
-                columns = [row[1] async for row in cursor]
-
-                if 'last_reminder_message_id' not in columns:
-                    self.log.info("Running migration: Adding last_reminder_message_id column to ticket_reminders")
-                    await db.execute(
-                        "ALTER TABLE ticket_reminders ADD COLUMN last_reminder_message_id INTEGER"
-                    )
-                    await db.commit()
-                    self.log.info("Migration completed successfully")
-        except Exception as e:
-            self.log.error(f"Error running migrations: {e}", exc_info=True)
+        """Run database migrations using the framework's migration system."""
+        await self.db.migrate([
+            Migration(
+                name="add_last_reminder_message_id",
+                sql="ALTER TABLE ticket_reminders ADD COLUMN last_reminder_message_id INTEGER"
+            )
+        ])
 
     async def on_disable(self):
         """Stop background tasks and remove persistent views."""
@@ -195,6 +177,10 @@ class Tickets(OakBranch):
         for view in self._registered_views:
             view.stop()
         self._registered_views.clear()
+        self.bot.remove_dynamic_items(
+            ReminderStopButton, ReminderSnooze1hButton,
+            ReminderSnooze6hButton, ReminderSnooze1dButton
+        )
         self.log.info("Tickets branch unloaded")
 
     async def validate_panel(self):
@@ -202,50 +188,46 @@ class Tickets(OakBranch):
         try:
             current_hash = hash_config(self.config)
 
-            async with aiosqlite.connect(self.db_path) as db:
-                cursor = await db.execute(
-                    "SELECT message_id, channel_id, config_hash FROM panel_messages ORDER BY id DESC LIMIT 1"
-                )
-                row = await cursor.fetchone()
+            row = await self.db.fetchone(
+                "SELECT message_id, channel_id, config_hash FROM panel_messages ORDER BY id DESC LIMIT 1"
+            )
 
-                needs_update = False
+            needs_update = False
 
-                if row:
-                    message_id, channel_id, stored_hash = row
+            if row:
+                message_id, channel_id, stored_hash = row
 
-                    if current_hash != stored_hash:
-                        self.log.info("Config changed, panel needs update")
-                        needs_update = True
-
-                        channel = self.bot.get_channel(channel_id)
-                        if channel:
-                            try:
-                                old_message = await channel.fetch_message(message_id)
-                                await old_message.delete()
-                                self.log.info(f"Deleted old panel message {message_id}")
-                            except discord.NotFound:
-                                self.log.warning(f"Old panel message {message_id} not found")
-                            except discord.HTTPException as e:
-                                self.log.error(f"Failed to delete old panel: {e}")
-
-                        await db.execute("DELETE FROM panel_messages WHERE message_id = ?", (message_id,))
-                        await db.commit()
-                    else:
-                        channel = self.bot.get_channel(channel_id)
-                        if channel:
-                            try:
-                                await channel.fetch_message(message_id)
-                                self.log.info(f"Panel message validated: {message_id}")
-                            except discord.NotFound:
-                                self.log.warning(f"Panel message {message_id} not found - will recreate")
-                                needs_update = True
-                                await db.execute("DELETE FROM panel_messages WHERE message_id = ?", (message_id,))
-                                await db.commit()
-                else:
+                if current_hash != stored_hash:
+                    self.log.info("Config changed, panel needs update")
                     needs_update = True
 
-                if needs_update:
-                    await self.create_panel()
+                    channel = self.bot.get_channel(channel_id)
+                    if channel:
+                        try:
+                            old_message = await channel.fetch_message(message_id)
+                            await old_message.delete()
+                            self.log.info(f"Deleted old panel message {message_id}")
+                        except discord.NotFound:
+                            self.log.warning(f"Old panel message {message_id} not found")
+                        except discord.HTTPException as e:
+                            self.log.error(f"Failed to delete old panel: {e}")
+
+                    await self.db.execute("DELETE FROM panel_messages WHERE message_id = ?", (message_id,))
+                else:
+                    channel = self.bot.get_channel(channel_id)
+                    if channel:
+                        try:
+                            await channel.fetch_message(message_id)
+                            self.log.info(f"Panel message validated: {message_id}")
+                        except discord.NotFound:
+                            self.log.warning(f"Panel message {message_id} not found - will recreate")
+                            needs_update = True
+                            await self.db.execute("DELETE FROM panel_messages WHERE message_id = ?", (message_id,))
+            else:
+                needs_update = True
+
+            if needs_update:
+                await self.create_panel()
 
         except Exception as e:
             self.log.error(f"Error validating panel: {e}", exc_info=True)
@@ -253,23 +235,22 @@ class Tickets(OakBranch):
     async def create_panel(self):
         """Create the ticket panel message."""
         try:
-            async with aiosqlite.connect(self.db_path) as db:
-                cursor = await db.execute("SELECT message_id, channel_id FROM panel_messages")
-                old_panels = [row async for row in cursor]
+            old_panels = await self.db.fetchall(
+                "SELECT message_id, channel_id FROM panel_messages"
+            )
 
-                for message_id, channel_id in old_panels:
-                    channel = self.bot.get_channel(channel_id)
-                    if channel:
-                        try:
-                            old_message = await channel.fetch_message(message_id)
-                            await old_message.delete()
-                        except discord.NotFound:
-                            pass
-                        except discord.HTTPException as e:
-                            self.log.error(f"Failed to delete old panel {message_id}: {e}")
+            for message_id, channel_id in old_panels:
+                channel = self.bot.get_channel(channel_id)
+                if channel:
+                    try:
+                        old_message = await channel.fetch_message(message_id)
+                        await old_message.delete()
+                    except discord.NotFound:
+                        pass
+                    except discord.HTTPException as e:
+                        self.log.error(f"Failed to delete old panel {message_id}: {e}")
 
-                await db.execute("DELETE FROM panel_messages")
-                await db.commit()
+            await self.db.execute("DELETE FROM panel_messages")
 
             channel = self.bot.get_channel(self.ticket_panel_channel_id)
             if not channel:
@@ -277,7 +258,7 @@ class Tickets(OakBranch):
                 return
 
             panel_config = self.config.get("settings", {}).get("panel", {})
-            title = panel_config.get("title", "🎫 Support Tickets")
+            title = panel_config.get("title", "\U0001f3ab Support Tickets")
             description = panel_config.get("description", "Click a button below to create a ticket.")
             color = panel_config.get("color", 0x5865F2)
 
@@ -296,12 +277,11 @@ class Tickets(OakBranch):
             if enabled_cats:
                 category_list = []
                 for key, cat in enabled_cats:
-                    emoji = cat.get("emoji", "🎫")
+                    emoji = cat.get("emoji", "\U0001f3ab")
                     label = cat.get("label", key.replace('_', ' ').title())
                     desc = cat.get("description", "")
                     category_list.append(f"{emoji} **{label}**\n{desc}")
 
-                panel_config = self.config.get("settings", {}).get("panel", {})
                 field_name = panel_config.get("categories_field_name", "Available Categories")
 
                 embed.add_field(
@@ -314,12 +294,10 @@ class Tickets(OakBranch):
             message = await channel.send(embed=embed, view=view)
 
             current_hash = hash_config(self.config)
-            async with aiosqlite.connect(self.db_path) as db:
-                await db.execute(
-                    "INSERT INTO panel_messages (message_id, channel_id, config_hash) VALUES (?, ?, ?)",
-                    (message.id, channel.id, current_hash)
-                )
-                await db.commit()
+            await self.db.execute(
+                "INSERT INTO panel_messages (message_id, channel_id, config_hash) VALUES (?, ?, ?)",
+                (message.id, channel.id, current_hash)
+            )
 
             self.log.info(f"Created new panel message: {message.id}")
 
@@ -336,17 +314,15 @@ class Tickets(OakBranch):
             del self._thread_update_times[tid]
 
         try:
-            async with aiosqlite.connect(self.db_path) as db:
-                cursor = await db.execute(
-                    "SELECT thread_id FROM tickets WHERE status = 'open'"
-                )
-                open_tickets = [row[0] async for row in cursor]
+            open_tickets = await self.db.fetchall(
+                "SELECT thread_id FROM tickets WHERE status = 'open'"
+            )
 
             if not open_tickets:
                 return
 
             unarchived = 0
-            for thread_id in open_tickets:
+            for (thread_id,) in open_tickets:
                 try:
                     thread = self.bot.get_channel(thread_id)
                     if not thread:
@@ -394,20 +370,19 @@ class Tickets(OakBranch):
 
         try:
             now = datetime.now(timezone.utc)
+            colors = get_embed_colors(self.config)
 
-            async with aiosqlite.connect(self.db_path) as db:
-                cursor = await db.execute(
-                    """SELECT id, ticket_thread_id, user_id, initial_reminder_at, last_reminded_at, dm_enabled, last_reminder_message_id
-                    FROM ticket_reminders
-                    WHERE active = 1
-                    AND (
-                        (initial_reminder_at IS NOT NULL AND initial_reminder_at <= ? AND last_reminded_at IS NULL)
-                        OR (last_reminded_at IS NOT NULL AND datetime(last_reminded_at, '+1 day') <= ?)
-                        OR (initial_reminder_at IS NULL AND last_reminded_at IS NULL AND created_at <= datetime('now', '-1 day'))
-                    )""",
-                    (now.strftime('%Y-%m-%d %H:%M:%S'), now.strftime('%Y-%m-%d %H:%M:%S'))
-                )
-                due_reminders = [row async for row in cursor]
+            due_reminders = await self.db.fetchall(
+                """SELECT id, ticket_thread_id, user_id, initial_reminder_at, last_reminded_at, dm_enabled, last_reminder_message_id
+                FROM ticket_reminders
+                WHERE active = 1
+                AND (
+                    (initial_reminder_at IS NOT NULL AND initial_reminder_at <= ? AND last_reminded_at IS NULL)
+                    OR (last_reminded_at IS NOT NULL AND datetime(last_reminded_at, '+1 day') <= ?)
+                    OR (initial_reminder_at IS NULL AND last_reminded_at IS NULL AND created_at <= datetime('now', '-1 day'))
+                )""",
+                (now.strftime('%Y-%m-%d %H:%M:%S'), now.strftime('%Y-%m-%d %H:%M:%S'))
+            )
 
             if not due_reminders:
                 return
@@ -426,12 +401,10 @@ class Tickets(OakBranch):
 
                     if not thread or not isinstance(thread, discord.Thread):
                         self.log.warning(f"Thread {thread_id} not found, deactivating reminder {reminder_id}")
-                        async with aiosqlite.connect(self.db_path) as db:
-                            await db.execute(
-                                "UPDATE ticket_reminders SET active = 0 WHERE id = ?",
-                                (reminder_id,)
-                            )
-                            await db.commit()
+                        await self.db.execute(
+                            "UPDATE ticket_reminders SET active = 0 WHERE id = ?",
+                            (reminder_id,)
+                        )
                         continue
 
                     user = self.bot.get_user(user_id)
@@ -457,9 +430,9 @@ class Tickets(OakBranch):
 
                     view = build_reminder_view(reminder_id)
                     embed = discord.Embed(
-                        title=f"🔔 {reminder_type} Reminder",
+                        title=f"\U0001f514 {reminder_type} Reminder",
                         description=f"{user.mention}, this is a reminder to check on this ticket.",
-                        color=get_embed_colors()["open"]
+                        color=colors["open"]
                     )
                     embed.add_field(
                         name="Ticket",
@@ -474,9 +447,9 @@ class Tickets(OakBranch):
                     if dm_enabled:
                         try:
                             dm_embed = discord.Embed(
-                                title=f"🔔 Ticket Reminder: {thread.name}",
+                                title=f"\U0001f514 Ticket Reminder: {thread.name}",
                                 description="This is a reminder to check on your ticket.",
-                                color=get_embed_colors()["open"]
+                                color=colors["open"]
                             )
                             dm_embed.add_field(
                                 name="Ticket",
@@ -490,12 +463,10 @@ class Tickets(OakBranch):
                         except discord.HTTPException as e:
                             self.log.error(f"Failed to DM user {user_id}: {e}")
 
-                    async with aiosqlite.connect(self.db_path) as db:
-                        await db.execute(
-                            "UPDATE ticket_reminders SET last_reminded_at = ?, last_reminder_message_id = ? WHERE id = ?",
-                            (now.strftime('%Y-%m-%d %H:%M:%S'), reminder_message.id, reminder_id)
-                        )
-                        await db.commit()
+                    await self.db.execute(
+                        "UPDATE ticket_reminders SET last_reminded_at = ?, last_reminder_message_id = ? WHERE id = ?",
+                        (now.strftime('%Y-%m-%d %H:%M:%S'), reminder_message.id, reminder_id)
+                    )
 
                     await asyncio.sleep(1)
 
@@ -532,135 +503,132 @@ class Tickets(OakBranch):
         archived = metadata.get('archived', False)
         locked = metadata.get('locked', False)
 
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute(
-                "SELECT status FROM tickets WHERE thread_id = ?",
+        ticket = await self.db.fetchone(
+            "SELECT status FROM tickets WHERE thread_id = ?",
+            (payload.thread_id,)
+        )
+
+        if not ticket:
+            return
+
+        status = ticket[0]
+
+        if status == 'closed' and (not archived or not locked):
+            ticket_data = await self.db.fetchone(
+                "SELECT user_id, category FROM tickets WHERE thread_id = ?",
                 (payload.thread_id,)
             )
-            ticket = await cursor.fetchone()
+            if not ticket_data:
+                return
+            creator_id, category = ticket_data
 
-            if not ticket:
+            # Resolve the thread
+            thread = self.bot.get_channel(payload.thread_id)
+            if not thread:
+                for guild in self.bot.guilds:
+                    try:
+                        thread = await guild.fetch_channel(payload.thread_id)
+                        if thread:
+                            break
+                    except (discord.NotFound, discord.HTTPException):
+                        continue
+
+            if not thread or not isinstance(thread, discord.Thread):
                 return
 
-            status = ticket[0]
+            # Check if the unarchiver is authorized (admin, global staff, or category staff)
+            unarchiver = None
+            try:
+                guild = thread.guild
+                async for entry in guild.audit_logs(limit=5, action=discord.AuditLogAction.thread_update):
+                    if entry.target and entry.target.id == payload.thread_id:
+                        unarchiver = entry.user
+                        break
+            except (discord.Forbidden, discord.HTTPException) as e:
+                self.log.warning(f"Could not check audit log for thread {payload.thread_id}: {e}")
 
-            if status == 'closed' and (not archived or not locked):
-                cursor = await db.execute(
-                    "SELECT user_id, category FROM tickets WHERE thread_id = ?",
-                    (payload.thread_id,)
-                )
-                ticket_data = await cursor.fetchone()
-                if not ticket_data:
-                    return
-                creator_id, category = ticket_data
+            # If we found an unarchiver, check authorization
+            if unarchiver and not unarchiver.bot:
+                is_authorized = False
 
-                # Resolve the thread
-                thread = self.bot.get_channel(payload.thread_id)
-                if not thread:
-                    for guild in self.bot.guilds:
-                        try:
-                            thread = await guild.fetch_channel(payload.thread_id)
-                            if thread:
-                                break
-                        except (discord.NotFound, discord.HTTPException):
-                            continue
+                # Check if admin
+                member = thread.guild.get_member(unarchiver.id)
+                if member:
+                    if member.guild_permissions.administrator:
+                        is_authorized = True
 
-                if not thread or not isinstance(thread, discord.Thread):
-                    return
+                    # Check global staff roles
+                    if not is_authorized and any(role.id in self.staff_role_ids for role in member.roles):
+                        is_authorized = True
 
-                # Check if the unarchiver is authorized (admin, global staff, or category staff)
-                unarchiver = None
-                try:
-                    guild = thread.guild
-                    async for entry in guild.audit_logs(limit=5, action=discord.AuditLogAction.thread_update):
-                        if entry.target and entry.target.id == payload.thread_id:
-                            unarchiver = entry.user
-                            break
-                except (discord.Forbidden, discord.HTTPException) as e:
-                    self.log.warning(f"Could not check audit log for thread {payload.thread_id}: {e}")
-
-                # If we found an unarchiver, check authorization
-                if unarchiver and not unarchiver.bot:
-                    is_authorized = False
-
-                    # Check if admin
-                    member = thread.guild.get_member(unarchiver.id)
-                    if member:
-                        if member.guild_permissions.administrator:
-                            is_authorized = True
-
-                        # Check global staff roles
-                        if not is_authorized and any(role.id in self.staff_role_ids for role in member.roles):
-                            is_authorized = True
-
-                        # Check category-specific staff roles
-                        if not is_authorized:
-                            config = get_tickets_config()
-                            categories = config.get("settings", {}).get("categories", {})
-                            category_config = categories.get(category, {})
-                            cat_staff_roles = category_config.get("staff_roles", category_config.get("ping_roles", []))
-                            if any(role.id in cat_staff_roles for role in member.roles):
-                                is_authorized = True
-
+                    # Check category-specific staff roles
                     if not is_authorized:
-                        # Unauthorized reopen - re-archive and re-lock
-                        self.log.warning(
-                            f"Unauthorized reopen of ticket {payload.thread_id} by user {unarchiver.id}, re-archiving"
-                        )
-                        try:
-                            await thread.edit(archived=True, locked=True)
-                        except discord.HTTPException as e:
-                            self.log.error(f"Failed to re-archive unauthorized thread {payload.thread_id}: {e}")
-                        return
+                        categories = self.config.get("settings", {}).get("categories", {})
+                        category_config = categories.get(category, {})
+                        cat_staff_roles = category_config.get("staff_roles", category_config.get("ping_roles", []))
+                        if any(role.id in cat_staff_roles for role in member.roles):
+                            is_authorized = True
 
-                elif unarchiver is None:
-                    # Audit log lookup failed — deny the reopen for safety
-                    self.log.error(
-                        f"Could not determine who unarchived closed ticket {payload.thread_id}; "
-                        "re-archiving (likely missing Audit Log permission)"
+                if not is_authorized:
+                    # Unauthorized reopen - re-archive and re-lock
+                    self.log.warning(
+                        f"Unauthorized reopen of ticket {payload.thread_id} by user {unarchiver.id}, re-archiving"
                     )
                     try:
                         await thread.edit(archived=True, locked=True)
                     except discord.HTTPException as e:
-                        self.log.error(f"Failed to re-archive thread {payload.thread_id}: {e}")
+                        self.log.error(f"Failed to re-archive unauthorized thread {payload.thread_id}: {e}")
                     return
 
-                # Authorized reopen - update DB and notify
-                await db.execute(
-                    "UPDATE tickets SET status = 'open', reopened_by = NULL, closed_at = NULL WHERE thread_id = ?",
-                    (payload.thread_id,)
+            elif unarchiver is None:
+                # Audit log lookup failed -- deny the reopen for safety
+                self.log.error(
+                    f"Could not determine who unarchived closed ticket {payload.thread_id}; "
+                    "re-archiving (likely missing Audit Log permission)"
                 )
-                await db.commit()
-
                 try:
-                    await thread.edit(archived=False, locked=False)
-
-                    from .views import TicketControlView
-                    reopen_embed = discord.Embed(
-                        title="🔓 Ticket Reopened",
-                        description="This ticket has been reopened.",
-                        color=get_embed_colors()["open"]
-                    )
-                    await thread.send(embed=reopen_embed, view=TicketControlView())
-
-                    if self.log_channel_id:
-                        log_channel = thread.guild.get_channel(self.log_channel_id)
-                        if log_channel:
-                            log_embed = format_log_embed(
-                                "reopened",
-                                {
-                                    "category": category,
-                                    "thread_id": thread.id,
-                                    "creator_id": creator_id
-                                }
-                            )
-                            try:
-                                await log_channel.send(embed=log_embed)
-                            except discord.HTTPException as e:
-                                self.log.error(f"Failed to log ticket reopen: {e}")
-
+                    await thread.edit(archived=True, locked=True)
                 except discord.HTTPException as e:
-                    self.log.error(f"Failed to reopen ticket {payload.thread_id}: {e}")
+                    self.log.error(f"Failed to re-archive thread {payload.thread_id}: {e}")
+                return
+
+            # Authorized reopen - update DB and notify
+            colors = get_embed_colors(self.config)
+
+            await self.db.execute(
+                "UPDATE tickets SET status = 'open', reopened_by = NULL, closed_at = NULL WHERE thread_id = ?",
+                (payload.thread_id,)
+            )
+
+            try:
+                await thread.edit(archived=False, locked=False)
+
+                reopen_embed = discord.Embed(
+                    title="\U0001f513 Ticket Reopened",
+                    description="This ticket has been reopened.",
+                    color=colors["open"]
+                )
+                await thread.send(embed=reopen_embed, view=TicketControlView())
+
+                if self.log_channel_id:
+                    log_channel = thread.guild.get_channel(self.log_channel_id)
+                    if log_channel:
+                        log_embed = format_log_embed(
+                            "reopened",
+                            {
+                                "category": category,
+                                "thread_id": thread.id,
+                                "creator_id": creator_id
+                            },
+                            colors=colors
+                        )
+                        try:
+                            await log_channel.send(embed=log_embed)
+                        except discord.HTTPException as e:
+                            self.log.error(f"Failed to log ticket reopen: {e}")
+
+            except discord.HTTPException as e:
+                self.log.error(f"Failed to reopen ticket {payload.thread_id}: {e}")
 
     @app_commands.command(name="tickets", description="View your open tickets")
     async def list_tickets(self, interaction: discord.Interaction):
@@ -668,12 +636,11 @@ class Tickets(OakBranch):
         await interaction.response.defer(ephemeral=True)
 
         try:
-            async with aiosqlite.connect(self.db_path) as db:
-                cursor = await db.execute(
-                    "SELECT thread_id, category, created_at FROM tickets WHERE user_id = ? AND status = 'open' ORDER BY created_at DESC",
-                    (interaction.user.id,)
-                )
-                tickets = [row async for row in cursor]
+            colors = get_embed_colors(self.config)
+            tickets = await self.db.fetchall(
+                "SELECT thread_id, category, created_at FROM tickets WHERE user_id = ? AND status = 'open' ORDER BY created_at DESC",
+                (interaction.user.id,)
+            )
 
             if not tickets:
                 await interaction.followup.send(
@@ -683,14 +650,14 @@ class Tickets(OakBranch):
                 return
 
             embed = discord.Embed(
-                title="📋 Your Open Tickets",
-                color=get_embed_colors()["open"]
+                title="\U0001f4cb Your Open Tickets",
+                color=colors["open"]
             )
 
             for thread_id, category, created_at in tickets:
                 category_name = category.replace('_', ' ').title()
                 embed.add_field(
-                    name=f"🎫 {category_name}",
+                    name=f"\U0001f3ab {category_name}",
                     value=f"Thread: <#{thread_id}>\nCreated: {created_at[:16]}",
                     inline=False
                 )
@@ -700,7 +667,7 @@ class Tickets(OakBranch):
         except Exception as e:
             self.log.error(f"Error listing tickets: {e}", exc_info=True)
             await interaction.followup.send(
-                "❌ An error occurred while fetching your tickets.",
+                "\u274c An error occurred while fetching your tickets.",
                 ephemeral=True
             )
 
@@ -709,7 +676,7 @@ class Tickets(OakBranch):
         """Reopen a closed ticket."""
         if not isinstance(interaction.channel, discord.Thread):
             await interaction.response.send_message(
-                "❌ This command can only be used in ticket threads.",
+                "\u274c This command can only be used in ticket threads.",
                 ephemeral=True
             )
             return
@@ -717,45 +684,43 @@ class Tickets(OakBranch):
         await interaction.response.defer(ephemeral=True)
 
         thread = interaction.channel
+        colors = get_embed_colors(self.config)
 
         try:
-            async with aiosqlite.connect(self.db_path) as db:
-                cursor = await db.execute(
-                    "SELECT user_id, category, status FROM tickets WHERE thread_id = ?",
-                    (thread.id,)
+            ticket = await self.db.fetchone(
+                "SELECT user_id, category, status FROM tickets WHERE thread_id = ?",
+                (thread.id,)
+            )
+
+            if not ticket:
+                await interaction.followup.send(
+                    "\u274c This is not a valid ticket thread.",
+                    ephemeral=True
                 )
-                ticket = await cursor.fetchone()
+                return
 
-                if not ticket:
-                    await interaction.followup.send(
-                        "❌ This is not a valid ticket thread.",
-                        ephemeral=True
-                    )
-                    return
+            creator_id, category, status = ticket
 
-                creator_id, category, status = ticket
-
-                if not can_manage_ticket_category(interaction, category):
-                    await interaction.followup.send(
-                        "❌ You don't have permission to reopen tickets in this category.",
-                        ephemeral=True
-                    )
-                    return
-
-                if status == 'open':
-                    await interaction.followup.send(
-                        "❌ This ticket is already open.",
-                        ephemeral=True
-                    )
-                    return
-
-                await db.execute(
-                    """UPDATE tickets
-                    SET status = 'open', reopened_by = ?, closed_at = NULL
-                    WHERE thread_id = ?""",
-                    (interaction.user.id, thread.id)
+            if not can_manage_ticket_category(interaction, category, self.config):
+                await interaction.followup.send(
+                    "\u274c You don't have permission to reopen tickets in this category.",
+                    ephemeral=True
                 )
-                await db.commit()
+                return
+
+            if status == 'open':
+                await interaction.followup.send(
+                    "\u274c This ticket is already open.",
+                    ephemeral=True
+                )
+                return
+
+            await self.db.execute(
+                """UPDATE tickets
+                SET status = 'open', reopened_by = ?, closed_at = NULL
+                WHERE thread_id = ?""",
+                (interaction.user.id, thread.id)
+            )
 
             try:
                 await thread.edit(archived=False, locked=False)
@@ -763,9 +728,9 @@ class Tickets(OakBranch):
                 self.log.error(f"Failed to unarchive/unlock thread: {e}")
 
             reopen_embed = discord.Embed(
-                title="🔓 Ticket Reopened",
+                title="\U0001f513 Ticket Reopened",
                 description=f"This ticket has been reopened by {interaction.user.mention}",
-                color=get_embed_colors()["open"]
+                color=colors["open"]
             )
 
             await thread.send(embed=reopen_embed, view=TicketControlView())
@@ -780,7 +745,8 @@ class Tickets(OakBranch):
                             "thread_id": thread.id,
                             "creator_id": creator_id
                         },
-                        user=interaction.user
+                        user=interaction.user,
+                        colors=colors
                     )
                     try:
                         await log_channel.send(embed=log_embed)
@@ -788,14 +754,14 @@ class Tickets(OakBranch):
                         self.log.error(f"Failed to log ticket reopen: {e}")
 
             await interaction.followup.send(
-                "✅ Ticket reopened successfully.",
+                "\u2705 Ticket reopened successfully.",
                 ephemeral=True
             )
 
         except Exception as e:
             self.log.error(f"Error reopening ticket: {e}", exc_info=True)
             await interaction.followup.send(
-                "❌ An error occurred while reopening the ticket.",
+                "\u274c An error occurred while reopening the ticket.",
                 ephemeral=True
             )
 
@@ -805,7 +771,7 @@ class Tickets(OakBranch):
         """Close a ticket via slash command (works in any ticket thread)."""
         if not isinstance(interaction.channel, discord.Thread):
             await interaction.response.send_message(
-                "❌ This command can only be used in ticket threads.",
+                "\u274c This command can only be used in ticket threads.",
                 ephemeral=True
             )
             return
@@ -813,42 +779,41 @@ class Tickets(OakBranch):
         await interaction.response.defer(ephemeral=True)
 
         thread = interaction.channel
+        colors = get_embed_colors(self.config)
 
         try:
-            async with aiosqlite.connect(self.db_path) as db:
-                cursor = await db.execute(
-                    "SELECT user_id, category, status FROM tickets WHERE thread_id = ?",
-                    (thread.id,)
+            ticket = await self.db.fetchone(
+                "SELECT user_id, category, status FROM tickets WHERE thread_id = ?",
+                (thread.id,)
+            )
+
+            if not ticket:
+                await interaction.followup.send(
+                    "\u274c This is not a valid ticket thread.",
+                    ephemeral=True
                 )
-                ticket = await cursor.fetchone()
+                return
 
-                if not ticket:
-                    await interaction.followup.send(
-                        "❌ This is not a valid ticket thread.",
-                        ephemeral=True
-                    )
-                    return
+            creator_id, category, status = ticket
 
-                creator_id, category, status = ticket
+            if not can_manage_ticket_category(interaction, category, self.config):
+                await interaction.followup.send(
+                    "\u274c You don't have permission to close tickets in this category.",
+                    ephemeral=True
+                )
+                return
 
-                if not can_manage_ticket_category(interaction, category):
-                    await interaction.followup.send(
-                        "❌ You don't have permission to close tickets in this category.",
-                        ephemeral=True
-                    )
-                    return
-
-                if status == 'closed':
-                    await interaction.followup.send(
-                        "❌ This ticket is already closed.",
-                        ephemeral=True
-                    )
-                    return
+            if status == 'closed':
+                await interaction.followup.send(
+                    "\u274c This ticket is already closed.",
+                    ephemeral=True
+                )
+                return
 
             close_embed = discord.Embed(
-                title="🔒 Ticket Closed",
+                title="\U0001f512 Ticket Closed",
                 description=f"This ticket has been closed by {interaction.user.mention}",
-                color=get_embed_colors()["closed"]
+                color=colors["closed"]
             )
 
             if reason:
@@ -860,29 +825,34 @@ class Tickets(OakBranch):
             except discord.HTTPException as e:
                 self.log.error(f"Failed to send close message: {e}")
 
-            try:
-                await thread.edit(archived=True, locked=True)
-            except discord.HTTPException as e:
-                self.log.error(f"Failed to close thread: {e}")
-                await interaction.followup.send(
-                    "❌ Failed to close the ticket thread. Please check bot permissions and try again.",
-                    ephemeral=True
-                )
-                return
-
-            async with aiosqlite.connect(self.db_path) as db:
-                await db.execute(
+            # Update DB BEFORE archiving to prevent inconsistent state
+            async with self.db.transaction() as conn:
+                await conn.execute(
                     """UPDATE tickets
                     SET status = 'closed', closed_by = ?, close_reason = ?, closed_at = datetime('now')
                     WHERE thread_id = ?""",
                     (interaction.user.id, reason, thread.id)
                 )
-                await db.execute(
+                await conn.execute(
                     "UPDATE ticket_reminders SET active = 0 WHERE ticket_thread_id = ? AND active = 1",
                     (thread.id,)
                 )
-                await db.commit()
-                self.log.info(f"Closed ticket {thread.id} and cancelled reminders")
+            self.log.info(f"Closed ticket {thread.id} and cancelled reminders")
+
+            try:
+                await thread.edit(archived=True, locked=True)
+            except discord.HTTPException as e:
+                self.log.error(f"Failed to close thread: {e}")
+                # Revert DB since thread couldn't be archived
+                await self.db.execute(
+                    "UPDATE tickets SET status = 'open', closed_by = NULL, close_reason = NULL, closed_at = NULL WHERE thread_id = ?",
+                    (thread.id,)
+                )
+                await interaction.followup.send(
+                    "\u274c Failed to close the ticket thread. Please check bot permissions and try again.",
+                    ephemeral=True
+                )
+                return
 
             if self.log_channel_id:
                 log_channel = interaction.guild.get_channel(self.log_channel_id)
@@ -895,17 +865,23 @@ class Tickets(OakBranch):
                             "creator_id": creator_id
                         },
                         user=interaction.user,
-                        reason=reason
+                        reason=reason,
+                        colors=colors
                     )
                     try:
                         await log_channel.send(embed=log_embed)
                     except discord.HTTPException as e:
                         self.log.error(f"Failed to log ticket closure: {e}")
 
+            await interaction.followup.send(
+                "\u2705 Ticket closed successfully.",
+                ephemeral=True
+            )
+
         except Exception as e:
             self.log.error(f"Error closing ticket: {e}", exc_info=True)
             await interaction.followup.send(
-                "❌ An error occurred while closing the ticket.",
+                "\u274c An error occurred while closing the ticket.",
                 ephemeral=True
             )
 
@@ -915,8 +891,7 @@ class Tickets(OakBranch):
         current: str,
     ) -> list[app_commands.Choice[str]]:
         """Autocomplete categories from config."""
-        config = get_tickets_config()
-        categories = config.get("settings", {}).get("categories", {})
+        categories = self.config.get("settings", {}).get("categories", {})
 
         choices = [
             app_commands.Choice(
@@ -945,14 +920,14 @@ class Tickets(OakBranch):
         """Manually add a thread to the tickets database."""
         if not is_staff(interaction, self.staff_role_ids):
             await interaction.response.send_message(
-                "❌ You don't have permission to use this command.",
+                "\u274c You don't have permission to use this command.",
                 ephemeral=True
             )
             return
 
         if not isinstance(interaction.channel, discord.Thread):
             await interaction.response.send_message(
-                "❌ This command can only be used in ticket threads.",
+                "\u274c This command can only be used in ticket threads.",
                 ephemeral=True
             )
             return
@@ -962,11 +937,10 @@ class Tickets(OakBranch):
         thread = interaction.channel
 
         try:
-            config = get_tickets_config()
-            categories = config.get("settings", {}).get("categories", {})
+            categories = self.config.get("settings", {}).get("categories", {})
             if category not in categories:
                 await interaction.followup.send(
-                    f"❌ Invalid category: '{category}'. Please choose from the autocomplete list.",
+                    f"\u274c Invalid category: '{category}'. Please choose from the autocomplete list.",
                     ephemeral=True
                 )
                 return
@@ -974,64 +948,69 @@ class Tickets(OakBranch):
             category_config = categories[category]
             if not category_config.get("enabled", True):
                 await interaction.followup.send(
-                    f"❌ Category '{category}' is currently disabled.",
+                    f"\u274c Category '{category}' is currently disabled.",
                     ephemeral=True
                 )
                 return
 
-            async with aiosqlite.connect(self.db_path) as db:
-                cursor = await db.execute(
-                    "SELECT id FROM tickets WHERE thread_id = ?",
-                    (thread.id,)
+            existing = await self.db.fetchone(
+                "SELECT id FROM tickets WHERE thread_id = ?",
+                (thread.id,)
+            )
+
+            if existing:
+                await interaction.followup.send(
+                    "\u274c This ticket is already in the database.",
+                    ephemeral=True
                 )
-                existing = await cursor.fetchone()
+                return
 
-                if existing:
-                    await interaction.followup.send(
-                        "❌ This ticket is already in the database.",
-                        ephemeral=True
+            if user:
+                user_id = user.id
+            elif thread.owner:
+                user_id = thread.owner.id
+            elif thread.owner_id:
+                user_id = thread.owner_id
+            else:
+                await interaction.followup.send(
+                    "\u274c Could not determine ticket owner. Please specify a user.",
+                    ephemeral=True
+                )
+                return
+
+            status = "closed" if (thread.archived and thread.locked) else "open"
+
+            ticket_number = None
+            naming_pattern = category_config.get("naming_pattern", "")
+            if "{number}" in naming_pattern:
+                # Use transaction to combine number generation + insert atomically
+                async with self.db.transaction() as conn:
+                    ticket_number = await get_next_ticket_number(category, conn)
+                    await conn.execute(
+                        """INSERT INTO tickets
+                        (thread_id, user_id, category, ticket_number, status, created_at)
+                        VALUES (?, ?, ?, ?, ?, datetime('now'))""",
+                        (thread.id, user_id, category, ticket_number, status)
                     )
-                    return
-
-                if user:
-                    user_id = user.id
-                elif thread.owner:
-                    user_id = thread.owner.id
-                elif thread.owner_id:
-                    user_id = thread.owner_id
-                else:
-                    await interaction.followup.send(
-                        "❌ Could not determine ticket owner. Please specify a user.",
-                        ephemeral=True
-                    )
-                    return
-
-                status = "closed" if (thread.archived and thread.locked) else "open"
-
-                ticket_number = None
-                naming_pattern = category_config.get("naming_pattern", "")
-                if "{number}" in naming_pattern:
-                    ticket_number = await get_next_ticket_number(category, db)
-
-                await db.execute(
+            else:
+                await self.db.execute(
                     """INSERT INTO tickets
                     (thread_id, user_id, category, ticket_number, status, created_at)
                     VALUES (?, ?, ?, ?, ?, datetime('now'))""",
                     (thread.id, user_id, category, ticket_number, status)
                 )
-                await db.commit()
 
             category_name = category.replace('_', ' ').title()
             ticket_identifier = f"#{ticket_number}" if ticket_number else f"ID:{user_id}"
             user_mention = user.mention if user else f"<@{user_id}>"
 
             await interaction.followup.send(
-                f"✅ Ticket added to database!\n"
-                f"• Category: {category_name}\n"
-                f"• Ticket: {ticket_identifier}\n"
-                f"• User: {user_mention}\n"
-                f"• Status: {status}\n"
-                f"• Thread: {thread.mention}",
+                f"\u2705 Ticket added to database!\n"
+                f"\u2022 Category: {category_name}\n"
+                f"\u2022 Ticket: {ticket_identifier}\n"
+                f"\u2022 User: {user_mention}\n"
+                f"\u2022 Status: {status}\n"
+                f"\u2022 Thread: {thread.mention}",
                 ephemeral=True
             )
 
@@ -1040,7 +1019,7 @@ class Tickets(OakBranch):
         except Exception as e:
             self.log.error(f"Error adding ticket manually: {e}", exc_info=True)
             await interaction.followup.send(
-                "❌ An error occurred while adding the ticket to the database.",
+                "\u274c An error occurred while adding the ticket to the database.",
                 ephemeral=True
             )
 
@@ -1049,7 +1028,7 @@ class Tickets(OakBranch):
         """Show ticket statistics."""
         if not is_staff(interaction, self.staff_role_ids):
             await interaction.response.send_message(
-                "❌ You don't have permission to view ticket statistics.",
+                "\u274c You don't have permission to view ticket statistics.",
                 ephemeral=True
             )
             return
@@ -1057,30 +1036,29 @@ class Tickets(OakBranch):
         await interaction.response.defer(ephemeral=True)
 
         try:
-            async with aiosqlite.connect(self.db_path) as db:
-                cursor = await db.execute("SELECT COUNT(*) FROM tickets")
-                total = (await cursor.fetchone())[0]
+            colors = get_embed_colors(self.config)
 
-                cursor = await db.execute(
-                    "SELECT status, COUNT(*) FROM tickets GROUP BY status"
-                )
-                status_counts = {row[0]: row[1] async for row in cursor}
+            total_row = await self.db.fetchone("SELECT COUNT(*) FROM tickets")
+            total = total_row[0]
 
-                cursor = await db.execute(
-                    "SELECT category, COUNT(*) FROM tickets GROUP BY category ORDER BY COUNT(*) DESC LIMIT 5"
-                )
-                category_counts = [(row[0], row[1]) async for row in cursor]
+            status_rows = await self.db.fetchall(
+                "SELECT status, COUNT(*) FROM tickets GROUP BY status"
+            )
+            status_counts = {row[0]: row[1] for row in status_rows}
 
-                cursor = await db.execute(
-                    """SELECT AVG(julianday(closed_at) - julianday(created_at))
-                    FROM tickets WHERE status = 'closed' AND closed_at IS NOT NULL"""
-                )
-                avg_days = await cursor.fetchone()
-                avg_resolution = avg_days[0] if avg_days[0] else 0
+            category_rows = await self.db.fetchall(
+                "SELECT category, COUNT(*) FROM tickets GROUP BY category ORDER BY COUNT(*) DESC LIMIT 5"
+            )
+
+            avg_row = await self.db.fetchone(
+                """SELECT AVG(julianday(closed_at) - julianday(created_at))
+                FROM tickets WHERE status = 'closed' AND closed_at IS NOT NULL"""
+            )
+            avg_resolution = avg_row[0] if avg_row[0] else 0
 
             embed = discord.Embed(
-                title="📊 Ticket Statistics",
-                color=get_embed_colors()["open"]
+                title="\U0001f4ca Ticket Statistics",
+                color=colors["open"]
             )
 
             embed.add_field(name="Total Tickets", value=f"**{total}**", inline=True)
@@ -1103,10 +1081,10 @@ class Tickets(OakBranch):
                     inline=True
                 )
 
-            if category_counts:
+            if category_rows:
                 cat_text = "\n".join([
                     f"**{cat.replace('_', ' ').title()}:** {count}"
-                    for cat, count in category_counts
+                    for cat, count in category_rows
                 ])
                 embed.add_field(
                     name="Top Categories",
@@ -1119,7 +1097,7 @@ class Tickets(OakBranch):
         except Exception as e:
             self.log.error(f"Error getting ticket stats: {e}", exc_info=True)
             await interaction.followup.send(
-                "❌ An error occurred while fetching statistics.",
+                "\u274c An error occurred while fetching statistics.",
                 ephemeral=True
             )
 
@@ -1135,7 +1113,7 @@ class Tickets(OakBranch):
 
         if not isinstance(interaction.channel, discord.Thread):
             await interaction.response.send_message(
-                "❌ This command can only be used in ticket threads.",
+                "\u274c This command can only be used in ticket threads.",
                 ephemeral=True
             )
             return
@@ -1145,78 +1123,74 @@ class Tickets(OakBranch):
         try:
             thread = interaction.channel
 
-            async with aiosqlite.connect(self.db_path) as db:
-                cursor = await db.execute(
-                    "SELECT user_id, status FROM tickets WHERE thread_id = ?",
-                    (thread.id,)
+            ticket_row = await self.db.fetchone(
+                "SELECT user_id, status FROM tickets WHERE thread_id = ?",
+                (thread.id,)
+            )
+
+            if not ticket_row:
+                await interaction.followup.send(
+                    "\u274c This doesn't appear to be a ticket thread.",
+                    ephemeral=True
                 )
-                ticket_row = await cursor.fetchone()
+                return
 
-                if not ticket_row:
-                    await interaction.followup.send(
-                        "❌ This doesn't appear to be a ticket thread.",
-                        ephemeral=True
-                    )
-                    return
+            ticket_creator_id, ticket_status = ticket_row
 
-                ticket_creator_id, ticket_status = ticket_row
-
-                if ticket_status != 'open':
-                    await interaction.followup.send(
-                        "❌ You can only set reminders for open tickets.",
-                        ephemeral=True
-                    )
-                    return
-
-                cursor = await db.execute(
-                    "SELECT id FROM ticket_reminders WHERE ticket_thread_id = ? AND user_id = ? AND active = 1",
-                    (thread.id, interaction.user.id)
+            if ticket_status != 'open':
+                await interaction.followup.send(
+                    "\u274c You can only set reminders for open tickets.",
+                    ephemeral=True
                 )
-                existing = await cursor.fetchone()
+                return
 
-                if existing:
+            existing = await self.db.fetchone(
+                "SELECT id FROM ticket_reminders WHERE ticket_thread_id = ? AND user_id = ? AND active = 1",
+                (thread.id, interaction.user.id)
+            )
+
+            if existing:
+                await interaction.followup.send(
+                    "\u274c You already have an active reminder for this ticket. Stop it first before creating a new one.",
+                    ephemeral=True
+                )
+                return
+
+            initial_reminder_seconds = None
+            initial_reminder_at = None
+
+            if time:
+                initial_reminder_seconds = parse_time_string(time)
+                if initial_reminder_seconds is None:
                     await interaction.followup.send(
-                        "❌ You already have an active reminder for this ticket. Stop it first before creating a new one.",
+                        "\u274c Invalid time format. Use formats like: `30m`, `1h`, `2h`, `1d`",
                         ephemeral=True
                     )
                     return
 
-                initial_reminder_seconds = None
-                initial_reminder_at = None
+                initial_reminder_at = datetime.now(timezone.utc) + timedelta(seconds=initial_reminder_seconds)
 
-                if time:
-                    initial_reminder_seconds = parse_time_string(time)
-                    if initial_reminder_seconds is None:
-                        await interaction.followup.send(
-                            "❌ Invalid time format. Use formats like: `30m`, `1h`, `2h`, `1d`",
-                            ephemeral=True
-                        )
-                        return
-
-                    initial_reminder_at = datetime.now(timezone.utc) + timedelta(seconds=initial_reminder_seconds)
-
-                try:
-                    await db.execute(
-                        """INSERT INTO ticket_reminders
-                        (ticket_thread_id, user_id, initial_reminder_at, last_reminded_at, dm_enabled, active)
-                        VALUES (?, ?, ?, ?, ?, 1)""",
-                        (
-                            thread.id,
-                            interaction.user.id,
-                            initial_reminder_at.strftime('%Y-%m-%d %H:%M:%S') if initial_reminder_at else None,
-                            None,
-                            1 if dm else 0
-                        )
+            try:
+                await self.db.execute(
+                    """INSERT INTO ticket_reminders
+                    (ticket_thread_id, user_id, initial_reminder_at, last_reminded_at, dm_enabled, active)
+                    VALUES (?, ?, ?, ?, ?, 1)""",
+                    (
+                        thread.id,
+                        interaction.user.id,
+                        initial_reminder_at.strftime('%Y-%m-%d %H:%M:%S') if initial_reminder_at else None,
+                        None,
+                        1 if dm else 0
                     )
-                    await db.commit()
-                except aiosqlite.IntegrityError:
-                    await interaction.followup.send(
-                        "❌ You already have an active reminder for this ticket.",
-                        ephemeral=True
-                    )
-                    return
+                )
+            except sqlite3.IntegrityError:
+                await interaction.followup.send(
+                    "\u274c You already have an active reminder for this ticket.",
+                    ephemeral=True
+                )
+                return
 
-            msg_parts = ["✅ Reminder set!"]
+            msg_parts = ["\u2705 Reminder set!"]
 
             if time:
                 msg_parts.append(f"**Initial reminder:** In {time}")
@@ -1234,7 +1208,7 @@ class Tickets(OakBranch):
         except Exception as e:
             self.log.error(f"Error creating reminder: {e}", exc_info=True)
             await interaction.followup.send(
-                "❌ An error occurred while creating the reminder.",
+                "\u274c An error occurred while creating the reminder.",
                 ephemeral=True
             )
 
@@ -1243,7 +1217,7 @@ class Tickets(OakBranch):
         """Stop a reminder for this ticket."""
         if not isinstance(interaction.channel, discord.Thread):
             await interaction.response.send_message(
-                "❌ This command can only be used in ticket threads.",
+                "\u274c This command can only be used in ticket threads.",
                 ephemeral=True
             )
             return
@@ -1253,31 +1227,28 @@ class Tickets(OakBranch):
         try:
             thread = interaction.channel
 
-            async with aiosqlite.connect(self.db_path) as db:
-                cursor = await db.execute(
-                    """SELECT id FROM ticket_reminders
-                    WHERE ticket_thread_id = ? AND user_id = ? AND active = 1""",
-                    (thread.id, interaction.user.id)
+            reminder = await self.db.fetchone(
+                """SELECT id FROM ticket_reminders
+                WHERE ticket_thread_id = ? AND user_id = ? AND active = 1""",
+                (thread.id, interaction.user.id)
+            )
+
+            if not reminder:
+                await interaction.followup.send(
+                    "\u274c You don't have an active reminder for this ticket.",
+                    ephemeral=True
                 )
-                reminder = await cursor.fetchone()
+                return
 
-                if not reminder:
-                    await interaction.followup.send(
-                        "❌ You don't have an active reminder for this ticket.",
-                        ephemeral=True
-                    )
-                    return
+            reminder_id = reminder[0]
 
-                reminder_id = reminder[0]
-
-                await db.execute(
-                    "UPDATE ticket_reminders SET active = 0 WHERE id = ?",
-                    (reminder_id,)
-                )
-                await db.commit()
+            await self.db.execute(
+                "UPDATE ticket_reminders SET active = 0 WHERE id = ?",
+                (reminder_id,)
+            )
 
             await interaction.followup.send(
-                "✅ Your reminder for this ticket has been stopped.",
+                "\u2705 Your reminder for this ticket has been stopped.",
                 ephemeral=True
             )
             self.log.info(f"User {interaction.user.id} stopped reminder {reminder_id} for ticket {thread.id}")
@@ -1285,6 +1256,6 @@ class Tickets(OakBranch):
         except Exception as e:
             self.log.error(f"Error stopping reminder: {e}", exc_info=True)
             await interaction.followup.send(
-                "❌ An error occurred while stopping the reminder.",
+                "\u274c An error occurred while stopping the reminder.",
                 ephemeral=True
             )

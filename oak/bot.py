@@ -169,5 +169,5 @@ class OakBot(commands.Bot):
                 await interaction.followup.send(message, ephemeral=True)
             else:
                 await interaction.response.send_message(message, ephemeral=True)
-        except discord.HTTPException:
-            pass
+        except discord.HTTPException as e:
+            logger.debug(f"Failed to send error response for {interaction.command}: {e}")

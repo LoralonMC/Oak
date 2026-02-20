@@ -4,6 +4,8 @@ Stateless import engine for CSV trade log files.
 All config is passed in as arguments from branch.py.
 """
 
+from __future__ import annotations
+
 import asyncio
 import csv
 import hashlib
@@ -11,10 +13,14 @@ import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import aiosqlite
 
 from .nbt_parser import parse_item_metadata, parse_shulker_contents
+
+if TYPE_CHECKING:
+    from oak.database import BranchDatabase
 
 logger = logging.getLogger(__name__)
 
@@ -64,19 +70,19 @@ class ImportResult:
     errors: list[str] = field(default_factory=list)
 
 
-def _read_csv_file(filepath: str) -> list[list[str]]:
-    """Read all rows from a CSV file synchronously.
+def _read_csv_rows(filepath: str):
+    """Iterate over rows from a CSV file synchronously.
 
-    Returns a list of rows (each row is a list of strings).
+    Yields each row as a list of strings.
     This function runs in a thread to avoid blocking the event loop.
     """
     with open(filepath, "r", encoding="utf-8", newline="") as f:
         reader = csv.reader(f)
-        return list(reader)
+        yield from reader
 
 
 async def import_all(
-    db_path: str,
+    db: BranchDatabase,
     csv_directory: str,
     plugin_identity_keys: list,
     currencies: list,
@@ -85,7 +91,7 @@ async def import_all(
     Main entry point: discover and import all CSV trade files.
 
     Args:
-        db_path: Path to the SQLite database.
+        db: BranchDatabase instance for the shopkeepers branch.
         csv_directory: Directory containing trades-YYYY-MM-DD.csv files.
         plugin_identity_keys: Ordered list of plugin identity key strings.
         currencies: List of currency config dicts with item_key and emerald_value.
@@ -100,44 +106,43 @@ async def import_all(
     if not csv_files:
         return result
 
-    async with aiosqlite.connect(db_path) as db:
-        await db.execute("PRAGMA journal_mode = WAL")
-        await db.execute("PRAGMA foreign_keys = ON")
+    conn = db.raw_connection()
 
-        item_cache = await _load_item_cache(db)
-        currency_map = await _build_currency_map(db)
+    item_cache = await _load_item_cache(conn)
+    currency_map = await _build_currency_map(conn)
 
-        # Build a lookup from item_key -> emerald_value from config,
-        # used when upserting items that haven't been flagged yet.
-        currency_config = {c["item_key"]: c["emerald_value"] for c in currencies if "item_key" in c}
+    # Build a lookup from item_key -> emerald_value from config,
+    # used when upserting items that haven't been flagged yet.
+    currency_config = {c["item_key"]: c["emerald_value"] for c in currencies if "item_key" in c}
 
-        affected_dates: set[str] = set()
+    affected_dates: set[str] = set()
 
-        for filepath, trade_date, filename in csv_files:
-            try:
-                # Check file size before importing
-                file_stat = await asyncio.to_thread(Path(filepath).stat)
-                if file_stat.st_size > _MAX_CSV_FILE_SIZE:
-                    logger.warning(
-                        f"Skipping {filename}: file size {file_stat.st_size / 1024 / 1024:.1f} MB exceeds "
-                        f"{_MAX_CSV_FILE_SIZE / 1024 / 1024:.0f} MB limit"
-                    )
-                    result.files_skipped += 1
-                    continue
+    for filepath, trade_date, filename in csv_files:
+        try:
+            # Check file size before importing
+            file_stat = await asyncio.to_thread(Path(filepath).stat)
+            if file_stat.st_size > _MAX_CSV_FILE_SIZE:
+                logger.warning(
+                    f"Skipping {filename}: file size {file_stat.st_size / 1024 / 1024:.1f} MB exceeds "
+                    f"{_MAX_CSV_FILE_SIZE / 1024 / 1024:.0f} MB limit"
+                )
+                result.files_skipped += 1
+                continue
 
-                if not await _needs_import(db, filepath, filename):
-                    result.files_skipped += 1
-                    continue
+            if not await _needs_import(conn, filepath, filename):
+                result.files_skipped += 1
+                continue
 
-                # Read all CSV rows in a thread to avoid blocking the event loop
-                all_rows = await asyncio.to_thread(_read_csv_file, filepath)
+            # Read CSV rows in a thread (streamed via generator, collected to list)
+            all_rows = await asyncio.to_thread(list, _read_csv_rows(filepath))
 
-                file_warnings = 0
-                file_new = 0
-                file_dup = 0
-                file_affected_dates: set[str] = set()
-                line_num = 0
+            file_warnings = 0
+            file_new = 0
+            file_dup = 0
+            file_affected_dates: set[str] = set()
+            line_num = 0
 
+            async with db.transaction() as txn:
                 for line_num, row in enumerate(all_rows):
                     # Skip header row
                     if line_num == 0:
@@ -189,7 +194,7 @@ async def import_all(
 
                     # Upsert item1 (always present)
                     item1_id = await _upsert_item(
-                        db, row[COL_ITEM1_TYPE], row[COL_ITEM1_METADATA],
+                        txn, row[COL_ITEM1_TYPE], row[COL_ITEM1_METADATA],
                         plugin_identity_keys, item_cache, currency_config, currency_map, result,
                     )
 
@@ -197,7 +202,7 @@ async def import_all(
                     item2_id = None
                     if row[COL_ITEM2_TYPE]:
                         item2_id = await _upsert_item(
-                            db, row[COL_ITEM2_TYPE], row[COL_ITEM2_METADATA],
+                            txn, row[COL_ITEM2_TYPE], row[COL_ITEM2_METADATA],
                             plugin_identity_keys, item_cache, currency_config, currency_map, result,
                         )
 
@@ -212,16 +217,13 @@ async def import_all(
                         if shulker_contents:
                             # Uniform shulker - expand to bulk trade of contents
                             content_item_id, content_count = shulker_contents
-                            # content_item_id is like "minecraft:gunpowder"
-                            # Extract material type from it
                             content_material = content_item_id.replace("minecraft:", "").upper()
                             result_material = content_material
-                            result_metadata = ""  # No special metadata for bulk items
-                            # Total items = items per shulker * number of shulkers * trade count factor
+                            result_metadata = ""
                             actual_result_amount = content_count * result_amount
 
                     result_item_id = await _upsert_item(
-                        db, result_material, result_metadata,
+                        txn, result_material, result_metadata,
                         plugin_identity_keys, item_cache, currency_config, currency_map, result,
                     )
 
@@ -253,8 +255,7 @@ async def import_all(
                         continue
 
                     # Insert trade (OR IGNORE for fingerprint dedup)
-                    # Use actual_result_amount for shulker-expanded trades
-                    cursor = await db.execute(
+                    cursor = await txn.execute(
                         """INSERT OR IGNORE INTO trades (
                             trade_date, trade_time, player_uuid, shop_uuid,
                             shop_type, shop_world, shop_x, shop_y, shop_z,
@@ -281,11 +282,11 @@ async def import_all(
                     else:
                         file_dup += 1
 
-                    # Upsert player names (update even for duplicate trades to keep names current)
+                    # Upsert player names
                     player_uuid = row[COL_PLAYER_UUID]
                     player_name = row[COL_PLAYER_NAME]
                     if player_uuid and player_name:
-                        await db.execute(
+                        await txn.execute(
                             """INSERT INTO players (uuid, last_name, last_seen)
                                VALUES (?, ?, ?)
                                ON CONFLICT(uuid) DO UPDATE SET
@@ -298,7 +299,7 @@ async def import_all(
                     owner_uuid = row[COL_SHOP_OWNER_UUID]
                     owner_name = row[COL_SHOP_OWNER_NAME]
                     if owner_uuid and owner_name:
-                        await db.execute(
+                        await txn.execute(
                             """INSERT INTO players (uuid, last_name, last_seen)
                                VALUES (?, ?, ?)
                                ON CONFLICT(uuid) DO UPDATE SET
@@ -310,33 +311,28 @@ async def import_all(
                 # Update file record with final state (line_num is last line read)
                 stat = await asyncio.to_thread(Path(filepath).stat)
                 await _update_file_record(
-                    db, filename, trade_date, line_num,
+                    txn, filename, trade_date, line_num,
                     stat.st_size, stat.st_mtime_ns,
                 )
 
-                await db.commit()
+            # Only merge file's affected dates into global set after successful commit
+            affected_dates.update(file_affected_dates)
 
-                # Only merge file's affected dates into global set after successful commit
-                affected_dates.update(file_affected_dates)
+            result.new_trades += file_new
+            result.duplicate_trades += file_dup
+            result.files_imported += 1
 
-                result.new_trades += file_new
-                result.duplicate_trades += file_dup
-                result.files_imported += 1
+            if file_new > 0:
+                logger.info(f"Imported {filename}: {file_new} new, {file_dup} duplicate trades")
 
-                if file_new > 0:
-                    logger.info(f"Imported {filename}: {file_new} new, {file_dup} duplicate trades")
+        except Exception as e:
+            logger.error(f"Error importing {filename}: {e}", exc_info=True)
+            result.errors.append(f"{filename}: {e}")
 
-            except Exception as e:
-                logger.error(f"Error importing {filename}: {e}", exc_info=True)
-                result.errors.append(f"{filename}: {e}")
-                try:
-                    await db.rollback()
-                except Exception:
-                    pass
-
-        # Rebuild price summary only for dates that had new trades
-        if affected_dates:
-            await _rebuild_price_summary(db, affected_dates)
+    # Rebuild price summary only for dates that had new trades
+    if affected_dates:
+        async with db.transaction() as txn:
+            await _rebuild_price_summary(txn, affected_dates)
 
     return result
 
@@ -520,7 +516,7 @@ def _calculate_emerald_cost(
     cost_per_trade = 0.0
     has_currency = False
 
-    if item1_id and item1_id in currency_map:
+    if item1_id is not None and item1_id in currency_map:
         cost_per_trade += item1_amount * currency_map[item1_id]
         has_currency = True
 
@@ -558,19 +554,22 @@ async def _update_file_record(
     )
 
 
-async def _rebuild_price_summary(db: aiosqlite.Connection, affected_dates: set[str]) -> None:
-    """Incrementally rebuild price_summary for dates that had new trades."""
+async def _rebuild_price_summary(conn: aiosqlite.Connection, affected_dates: set[str]) -> None:
+    """Incrementally rebuild price_summary for dates that had new trades.
+
+    Must be called within a transaction; does not commit.
+    """
     if not affected_dates:
         return
 
     placeholders = ",".join("?" for _ in affected_dates)
     date_params = tuple(sorted(affected_dates))
 
-    await db.execute(
+    await conn.execute(
         f"DELETE FROM price_summary WHERE trade_date IN ({placeholders})",
         date_params,
     )
-    await db.execute(
+    await conn.execute(
         f"""INSERT INTO price_summary (item_id, trade_date, avg_price, min_price, max_price, total_volume, trade_count)
         SELECT result_item_id, trade_date,
             AVG(emerald_cost_per_unit), MIN(emerald_cost_per_unit), MAX(emerald_cost_per_unit),
@@ -581,5 +580,4 @@ async def _rebuild_price_summary(db: aiosqlite.Connection, affected_dates: set[s
         GROUP BY result_item_id, trade_date""",
         date_params,
     )
-    await db.commit()
     logger.info(f"Price summary updated for {len(affected_dates)} date(s)")

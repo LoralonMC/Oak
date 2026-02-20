@@ -11,38 +11,39 @@ from oak.constants import (
     MODAL_TEXT_INPUT_PLACEHOLDER_MAX,
     MODAL_TEXT_INPUT_VALUE_MAX
 )
-from .helpers import get_embed_colors, check_application_answer_quality
-import aiosqlite
+from .helpers import get_embed_colors, check_application_answer_quality, get_application_questions
 import json
+import asyncio
 import logging
 
 logger = logging.getLogger(__name__)
+
+# m9: Set for preventing garbage collection of fire-and-forget tasks
+_background_tasks: set = set()
 
 
 class ApplicationModal(Modal):
     """Multi-page modal for collecting application answers."""
 
-    def __init__(self, step: int, answers: list, get_config_func, get_questions_func, get_db_path_func):
+    def __init__(self, step: int, answers: list):
         """
         Initialize application modal.
 
         Args:
             step: Current page number (0-indexed)
             answers: List of already collected answers
-            get_config_func: Function to get application config
-            get_questions_func: Function to get application questions
-            get_db_path_func: Function to get database path
         """
-        config = get_config_func()
+        from .views import _config
+
+        config = _config
         position_name = config.get("settings", {}).get("application", {}).get("position_name", "Staff")
-        super().__init__(title=f"📝 {position_name} Application – Page {step + 1}")
+        title = f"📝 {position_name} Application – Page {step + 1}"
+        super().__init__(title=title[:45])  # m5: Truncate modal title to Discord limit
 
         self.step = step
         self.answers = answers
-        self.all_questions = get_questions_func()
+        self.all_questions = get_application_questions(config)
         self.questions = self.all_questions[step * 5: (step + 1) * 5]
-        self.get_config = get_config_func
-        self.get_db_path = get_db_path_func
 
         for i, q in enumerate(self.questions):
             self.add_item(TextInput(
@@ -57,7 +58,9 @@ class ApplicationModal(Modal):
     async def on_submit(self, interaction: discord.Interaction):
         """Handle modal submission."""
         # Import here to avoid circular imports
-        from .views import ContinueView
+        from .views import _db, _config, ContinueView
+
+        colors = get_embed_colors(_config)
 
         # Validate all answers before proceeding
         validation_errors = []
@@ -77,7 +80,7 @@ class ApplicationModal(Modal):
             error_embed = discord.Embed(
                 title="❌ Please Review Your Answers",
                 description="Some of your answers need improvement:\n\n" + "\n\n".join(validation_errors[:3]),
-                color=get_embed_colors()["error"]
+                color=colors["error"]
             )
             error_embed.set_footer(text="Please click the button again and provide better answers.")
             await interaction.response.send_message(embed=error_embed, ephemeral=True)
@@ -106,12 +109,10 @@ class ApplicationModal(Modal):
             # More questions to answer
             # Save partial answers and update last activity in database
             try:
-                async with aiosqlite.connect(self.get_db_path()) as db:
-                    await db.execute(
-                        "UPDATE applications SET answers = ?, last_activity_at = datetime('now') WHERE channel_id = ?",
-                        (json.dumps(self.answers), interaction.channel.id)
-                    )
-                    await db.commit()
+                await _db.execute(
+                    "UPDATE applications SET answers = ?, last_activity_at = datetime('now') WHERE channel_id = ?",
+                    (json.dumps(self.answers), interaction.channel.id)
+                )
             except Exception as e:
                 logger.error(f"Failed to save partial answers: {e}")
 
@@ -120,12 +121,9 @@ class ApplicationModal(Modal):
                 embed=discord.Embed(
                     title=f"✅ First {len(self.answers)} questions submitted!",
                     description=f"Only {remaining} more to go. Please continue your application below:",
-                    color=get_embed_colors()["info"]
+                    color=colors["info"]
                 ),
-                view=ContinueView(step=self.step + 1, answers=self.answers,
-                                get_config_func=self.get_config,
-                                get_questions_func=lambda: self.all_questions,
-                                get_db_path_func=self.get_db_path)
+                view=ContinueView(step=self.step + 1, answers=self.answers)
             )
         else:
             # All questions answered
@@ -133,17 +131,22 @@ class ApplicationModal(Modal):
 
     async def _complete_application(self, interaction: discord.Interaction):
         """Handle application completion."""
-        from .views import PostSubmissionView
+        from .views import _db, _config, PostSubmissionView
+
+        colors = get_embed_colors(_config)
 
         # Respond to interaction first
         await interaction.response.send_message(
             embed=discord.Embed(
                 title="Application Complete!",
                 description="Your application has been submitted and is being reviewed.",
-                color=get_embed_colors()["success"]
+                color=colors["success"]
             ),
             ephemeral=True
         )
+
+        # M4: Update database BEFORE Discord operations to ensure consistent state
+        await self._update_database(interaction)
 
         # Clean up bot messages
         try:
@@ -162,7 +165,6 @@ class ApplicationModal(Modal):
             logger.warning(f"Failed to purge application messages: {e}")
 
         applicant = interaction.guild.get_member(interaction.user.id) or interaction.user
-        config = self.get_config()
 
         # Send submission confirmation
         embed = discord.Embed(
@@ -172,7 +174,7 @@ class ApplicationModal(Modal):
                 "Our staff team will review your responses and reach out here if we need more information. "
                 "You will be notified when a decision is made."
             ),
-            color=get_embed_colors()["success"]
+            color=colors["success"]
         )
 
         # Create staff review thread
@@ -183,14 +185,14 @@ class ApplicationModal(Modal):
                     auto_archive_duration=10080,
                     reason="Staff review for application"
                 )
-                reviewer_role_ids = config.get("settings", {}).get("reviewer_role_ids", [])
+                reviewer_role_ids = _config.get("settings", {}).get("reviewer_role_ids", [])
                 staff_mentions = " ".join(f"<@&{rid}>" for rid in reviewer_role_ids)
                 await thread.send(
                     content=staff_mentions,
                     embed=discord.Embed(
                         title="Staff Review Thread",
                         description="Discuss this application here.",
-                        color=get_embed_colors()["info"]
+                        color=colors["info"]
                     )
                 )
             except discord.HTTPException as e:
@@ -202,22 +204,19 @@ class ApplicationModal(Modal):
         try:
             await interaction.channel.send(
                 embed=embed,
-                view=PostSubmissionView(get_db_path_func=self.get_db_path)
+                view=PostSubmissionView()
             )
         except discord.HTTPException as e:
             logger.error(f"Failed to send submission message: {e}")
 
-        # Update database first to ensure consistent state even if Discord API calls fail
-        await self._update_database(interaction)
-
         # Notify admin chat
-        await self._notify_admin_chat(interaction, applicant, config)
+        await self._notify_admin_chat(interaction, applicant, _config, colors)
 
         # Check Discord linkage
-        await self._check_discord_link(interaction, applicant, config)
+        await self._check_discord_link(interaction, applicant, _config, colors)
 
         # Try to DM the user
-        await self._dm_applicant(interaction, applicant)
+        await self._dm_applicant(interaction, applicant, colors)
 
     async def on_error(self, interaction: discord.Interaction, error: Exception):
         logger.error(f"Error in ApplicationModal: {error}", exc_info=True)
@@ -229,7 +228,7 @@ class ApplicationModal(Modal):
         except Exception:
             pass
 
-    async def _notify_admin_chat(self, interaction, applicant, config):
+    async def _notify_admin_chat(self, interaction, applicant, config, colors):
         """Notify admin chat of new application."""
         admin_chat_id = config.get("settings", {}).get("admin_chat_id", 0)
         admin_chat = interaction.guild.get_channel(admin_chat_id) if admin_chat_id else None
@@ -238,14 +237,14 @@ class ApplicationModal(Modal):
                 notif = discord.Embed(
                     title="🆕 New Staff Application",
                     description=f"Applicant: {applicant.mention}\nChannel: [Jump to application]({interaction.channel.jump_url})",
-                    color=get_embed_colors()["info"]
+                    color=colors["info"]
                 )
                 notif.set_thumbnail(url=applicant.display_avatar.url)
                 await admin_chat.send(embed=notif)
             except discord.HTTPException as e:
                 logger.error(f"Failed to send admin notification: {e}")
 
-    async def _check_discord_link(self, interaction, applicant, config):
+    async def _check_discord_link(self, interaction, applicant, config, colors):
         """Check if user needs to link their account."""
         required_link_role_id = config.get("settings", {}).get("required_link_role_id", 0)
         if required_link_role_id:
@@ -256,38 +255,38 @@ class ApplicationModal(Modal):
                         embed=discord.Embed(
                             title="Link your Minecraft Account",
                             description=":link: To ensure the application process goes smoothly, please link your Minecraft account to Discord using `/link` in-game and sending the code to the bot.",
-                            color=get_embed_colors()["warning"]
+                            color=colors["warning"]
                         )
                     )
                 except discord.HTTPException as e:
                     logger.error(f"Failed to send link reminder: {e}")
 
-    async def _dm_applicant(self, interaction, applicant):
+    async def _dm_applicant(self, interaction, applicant, colors):
         """Try to DM the applicant."""
         try:
             await interaction.user.send(embed=discord.Embed(
                 title="Application Submitted!",
                 description="Thank you for applying. We'll be in touch soon! 👀",
-                color=get_embed_colors()["success"]
+                color=colors["success"]
             ))
         except discord.Forbidden:
             try:
                 await interaction.channel.send(embed=discord.Embed(
                     description=":warning: I couldn't DM the applicant. Please ensure DMs are enabled.",
-                    color=get_embed_colors()["warning"]
+                    color=colors["warning"]
                 ))
             except discord.HTTPException as e:
                 logger.error(f"Failed to send DM warning: {e}")
 
     async def _update_database(self, interaction):
         """Update database with submitted answers."""
+        from .views import _db
+
         try:
-            async with aiosqlite.connect(self.get_db_path()) as db:
-                await db.execute(
-                    "UPDATE applications SET answers = ?, status = 'pending', last_activity_at = datetime('now') WHERE channel_id = ?",
-                    (json.dumps(self.answers), interaction.channel.id)
-                )
-                await db.commit()
+            await _db.execute(
+                "UPDATE applications SET answers = ?, status = 'pending', last_activity_at = datetime('now') WHERE channel_id = ?",
+                (json.dumps(self.answers), interaction.channel.id)
+            )
         except Exception as e:
             logger.error(f"Failed to update application in database: {e}")
 
@@ -295,28 +294,27 @@ class ApplicationModal(Modal):
 class DeclineReasonModal(Modal):
     """Modal for entering decline reason."""
 
-    def __init__(self, applicant_id: int, get_db_path_func):
+    def __init__(self, applicant_id: int):
         super().__init__(title="Reason for Denial")
         self.applicant_id = applicant_id
-        self.get_db_path = get_db_path_func
         self.reason = TextInput(label="Why are you declining this application?", style=discord.TextStyle.paragraph)
         self.add_item(self.reason)
 
     async def on_submit(self, interaction: discord.Interaction):
         """Handle decline reason submission."""
-        import asyncio
-        from .helpers import get_application_config
+        from .views import _db, _config
 
         # Defer immediately to avoid interaction timeout
         await interaction.response.defer(ephemeral=True)
+
+        colors = get_embed_colors(_config)
 
         # Sanitize the decline reason to prevent markdown/mention injection
         raw_reason = self.reason.value
         sanitized_reason = discord.utils.escape_markdown(discord.utils.escape_mentions(raw_reason))
 
         # Get config
-        config = get_application_config()
-        denial_config = config.get("settings", {}).get("denial", {})
+        denial_config = _config.get("settings", {}).get("denial", {})
         delete_delay = denial_config.get("delete_delay_seconds", 10)
 
         applicant = interaction.guild.get_member(self.applicant_id)
@@ -333,7 +331,7 @@ class DeclineReasonModal(Modal):
                             f"**Reason:** {sanitized_reason}\n\n"
                             "We encourage you to continue contributing to the community and consider reapplying in the future."
                         ),
-                        color=get_embed_colors()["error"]
+                        color=colors["error"]
                     )
                 )
                 dm_sent = True
@@ -341,22 +339,20 @@ class DeclineReasonModal(Modal):
                 pass  # DM failed
 
         # Update database with denial info (store raw reason for DB, display sanitized)
-        async with aiosqlite.connect(self.get_db_path()) as db:
-            cursor = await db.execute(
-                "UPDATE applications SET status = 'denied', denied_at = datetime('now'), denial_dm_sent = ?, denial_reason = ? WHERE channel_id = ? AND status = 'pending'",
-                (1 if dm_sent else 0, raw_reason, interaction.channel.id)
-            )
-            if cursor.rowcount == 0:
-                await interaction.followup.send("This application was already processed.", ephemeral=True)
-                return
-            await db.commit()
+        cursor = await _db.execute(
+            "UPDATE applications SET status = 'denied', denied_at = datetime('now'), denial_dm_sent = ?, denial_reason = ? WHERE channel_id = ? AND status = 'pending'",
+            (1 if dm_sent else 0, raw_reason, interaction.channel.id)
+        )
+        if cursor.rowcount == 0:
+            await interaction.followup.send("This application was already processed.", ephemeral=True)
+            return
 
         # Public message in the channel
         await interaction.channel.send(
             embed=discord.Embed(
                 title="Application Denied",
                 description=f"Application for <@{self.applicant_id}> was denied.\n\n**Reason:** {sanitized_reason}",
-                color=get_embed_colors()["error"]
+                color=colors["error"]
             )
         )
 
@@ -381,7 +377,7 @@ class DeclineReasonModal(Modal):
             await interaction.channel.send(
                 embed=discord.Embed(
                     description=description,
-                    color=get_embed_colors()["warning"]
+                    color=colors["warning"]
                 )
             )
             await interaction.followup.send(
@@ -393,7 +389,7 @@ class DeclineReasonModal(Modal):
             await interaction.channel.send(
                 embed=discord.Embed(
                     description=f"<@{self.applicant_id}> has been notified via DM.\n\n**This channel will be deleted in {delete_delay} seconds.**",
-                    color=get_embed_colors()["success"]
+                    color=colors["success"]
                 )
             )
 
@@ -402,7 +398,7 @@ class DeclineReasonModal(Modal):
                 ephemeral=True
             )
 
-            # Fire-and-forget delayed channel deletion to avoid blocking the handler
+            # m9: Store task reference to prevent garbage collection
             async def _delayed_delete():
                 await asyncio.sleep(delete_delay)
                 try:
@@ -412,7 +408,8 @@ class DeclineReasonModal(Modal):
                     logger.error(f"Failed to delete denied application channel: {e}")
 
             task = asyncio.create_task(_delayed_delete())
-            task.add_done_callback(lambda t: logger.error(f"Delayed delete task error: {t.exception()}", exc_info=t.exception()) if t.exception() else None)
+            _background_tasks.add(task)
+            task.add_done_callback(_background_tasks.discard)
 
     async def on_error(self, interaction: discord.Interaction, error: Exception):
         logger.error(f"Error in DeclineReasonModal: {error}", exc_info=True)

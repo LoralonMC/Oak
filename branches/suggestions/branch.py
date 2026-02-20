@@ -6,11 +6,12 @@ import discord
 from discord.ext import commands
 
 from oak import OakBranch
+from oak.constants import THREAD_NAME_MAX
 from oak.context import BranchContext
 from oak.utils import sanitize_text
 
-from .helpers import get_db_path, truncate
-from .views import SuggestionVoteView
+from .helpers import truncate
+from .views import SuggestionVoteView, configure as configure_views
 
 SUGGESTIONS_SCHEMA = """
 CREATE TABLE IF NOT EXISTS suggestions (
@@ -71,13 +72,15 @@ class Suggestions(OakBranch):
 
     def __init__(self, ctx: BranchContext):
         super().__init__(ctx)
-        self.db_path = get_db_path()
 
     async def on_enable(self) -> None:
         if self.db:
             await self.db.initialize(SUGGESTIONS_SCHEMA)
             # Migrate existing votes from JSON columns to votes table
             await self._migrate_votes()
+
+        # Set module-level refs for views/handlers/modals
+        configure_views(self.db, self.config)
 
         channel_id = self.setting("channel_id", default=0)
         if channel_id == 0:
@@ -101,8 +104,7 @@ class Suggestions(OakBranch):
             if not rows:
                 return
 
-            conn = self.db.connect()
-            async with self.db.write_lock:
+            async with self.db.transaction() as conn:
                 for suggestion_id, likes_json, dislikes_json in rows:
                     likes = json.loads(likes_json) if likes_json else []
                     dislikes = json.loads(dislikes_json) if dislikes_json else []
@@ -116,7 +118,6 @@ class Suggestions(OakBranch):
                             "INSERT OR IGNORE INTO suggestion_votes (suggestion_id, user_id, vote_type) VALUES (?, ?, 'dislike')",
                             (suggestion_id, user_id),
                         )
-                await conn.commit()
             self.log.info("Migrated suggestion votes to new table")
         except Exception as e:
             self.log.error(f"Failed to migrate suggestion votes: {e}", exc_info=True)
@@ -176,6 +177,8 @@ class Suggestions(OakBranch):
             title_prefix = self.setting("ui", "thread", "title_prefix", default="💬 Discussion: ")
             raw_title = sanitize_text(content.strip()[:title_max], max_length=title_max)
             thread_title = f"{title_prefix}{raw_title}" if raw_title else f"{title_prefix}{message.author.display_name}"
+            # m1: Clamp thread name to Discord's limit
+            thread_title = thread_title[:THREAD_NAME_MAX]
             thread = await sent.create_thread(name=thread_title)
 
             if self.db:

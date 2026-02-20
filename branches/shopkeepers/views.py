@@ -51,5 +51,5 @@ class PaginatedEmbedView(discord.ui.View):
         if self.message:
             try:
                 await self.message.edit(view=self)
-            except discord.NotFound:
-                pass  # Message was deleted
+            except discord.HTTPException:
+                pass  # Message was deleted or inaccessible

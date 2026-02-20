@@ -4,51 +4,41 @@ Shared utility functions for the application system.
 """
 
 import discord
-import yaml
 import logging
-from pathlib import Path
-from oak.constants import (
-    EMBED_MAX_FIELDS,
-    EMBED_TOTAL_MAX,
-    truncate_for_embed_field
-)
+from oak.constants import EMBED_MAX_FIELDS, EMBED_TOTAL_MAX
+from oak.utils import truncate_for_embed_field
 
 logger = logging.getLogger(__name__)
 
 
-def get_embed_colors():
-    """Get embed colors from config."""
-    config = get_application_config()
+def get_embed_colors(config: dict) -> dict:
+    """Get embed colors from config.
+
+    Args:
+        config: Application configuration dictionary
+
+    Returns:
+        Dict mapping color names to integer values
+    """
     ui_settings = config.get("settings", {}).get("ui", {})
     embed_colors = ui_settings.get("embed_colors", {})
     return {
-        "info": embed_colors.get("info", 0x5865F2),       # Blurple
-        "success": embed_colors.get("success", 0x57F287),  # Green
-        "warning": embed_colors.get("warning", 0xFEE75C),  # Yellow
-        "error": embed_colors.get("error", 0xED4245)       # Red
+        "info": embed_colors.get("info", 0x5865F2),
+        "success": embed_colors.get("success", 0x57F287),
+        "warning": embed_colors.get("warning", 0xFEE75C),
+        "error": embed_colors.get("error", 0xED4245)
     }
 
 
-def get_db_path():
-    """Get the database path for this branch."""
-    return str(Path(__file__).parent / "data.db")
+def get_application_questions(config: dict) -> list:
+    """Get application questions from config.
 
+    Args:
+        config: Application configuration dictionary
 
-def get_application_config():
-    """Load application config from config.yml."""
-    config_path = Path(__file__).parent / "config.yml"
-    try:
-        with open(config_path, "r", encoding="utf-8") as f:
-            config = yaml.safe_load(f) or {}
-        return config
-    except Exception as e:
-        logger.error(f"Failed to load application config: {e}")
-        return {}
-
-
-def get_application_questions():
-    """Get application questions from config."""
-    config = get_application_config()
+    Returns:
+        List of question dicts
+    """
     questions = config.get("settings", {}).get("questions", [])
 
     # If no questions in config, use these defaults
@@ -63,19 +53,24 @@ def get_application_questions():
     return questions
 
 
-def paginate_application_embed(applicant, answers, get_questions_func=None):
+def paginate_application_embed(applicant, answers, questions: list, colors: dict = None):
     """
     Returns a list of embeds, paginated by Discord's field and character limits.
 
     Args:
         applicant: Discord member who applied (may be None if user left the server)
         answers: List of application answers
-        get_questions_func: Function to get questions (optional, uses default if None)
+        questions: List of question dicts
+        colors: Embed colors dict (from get_embed_colors)
 
     Returns:
         List of paginated embeds
     """
-    questions = get_questions_func() if get_questions_func else get_application_questions()
+    if colors is None:
+        colors = {
+            "info": 0x5865F2, "success": 0x57F287,
+            "warning": 0xFEE75C, "error": 0xED4245
+        }
 
     # Handle mismatch between questions and answers (legacy applications)
     # Use the minimum to avoid index errors
@@ -89,14 +84,15 @@ def paginate_application_embed(applicant, answers, get_questions_func=None):
 
     def make_embed(fields, page_num, total_pages):
         # Handle applicant=None safely (user left the server)
+        # m4: Use display_name instead of mention in embed title
         if applicant:
-            title = f"Application from {applicant.mention}"
+            title = f"Application from {applicant.display_name}"
         else:
             title = "Application from Unknown Applicant"
 
         embed = discord.Embed(
             title=title,
-            color=get_embed_colors()["info"]
+            color=colors["info"]
         )
         if applicant:
             embed.set_author(name=str(applicant), icon_url=applicant.display_avatar.url)
@@ -146,17 +142,17 @@ def paginate_application_embed(applicant, answers, get_questions_func=None):
     return [make_embed(fields, idx+1, total_pages) for idx, fields in enumerate(all_embeds)]
 
 
-def is_staff(member):
-    """Check if member has application reviewer permissions."""
-    config = get_application_config()
-    reviewer_role_ids = config.get("settings", {}).get("reviewer_role_ids", [])
+def is_staff(member, reviewer_role_ids: list) -> bool:
+    """Check if member has application reviewer permissions.
+
+    Args:
+        member: Discord member
+        reviewer_role_ids: List of reviewer role IDs
+
+    Returns:
+        True if member has reviewer permissions
+    """
     return any(role.id in reviewer_role_ids for role in getattr(member, "roles", []))
-
-
-def get_reviewer_role_ids():
-    """Get reviewer role IDs from config."""
-    config = get_application_config()
-    return tuple(config.get("settings", {}).get("reviewer_role_ids", []))
 
 
 def check_application_answer_quality(question: str, answer: str) -> tuple[bool, str]:
