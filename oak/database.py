@@ -8,7 +8,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import sqlite3
-import warnings
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -179,18 +178,6 @@ class BranchDatabase:
         if not self._conn:
             raise RuntimeError("Database not initialized")
         return self._conn
-
-    def connect(self) -> aiosqlite.Connection:
-        """Return the raw persistent connection.
-
-        .. deprecated:: Use ``raw_connection()`` instead.
-        """
-        warnings.warn(
-            "BranchDatabase.connect() is deprecated, use raw_connection() instead",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return self.raw_connection()
 
     @property
     def path(self) -> Path:

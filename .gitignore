@@ -51,6 +51,7 @@ branches/*/config.yml
 .vscode/
 .idea/
 .claude/
+CLAUDE.md
 *.swp
 *.swo
 *~

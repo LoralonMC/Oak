@@ -106,18 +106,3 @@ DEFAULT_BUTTON_TIMEOUT = 60
 
 MIN_AGE_DISCORD_TOS = 13
 MAX_AGE_REASONABLE = 100
-
-
-def truncate_for_embed_field(text: str, suffix: str = "...", max_length: int = EMBED_FIELD_VALUE_MAX) -> str:
-    """Truncate text to fit in an embed field value.
-
-    .. deprecated:: Use ``oak.utils.truncate_for_embed_field`` instead.
-    """
-    import warnings
-    warnings.warn(
-        "oak.constants.truncate_for_embed_field is deprecated, use oak.utils.truncate_for_embed_field instead",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    from .utils import truncate_for_embed_field as _impl
-    return _impl(text, suffix, max_length)
