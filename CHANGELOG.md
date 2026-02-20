@@ -2,115 +2,621 @@
 
 All notable changes to this project will be documented in this file.
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/).
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-### Added
-- **Tickets**: Transcript web server (`branches/tickets/web.py`) — serves transcripts as hosted links instead of file attachments
-  - Configurable via `transcript.web` settings (port, base_url); fully backwards compatible
-  - New dependency: `aiohttp`
+## [2.0.0] - 2026-02-20
 
-### Fixed
-- **Framework**: Audit log `details` field truncated to embed field limit (1024 chars)
-- **Framework**: Dependency cycle branches now recorded in load failures (visible in `/health`)
-- **Tickets**: Transcript "Closed:" header shows real timestamp instead of literal "now"
-- **Tickets**: Transcript embed renderer now displays embed fields (e.g. close reason)
-- **Application**: Status update is now atomic — prevents stale overwrites by concurrent staff
-- **Application**: Corrupted JSON in application answers no longer crashes the bot
-- **Shopkeepers**: Player name display no longer crashes when UUID is null
-- **Suggestions**: INSERT no longer writes to legacy `likes`/`dislikes` JSON columns
-- **Suggestions**: Rejection messages sent as temporary channel replies instead of DMs
-
-## [0.3.0] - 2026-02-20
-
-Major framework rewrite: all branches now run on the Oak framework with centralized database access, config management, and lifecycle hooks.
+Complete architectural rewrite to the Oak framework. All branches now use centralized
+database access, framework-managed config, and a standardized lifecycle. This is a
+breaking change for all branch code.
 
 ### Added
-- **Oak framework** (`oak/` package) replacing the old `core/` module
-  - `OakBranch` base class with `on_enable`/`on_ready`/`on_disable` lifecycle
-  - `BranchDatabase` with persistent connection, WAL mode, write lock, transaction context manager, and migration tracking
-  - `EventBus` for inter-branch communication
-  - `InteractionRouter` for `oak:{branch}:{action}` custom ID routing
-  - `BranchLoader` with dependency resolution and hot-reload support
-  - Branch manifests (`branch.yml`) for metadata and dependency declaration
-  - `TaskRegistry` for tracking `discord.ext.tasks` loops across branches
-  - `BackupManager` for scheduled database backups with WAL checkpoint
-  - `PaginatedEmbedView` reusable paginated embed component
-  - In-memory metrics tracking (commands, events, DB ops, errors)
-  - Inter-branch service registry (`self.services` / `self.require_branch()`)
-  - Audit logging to a Discord channel for admin actions
-- **Admin commands**: `/reload`, `/load`, `/status`, `/health`, `/metrics`, `/backup`, `/enable`, `/disable`
-- **Branch developer guide** (`GUIDE.md`) covering config, database, lifecycle, commands, views, and migration
+
+#### Oak Framework (`oak/` package)
+
+- `OakBot` class replacing the root `Oak` class, with config injection, metrics, audit
+  logging, and graceful shutdown
+- `OakBranch` base class with `on_enable()`/`on_ready()`/`on_disable()` lifecycle hooks,
+  `self.setting()` helper for nested config access, `self.services` dict for inter-branch
+  service registry, `require_branch()` for cross-branch dependencies, and `register_task()`
+  for background task tracking
+- `BranchDatabase` class (`oak/database.py`) with persistent `aiosqlite` connection, WAL
+  mode, `asyncio.Lock` write serialization, and built-in methods: `execute()`, `fetchone()`,
+  `fetchall()`, `executemany()`, `transaction()` context manager, `initialize()` for schema,
+  `migrate()` with named migration tracking in `_oak_migrations` table, `backup()` for
+  WAL-safe file copies, and `raw_connection()` for advanced use
+- `BranchContext` frozen dataclass providing `bot`, `id`, `name`, `config`, `db`, `logger`,
+  `data_dir`, `events`, and `interactions` to each branch
+- `BranchLoader` (`oak/loader.py`) with manifest-based discovery, dependency resolution via
+  topological sort, `load_branch()`/`reload_branch()`/`unload_branch()` lifecycle,
+  `require_branch()`, and tracking of skipped/failed branches
+- `BranchManifest` (`oak/manifest.py`) — `branch.yml` files declaring `id`, `name`,
+  `version`, `description`, `author`, `main`, `database`, `priority`, `dependencies`, and
+  `oak_version` compatibility gate
+- `EventBus` (`oak/events.py`) for inter-branch pub/sub with `OakEvent` dataclass, wildcard
+  subscriptions (`*` and `foo.*` patterns), 30-second listener timeout via
+  `asyncio.wait_for`, parallel dispatch via `asyncio.gather`, and scoped
+  `BranchEventHandle` with auto-tagging
+- `InteractionRouter` (`oak/interactions.py`) for `oak:{branch}:{action}[:value]` custom ID
+  routing with strict validation (3-4 colon-delimited parts, non-empty segments, value
+  pattern `[A-Za-z0-9._-]+`), plus scoped `BranchInteractionHandle` for building and
+  parsing namespaced custom IDs
+- `OakConfig` (`oak/config.py`) with `.env` loading, validation (raises `ConfigError`
+  instead of `sys.exit`), and properties: `command_prefix`, `dev_mode`,
+  `audit_log_channel`, `db_backup_interval`, `db_backup_max_count`
+- `deep_merge()` function using `copy.deepcopy` to prevent shared mutable references
+- `write_branch_enabled()` function for toggling `enabled` flag in branch config files
+- `TaskRegistry` (`oak/tasks.py`) tracking `discord.ext.tasks.Loop` instances per branch
+  with `is_running`, `failed`, `next_iteration`, `current_loop` status, used by `/health`
+- `BackupManager` (`oak/backup.py`) with periodic backup scheduling via
+  `DB_BACKUP_INTERVAL` env var, WAL checkpoint under write lock, `shutil.copy2` in executor
+  thread, old backup pruning via `DB_BACKUP_MAX_COUNT`
+- `PaginatedEmbedView` (`oak/views.py`) — reusable paginated embed with Previous/Next
+  buttons, author-locked interaction, auto-disable on timeout, configurable timeout
+- `Metrics` (`oak/metrics.py`) — in-memory counters for commands, events, db_writes,
+  db_reads, and errors, with `inc()` and `summary()` methods
+- `BranchWatcher` (`oak/watcher.py`) — file system polling for `.py` changes with
+  auto-reload in `DEV_MODE`
+- Custom exception hierarchy (`oak/errors.py`): `OakError`, `BranchLoadError`,
+  `BranchNotFoundError`, `ManifestError`, `ConfigError`
+- `oak/constants.py`: added `BRANCH_MANIFEST_FILE`, `CUSTOM_ID_PREFIX`,
+  `CUSTOM_ID_MAX_LENGTH`, `EVENT_LISTENER_TIMEOUT`; `truncate_for_embed_field()` now
+  accepts optional `max_length` parameter
+- `oak/utils.py`: `sanitize_text()`, `truncate_for_embed_field()`, `truncate()`,
+  `format_discord_timestamp()`, `safe_send()`, `paginate()`
+
+#### Admin Commands
+
+- `/enable <branch>` — enables a disabled branch (writes config, loads, syncs commands,
+  audit logs)
+- `/disable <branch>` — unloads and disables a branch (writes config, syncs commands,
+  audit logs)
+- `/health` — bot uptime, latency, branch count, per-branch database health check
+  (`SELECT 1`), scheduled task status (running/stopped/failed with loop count), load
+  failures, disabled branches
+- `/metrics` — top 10 events, DB reads/writes per branch, top 10 commands, error counts
+- `/backup [branch]` — backs up a single branch or all branches with databases
+- `/sync` — force-syncs slash commands to guild
+- `/branches` redesigned: shows loaded (green), disabled (grey), and failed (red) branches
+  with version numbers
+- `/botinfo` expanded: uptime, latency (ms), memory RSS, branch ratio, Python version,
+  discord.py version, Oak version
+- `/reload`, `/load`, `/unload` now defer interaction, re-sync commands, and send audit
+  logs; error messages no longer expose exception details to users
+- All admin commands enforce `@app_commands.checks.has_permissions(administrator=True)` in
+  addition to `@app_commands.default_permissions(administrator=True)`
+
+#### Tickets Branch
+
+- Transcript generation system (`branches/tickets/transcript.py`): full HTML transcripts
+  with Discord dark theme CSS, message grouping within 7-minute windows, system message
+  rendering, inline image display, file attachment links, embed rendering with colored
+  borders, and Discord markdown to HTML conversion (bold, italic, underline, strikethrough,
+  code blocks, inline code, mentions)
+- Transcript web server (`branches/tickets/web.py`): `aiohttp`-based server serving HTML
+  transcripts with path traversal protection, configurable via `transcript.web` settings
+- `/closeticket` now generates transcript before archiving and sends it to log channel
+  and/or DMs the ticket creator
+- `transcript_message_id` column added to `tickets` table via migration
+
+#### Suggestions Branch
+
+- `suggestion_votes` table with composite primary key `(suggestion_id, user_id)` and CHECK
+  constraint on `vote_type`; backfilled from legacy JSON columns via `_migrate_votes()`
+- `/topsuggestions` command: highest-voted suggestions with status filter (All/Pending/
+  Approved/Denied), sort options (net votes/most likes/most dislikes), paginated embed with
+  jump links to original messages
+- Config validation warnings on `on_enable()` for placeholder `channel_id` and empty
+  `manager_role_ids`
+
+#### Application Branch
+
+- `DEFAULT_CONFIG` dict with all settings defined in code (previously only in config.yml)
+- Staff permission checks on all manage buttons (Accept, Move, Decline, Background Check,
+  View History) and `StatusChangeView._update_status()` via `_check_staff()` method
+- Application status validation before state changes: accept checks `status = 'pending'`
+  with `WHERE` clause and `rowcount` check; decline checks `status = 'pending'`; move
+  checks `status = 'accepted'`
+- Post-restart answer recovery: `ContinueView` recovers partial answers from database if
+  `self.answers` is empty after bot restart, calculates correct resume step
+- Partial answer saving on each modal page submission (previously only saved on completion)
+- Cancel button verifies the clicking user is the actual applicant and updates DB status to
+  'cancelled' before deleting channel
+- Archived thread search in background check (searches both cached and
+  `archived_threads(limit=100)` in punishment forum)
+- Pagination safety counter with `max_iterations` limit to prevent infinite loops, with
+  guaranteed forward progress (at least one field per page)
+- Null-safe `paginate_application_embed()` when applicant has left the server
+- 3-phase creation pattern: Phase 1 (check existing, close DB), Phase 2 (create Discord
+  channel, no DB), Phase 3 (atomic INSERT with subquery for app_index)
+- Atomic `app_index` assignment via `INSERT ... (SELECT COALESCE(MAX(app_index), 0) + 1)`
+- Placeholder config warnings for `reviewer_role_ids == [0]` and
+  `application_channel_id == 0`
+- Inactivity check excludes abandoned-eligible apps from warning queries
+- `DeclineReasonModal` defers interaction immediately to avoid timeout; reason sanitized
+  with `escape_markdown(escape_mentions())`; fire-and-forget delayed channel deletion via
+  `asyncio.create_task()`
+- `ApplicationModal.on_error()` and `DeclineReasonModal.on_error()` handlers
+- Config validation on `on_enable()`: warns for placeholder IDs, errors if
+  `abandon_after_days <= warning_after_days`
+- Application history search increased from `limit=10` to `limit=50`
+
+#### Shopkeepers Branch
+
+- `_escape_like()` method for SQL LIKE wildcard escaping in all user input queries
+- `public` parameter on all public commands to control ephemeral/public response
+- Admin shop exclusion in `/price` (filters `shop_type != 'admin'`)
+- Price history chart generation (`chart.py`) using matplotlib with Discord dark theme,
+  average price line, and min/max fill band
+- Fuzzy item search prefers shortest match via `ORDER BY LENGTH(search_name) ASC`
+- Compound index `idx_trades_shop_type_date` for shop-type-filtered date queries
+- `auto_import_task.error` handler for unhandled import errors
+- Query truncation safety (user input shown in error messages truncated to 100 chars)
+- Embed description and field truncation using framework utilities
+- CSV reader moved to `asyncio.to_thread()` to avoid blocking the event loop
+- Max CSV file size check (50 MB limit)
+- File stat calls via `asyncio.to_thread()`
+
+#### Framework Infrastructure
+
+- Rotating log handler (`TimedRotatingFileHandler`) replacing date-stamped log files, with
+  midnight rotation and 30-day retention
+- Logs directory relative to script (`Path(__file__).parent / "logs"`) instead of CWD
+- `branches_dir` path made absolute relative to `oak/` package
+- `setup_logging()` function wrapping logging configuration
+- `CommandOnCooldown` error handling with user-friendly retry message
+- `_ready_fired` flag preventing duplicate `on_ready()` dispatches on reconnect
+- `on_message()` logs only the command name (not arguments)
+- `on_command_error()` messages auto-delete after 10 seconds
+- Command sync error handling with logging
+- Duplicate branch ID detection in `BranchLoader.discover()`
+- DFS-based topological sort replacing broken Kahn's algorithm for dependency resolution
+- Module cache cleanup on reload (deletes all `branches.<name>.*` submodules)
+- Resource cleanup on `add_cog` failure
+- `_is_branch_enabled()` helper for config.yml enabled-flag check
+- `_cleanup_branch_resources()` helper for event/database cleanup
+- Reload failure logging
+- `BranchDatabase.initialize()` double-init guard
+- `BranchDatabase.migrate()` duplicate migration name check and error re-raise
+- `BranchDatabase.write_lock` public property
+- `EventBus` dispatch timeout for listeners (30 seconds with `asyncio.shield`)
+- Manifest validation: semver format warning, branch ID digit prefix rejection, wrong-type
+  field warnings, `oak_version` compatibility check
+- `.env.example` with 5 new env vars: `COMMAND_PREFIX`, `DEV_MODE`, `AUDIT_LOG_CHANNEL`,
+  `DB_BACKUP_INTERVAL`, `DB_BACKUP_MAX_COUNT`
+
+#### Documentation
+
+- Branch developer guide (`GUIDE.md`) covering: quick start, manifest reference, config
+  system with `configure(db, config)` pattern, lifecycle hooks, database operations with
+  `BranchDatabase`, slash commands, persistent views with namespaced custom IDs, modals with
+  `on_error`, background tasks with `register_task()`, event bus, admin commands, paginated
+  embeds, inter-branch services, database backups, and migration from pre-framework branches
 
 ### Changed
-- All branches migrated from raw `aiosqlite.connect()` to `BranchDatabase` methods
-- All disk-reading config helpers replaced with `self.config` / `self.setting()`
-- Views, modals, and handlers use module-level `configure(db, config)` pattern
-- Slash command sync moved from `on_ready` to `setup_hook` (runs once instead of on every reconnect)
-- Config loading uses deep merge so missing keys fall back to defaults
-- `.env` removed from tracking, replaced with `.env.example`
+
+- All branch classes inherit from `OakBranch` instead of `commands.Cog`
+- All branch constructors accept `BranchContext` instead of `bot`
+- All `cog_load`/`cog_unload` lifecycle hooks renamed to `on_enable`/`on_disable`
+- All `@commands.Cog.listener() async def on_ready` changed to plain `async def on_ready`
+  (framework dispatches directly)
+- All module-level `logger = logging.getLogger(__name__)` replaced with `self.log` from
+  branch context
+- All `__init__.py` files emptied (framework uses `branch.yml` for discovery, no more
+  `setup()` functions)
+- All raw `aiosqlite.connect()` calls replaced with `BranchDatabase` methods (`execute`,
+  `fetchone`, `fetchall`, `transaction`)
+- All disk-reading config helpers (`get_*_config()`, `get_db_path()`) replaced with
+  `self.config` / `self.setting()`
+- Views, modals, and handlers that can't access the branch instance use module-level
+  `_db`/`_config` set by `configure(db, config)` in `on_enable()`
+- Import paths changed: `from constants import ...` to `from oak.constants import ...`,
+  `from utils import ...` to `from oak.utils import ...`
+- `GUILD_ID` global replaced with `self.bot.guild_id`
+- All persistent views register both legacy custom IDs and new `oak:{branch}:{action}`
+  namespaced IDs for backward compatibility
+- `DummyView` renamed to `SuggestionVoteView`
+- Suggestions: votes exclusively use `suggestion_votes` table; legacy JSON columns still
+  synced for backward compatibility but no longer written to on INSERT
+- Suggestions: empty/too-short rejection messages sent as temporary channel replies
+  (`delete_after=10`) instead of DMs
+- Suggestions: `StatusModal` fetches correct channel via stored `channel_id` instead of
+  using ephemeral interaction channel; re-checks manager permissions on submit
+- Suggestions: vote handler uses single `interaction.response.edit_message()` instead of
+  separate `message.edit()` + `defer()`
+- Application: embed title uses `applicant.display_name` instead of `applicant.mention`
+  (mentions don't render in embed titles)
+- Application: modal title truncated to 45 characters (Discord limit)
+- Application: database update moved before Discord API calls in `_complete_application()`
+  and `DeclineReasonModal`
+- Application: `StatusChangeView` buttons no longer have persistent custom_ids (ephemeral
+  view)
+- Application: `PostSubmissionView.read_application()` and `ApplicationHistoryView` use
+  `PaginatedEmbedView` instead of multi-embed followup loops
+- Application: background check MySQL operations run via `asyncio.to_thread()` to avoid
+  blocking; `connect_timeout: 10` added
+- Shopkeepers: branch-local `PaginatedEmbedView` replaced with framework
+  `oak.views.PaginatedEmbedView`
+- Shopkeepers: `_send_paginated()` accepts `ephemeral` kwarg (previously always ephemeral)
+- Shopkeepers: `/price` command shows matplotlib price chart instead of text-based history
+  (with text fallback for < 2 data points or missing matplotlib)
+- Shopkeepers: `format_price()` returns `"Free"` for zero values (previously returned
+  `"N/A"`)
+- Shopkeepers: import affected dates tracked per-file and only merged after successful
+  commit
+- Status channels: loop interval changed from 6 minutes to 11 minutes
+- Status channels: jitter changed from `random.uniform(-36, 36)` to
+  `random.uniform(0, 36)` (always non-negative)
+- Status channels: uses `async_lookup()` and `async_status()` instead of synchronous
+  mcstatus methods
+- Status channels: skips update when neither channel ID is configured
+- Tickets: authorized reopen check via audit logs — unauthorized users have their reopen
+  reversed (thread re-archived and re-locked)
+- Tickets: thread update debounce with 5-second window to prevent duplicate processing
+- Tickets: close cancels reminders atomically in the same DB transaction
+- Tickets: orphan thread cleanup on DB insert failure
+- Tickets: `sanitize_name()` uses Unicode-aware regex `[^\w\-]` instead of ASCII-only
+- Tickets: `parse_time_string()` rejects zero values
+- Tickets: `ConfirmCloseView` restricted to the initiating user
+- Tickets: `TicketQuestionsModal` respects `required: false` with `min_length=0`
+- Tickets: rate limit dict hard cap at 1000 entries
+- Tickets: stale `_thread_update_times` entries cleaned every anti-archive cycle
+- Tickets: persistent view cleanup (`.stop()`) in `on_disable()`
+- All emojis removed from user-facing embed text (titles, descriptions, field names)
+- Em dashes replaced with ASCII dashes, bullets changed from `•` to `-`/`*`
+- Config file reads use explicit `encoding="utf-8"`
+- `create_branch.py` updated: generates `OakBranch` subclass, `branch.yml` manifest,
+  `self.setting()`, `self.log`, `self.db.initialize()`, `on_enable`/`on_disable`/`on_ready`;
+  rejects reserved names and names starting with `_`; defaults to `database: false`
+- `requirements.txt` updated with `aiohttp~=3.11.0` and `matplotlib~=3.10.0`
+- README rewritten as concise reference-style documentation with tables
+- CONTRIBUTING.md updated for Oak framework terminology and patterns
+
+### Removed
+
+- Root-level `config.py`, `constants.py`, `database.py`, `utils.py` — replaced by `oak/`
+  package equivalents
+- `core/branch_loader.py` — replaced by `oak/loader.py` and `oak/manifest.py`
+- `branches/admin/` directory — admin branch moved to `oak/admin/` as built-in framework
+  component
+- All `setup()` functions and imports from branch `__init__.py` files
+- All `load_config()` methods from branches
+- All `get_*_config()`, `get_db_path()`, `get_embed_colors()` (no-arg), and
+  `get_reviewer_role_ids()` disk-reading helpers
+- All direct `import aiosqlite` from branch files
+- `is_application_reviewer()` decorator
+- `/reloadall` command (use `/reload` per branch or full bot restart)
+- Deprecated `truncate_for_embed_field()` shim in `oak/constants.py`
+- Deprecated `connect()` method on `BranchDatabase` (use `raw_connection()`)
+- Unused functions removed across all branches: dead status_emoji dicts, f-strings without
+  placeholders, redundant global declarations, unused variables and imports
 
 ### Fixed
-- **Suggestions**: Vote race condition fixed with atomic `suggestion_votes` table; null-safe JSON parsing; reason text truncated to embed field limit
-- **Applications**: Decline race condition fixed with status check before UPDATE; Read button permission check; modal title truncation
-- **Tickets**: Close race condition fixed with `AND status = 'open'` guard; ticket number race fixed with transaction; owner check on close confirmation; reminder messages now replaced instead of accumulating; anti-archive memory leak (unbounded `_thread_update_times`)
-- **Shopkeepers**: `_calculate_emerald_cost` None crash; TAG_Int unsigned handling; SQL injection via f-strings replaced with parameterized queries; import lock TOCTOU race
-- **Status Channels**: Players None check; task skipped when unconfigured
-- **Framework**: Duplicate branch ID detection; malformed custom ID rejection; stale manifest on reload; circular dependency handling; event listener timeout; persistent view cleanup on branch disable; config parse failure logging; exception details no longer leaked to Discord users
-- Error handlers added to all modals across all branches
 
-## [0.2.0] - 2026-02-06
+- Application `app_index` race condition: atomic assignment via subquery INSERT instead of
+  separate SELECT + INSERT
+- Application database held during slow Discord API calls: split into 3-phase pattern
+  releasing DB before channel creation
+- Application answers lost after bot restart: recovered from database on `ContinueView`
+  resume
+- Application decline modal interaction timeout: defers immediately
+- Application infinite loop in pagination: safety counter with guaranteed forward progress
+- Application crash when applicant left server: null-safe `paginate_application_embed()`
+- Application status double-update: atomic `AND status = 'pending'` WHERE clause in decline
+  and `AND status = ?` in `StatusChangeView`
+- Application corrupted JSON answers: caught with `try/except (json.JSONDecodeError, TypeError)`
+- Suggestions manage fetching wrong channel: passes `channel_id` through view chain instead
+  of using ephemeral interaction channel
+- Suggestions double-status change: checks `status = 'Pending'` before allowing
+  approve/deny
+- Suggestions vote race condition: atomic operations on `suggestion_votes` table instead of
+  JSON column read-modify-write
+- Suggestions null-safe JSON parsing for `likes`/`dislikes` columns (handles NULL values)
+- Suggestions reason field truncated to embed field limit (prevents HTTPException)
+- Shopkeepers SQL injection via LIKE wildcards: escapes `%`, `_`, `\` in user input
+- Shopkeepers blocking event loop during CSV import and file stat: moved to
+  `asyncio.to_thread()`
+- Shopkeepers null-safe currency calculation (handles `item2_id = 0` and
+  `item2_amount = None`)
+- Shopkeepers player/shop name crash on null UUID
+- Status channels blocking event loop: async mcstatus lookup and status
+- Status channels format string injection: rejects attribute access (`.`) and index
+  access (`[`)
+- Status channels crash when server returns no player information
+- Tickets unauthorized reopen: audit log check identifies unarchiver and re-locks if
+  unauthorized
+- Tickets thread update spam: 5-second debounce window
+- Tickets reminders not cancelled on close: atomic in same DB transaction
+- Tickets rate limit memory leak: hard cap at 1000 entries with expired entry cleanup
+- Tickets close race condition: `AND status = 'open'` guard
+- Tickets null unarchiver: re-archives and logs when audit log lookup fails
+- Framework `on_ready` firing on every reconnect: `_ready_fired` flag
+- Framework stale manifest on reload: re-discovers manifest before reloading
+- Framework circular dependency handling: DFS-based topological sort, cycle members excluded
+  and recorded in `_load_failures`
+- Framework stale submodule references on reload: cleans all `branches.<name>.*` from
+  `sys.modules`
+- Framework resource cleanup on `add_cog` failure: closes database and event handle
+- Framework config parse failures now logged instead of silently ignored
+- Framework event listener timeout: 30-second limit with `asyncio.shield`
+
+### Security
+
+- `.env` file no longer tracked in git; renamed to `.env.example` with `.env` in
+  `.gitignore`
+- Branch config files (`branches/*/config.yml`) added to `.gitignore` (may contain secrets)
+- Decline reason and suggestion content sanitized with `escape_markdown(escape_mentions())`
+  before display
+- Format string injection prevention in status channels (rejects `.` and `[` in format
+  strings)
+- SQL LIKE wildcard escaping in all shopkeepers user input queries
+- Staff permission checks enforced on all application management buttons
+- Ticket reopen authorization via audit log verification
+- Admin command error messages no longer expose exception details to Discord users
+- Transcript web server validates filenames against path traversal (`..`, `/`, `\`)
+
+## [1.2.0] - 2026-02-06
 
 ### Added
-- **Shopkeepers branch** (new) — Minecraft trade data analysis system
-  - CSV-based trade log importer with SHA-256 deduplication and incremental import
-  - NBT metadata parser supporting legacy Bukkit and modern 1.20.5+ component formats
-  - 13 slash commands: `/price`, `/top`, `/search`, `/player`, `/shop`, `/trending`, `/shops`, `/players`, `/shopkeepers_import`, `/shopkeepers_stats`, `/economy`, `/sinks`, `/faucets`
-  - Configurable multi-tier currency, plugin identity key support, auto-import task
-- **Tickets**: Reminder messages now tracked and replaced to avoid clutter in threads
 
-### Fixed
-- Slash command sync no longer re-runs on every Discord reconnect
-- Global slash command error handler added
-- Config deep merge for missing keys
-- SQLite WAL journal mode enabled
-- Bug fixes across all branches (admin command display, snowflake validation, application status emojis, and more)
-- Removed 14 unused functions and ~300 lines of dead code
-
-## [0.1.1] - 2025-11-15
-
-### Added
-- **Tickets**: Reminder system with `/remindme` and `/stopreminder` commands
-  - Custom intervals, DM notifications, snooze (1h/6h/1d), auto-cancel on ticket close
-- **Tickets**: Staff commands `/closeticket`, `/addticket`, `/ticketstats`
-- **Tickets**: Category-based permission system for granular staff access control
-  - `staff_roles` per category (renamed from `ping_roles`, backwards compatible)
-  - Global staff override via `staff_role_ids`
-- **Tickets**: Auto-reopen detection when closed tickets are manually unarchived
+- **Shopkeepers branch** — Minecraft trade data analysis system for the Shopkeepers plugin
+  - CSV-based trade log importer (`importer.py`) with SHA-256 fingerprint deduplication,
+    incremental import, and configurable auto-import interval (default 30 minutes)
+  - NBT metadata parser (`nbt_parser.py`) supporting legacy Bukkit format and modern 1.20.5+
+    component format; extracts custom names (including gradient text), enchantments, potion
+    types, shulker box contents, and plugin identity (ExecutableItems, ItemsAdder,
+    PhoenixCrates, CrazyCrates, OakTools, NekoTraps, Shopkeepers)
+  - Database schema: 5 tables (`imported_files`, `items`, `trades`, `price_summary`,
+    `players`) with indexes on trade dates, item IDs, player UUIDs, and shop owners
+  - Uniform shulker box expansion (single-item shulkers auto-expanded to bulk trades)
+  - Incremental price summary rebuild (only affected dates recomputed)
+  - Multi-tier currency system (emerald = 1, emerald_block = 9,
+    CompressedEmeraldBlock = 576) with smart mixed-unit display (CEMB/EMB/EM)
+  - Public commands: `/price` (price stats with history), `/top` (leaderboard by trades/
+    price/volume), `/search` (fuzzy item lookup), `/player` (trade stats), `/shop` (shop
+    owner stats), `/trending` (price change analysis), `/shops` (owner leaderboard),
+    `/players` (player leaderboard)
+  - Admin commands: `/shopkeepers_import` (manual CSV import), `/shopkeepers_stats`
+    (database dashboard), `/economy` (sink/faucet analysis for admin shops), `/sinks`
+    (detailed currency sink breakdown), `/faucets` (detailed currency faucet breakdown)
+  - Item and player autocomplete handlers
+  - `PaginatedEmbedView` with Previous/Next buttons and author-only interaction check
+  - Configurable plugin identity keys, embed color, trades per page, and UI settings
+- Ticket reminder message tracking and replacement: stores `last_reminder_message_id`,
+  deletes old reminder before sending new one (prevents reminder clutter in ticket threads)
+- `last_reminder_message_id` column added to `ticket_reminders` table via migration
+- Global slash command error handler (`_on_app_command_error`) on `OakBot`
+- `deep_merge()` utility function for recursive dictionary merging
+- `load_branch_config()` now deep-merges loaded config against defaults
+- `check_application_answer_quality()` moved from root `utils.py` to application helpers
+- WAL journal mode enabled in `init_branch_database()`
 
 ### Changed
-- Ticket close/manage operations now respect category-based permissions
-- Thread archived and locked before database update for consistency
-- Transaction safety with IMMEDIATE locking for ticket number generation
+
+- Slash command sync moved from `on_ready()` to `setup_hook()` (prevents re-sync on every
+  Discord reconnect, avoiding rate limits)
+- `/branches` uses `bot.extensions` instead of `bot.cogs` (correctly lists branch modules)
+- `/botinfo` counts `bot.tree.get_commands()` (slash commands) instead of `bot.commands`
+  (prefix commands)
+- `DummyView` no longer accepts unused `status` parameter
+- Ticket panel validation moved from `cog_load` to `on_ready` (ensures bot cache is
+  populated)
+- Log channel ID validation range corrected to `2^64 - 1` (unsigned 64-bit snowflakes)
+- Logging messages stripped of emojis throughout bot.py and branch_loader.py
+- Error messages stripped of emojis in `on_command_error()`
+- `on_message()` log simplified to `Command from {author}: {content}`
+- Type hints modernized from `Optional[X]` / `Dict[str, Any]` to Python 3.10+ `X | None` /
+  `dict[str, Any]`
+- `create_branch.py` generates slash command templates instead of prefix commands
+- Branch autocomplete in admin commands wrapped in try/except (returns empty on error)
+- `STATUS_EMOJI` extracted to module-level dict in application views (shared across views)
+- Ticket rate limit dict properly typed as `dict[int, float]` with expired entry cleanup
+- `.gitignore`: added `branches/shopkeepers/csv_data/`, `temp/`
+
+### Removed
+
+- `get_env_int_list()` from config.py
+- `validate_channel_id()`, `validate_role_ids()`, `validate_config_dict()` from config.py
+- `get_db_connection()` from database.py
+- `truncate_for_embed_description()`, `truncate_for_message()` from constants.py
+- `validate_minecraft_username()`, `validate_age()`, `truncate_text()`, `format_duration()`,
+  `is_valid_url()`, `validate_yes_no()`, `validate_rating()`, `validate_time_commitment()`
+  from utils.py
+- Intent validation block from bot.py
+- `BranchLoader.loaded_branches` unused dict
+- Unused `yaml` import from status_channels branch
+- Comment block removed from `.env` about admin permission system
 
 ### Fixed
-- Staff could previously access tickets outside their assigned categories
-- Closed tickets that were manually unarchived did not reopen properly
 
-## [0.1.0] - 2025-11-08
+- Slash commands re-synced on every Discord reconnect, causing unnecessary API calls and
+  potential rate limiting
+- Application stats null-safety: checks row is not None before accessing index
+- Ticket rate limit dict could grow unbounded: `_cleanup_rate_limits()` removes expired
+  entries before each check
+- f-strings without placeholders corrected to plain strings
+
+## [1.1.0] - 2025-11-15
 
 ### Added
-- **Oak framework** — modular Discord bot with hot-reload branch system
-- **Application branch** — staff application system with configurable questions, review workflow, background checks, and inactivity tracking
-- **Suggestions branch** — community suggestion voting with status management (approve/deny/consider) and discussion threads
-- **Tickets branch** — support ticket system with configurable categories, panels, transcript logging, and auto-archive
-- **Status Channels branch** — voice channels displaying live server member/bot/role counts
-- **Admin branch** — bot management commands (`/reload`, `/load`, `/branches`, `/botinfo`)
-- **Link branch** — Minecraft account linking
-- Constants module with Discord API limits
-- Branch scaffolding tool (`create_branch.py`)
 
-## [0.0.1] - 2025-11-06
+- **Ticket reminder system**: `/remindme` command with custom intervals (`30m`, `1h`, `2h`,
+  `1d`), optional DM notifications, `ReminderControlView` with Stop/Snooze 1h/Snooze 6h/
+  Snooze 1d buttons, 1-minute check loop, automatic cancellation on ticket close, orphaned
+  reminder deactivation
+- **Staff commands**: `/closeticket` (close with optional reason, sends closure embed, logs
+  to log channel), `/addticket` (manually register existing threads with category
+  autocomplete and status detection)
+- **Category-based permission system**: `can_manage_ticket_category()` checking Discord
+  administrator, global `staff_role_ids`, or per-category `staff_roles`;
+  `can_bypass_duplicate_check()` for configurable bypass roles
+- **Initial questions modal**: `TicketQuestionsModal` generating up to 5 `TextInput` fields
+  from config with per-field `label`, `placeholder`, `required`, `max_length`, `min_length`;
+  `{answers}` placeholder in welcome messages for formatted Q&A injection
+- **Ticket creation rate limiting**: configurable cooldown via
+  `rate_limit.ticket_creation_cooldown_seconds` (default 60), checked before and after modal
+  submission
+- **Configurable button styles**: per-category `button_style` supporting `primary`,
+  `secondary`, `success`, `danger` and aliases (`blurple`, `grey`, `green`, `red`)
+- **Ticket reopening detection**: `on_raw_thread_update` listener detects manual unarchive
+  of closed tickets and updates status to "open" in database with logging
+- `ticket_reminders` database table with foreign key cascade, indexes on active status,
+  thread, and user, and unique partial index preventing duplicate active reminders
+- `parse_time_string()` helper supporting minutes/hours/days with 30-day maximum
+- `categories_field_name` panel setting (set to `""` to hide categories in panel embed)
+- `bypass_duplicate_check_role_ids` config setting
+- Rate limit protection (1-second sleep) between processing due reminders
 
-Initial commit with core bot structure, branch loader, and five branches (Application, Suggestions, Status Channels, Link).
+### Changed
+
+- Close and reopen permissions now use `can_manage_ticket_category()` instead of global
+  `is_staff()` — category-specific access control
+- Thread closure order: archive and lock BEFORE database update for consistent state on
+  failure
+- Duplicate ticket check respects `can_bypass_duplicate_check()` bypass roles
+- Auto-archive duration adapts to guild boost level (7 days for tier 2+, 1 day for tier 0-1)
+- `ping_roles` renamed to `staff_roles` in category config (backward compatible fallback)
+- Category labels no longer include emoji prefix (emoji in separate `emoji` field)
+- Welcome messages updated to use `{answers}` placeholder
+- Config reloaded on every ticket panel button click
+- Interaction response handling checks `is_done()` before deferring
+
+### Fixed
+
+- Staff members could manage tickets outside their assigned categories
+- Closed tickets manually unarchived did not properly reopen in database
+- Ticket creators can close their own tickets regardless of staff role membership
+- Race condition in reminder creation handled via `IntegrityError` catch (unique partial
+  index enforcement)
+- Auto-archive duration failure on unboosted guilds (previously hardcoded 7-day request)
+
+### Security
+
+- Category isolation: sensitive categories (billing, appeals) restricted to specific staff
+  roles via per-category `staff_roles` config
+- All management commands (`/closeticket`, `/reopenticket`, `/addticket`, close button)
+  validate category access before executing
+
+## [1.0.0] - 2025-11-08
+
+Initial release of the Oak Discord Bot framework.
+
+### Added
+
+#### Core Framework
+
+- `Oak` bot class (`bot.py`) with Discord.py `commands.Bot`, `!` prefix, intents for
+  message_content, messages, guilds, and members
+- Branch auto-discovery and loading via `BranchLoader` (`core/branch_loader.py`) with
+  filesystem scanning, config loading, and hot-reload support
+- Configuration system (`config.py`) loading `.env` for `DISCORD_TOKEN` and `GUILD_ID`,
+  with validation
+- Database utilities (`database.py`): `init_branch_database()` for schema creation with WAL
+  mode and foreign keys
+- Utility functions (`utils.py`): `sanitize_text()`, `check_application_answer_quality()`
+- Discord API constants (`constants.py`): embed limits, message limits, modal limits, select
+  menu limits, button limits, channel/thread limits, HTTP status codes, Oak framework
+  constants, and `truncate_for_embed_field()` helper
+- Logging with file handler (`logs/oak_YYYYMMDD.log`) and console handler
+- Guild-scoped slash command syncing on startup
+- Global command error handler for prefix commands
+- Branch creation scaffold (`create_branch.py`) generating branch template with
+  `branch.py`, `__init__.py`, `config.yml`, and `branch.yml`
+- `requirements.txt`: `discord.py>=2.3.0`, `python-dotenv>=1.0.0`, `aiosqlite>=0.19.0`,
+  `PyYAML>=6.0`, `mysql-connector-python>=8.0.0`, `mcstatus>=11.0.0`
+- MIT License
+
+#### Admin Branch (`branches/admin/`)
+
+- `/reload <branch>` — hot-reload a branch and its config
+- `/load <branch>` — load a branch
+- `/unload <branch>` — unload a branch (with self-protection)
+- `/branches` — list all loaded branches
+- `/reloadall` — reload all branches (with deferred response)
+- `/botinfo` — server count, user count, branch count, Python version, discord.py version,
+  latency
+- Branch name autocomplete on all commands
+- All responses ephemeral, all commands require Administrator permission
+
+#### Application Branch (`branches/application/`)
+
+- Multi-page modal application system (5 questions per page) with configurable questions
+  (up to 17), answer quality validation (minimum length, repeated character detection,
+  single-word detection), and progress saving between pages
+- Private application channels with permission overwrites
+- Staff review tools: `ManageView` with Accept (moves to accepted category), Decline
+  (reason modal with configurable delay and DM), Background Check (MySQL/Plan playtime
+  integration), View History (previous applications with paginated dropdown)
+- `StatusChangeView` for manual status changes (Pending/Accepted/Denied/Cancelled/Abandoned)
+- `ApplicationHistoryView` with dropdown select for viewing previous applications
+- Automated inactivity management: configurable warning after N days, auto-abandon after N
+  days, denied app cleanup after N hours if DM failed
+- Duplicate application prevention with race condition handling (`IntegrityError` catch)
+- Optional required link role check (Minecraft account linking)
+- Database: `applications` table with `id`, `user_id`, `channel_id`, `app_index`, `answers`,
+  `status`, timestamps, and denial tracking columns; `idx_applications_status` and
+  `idx_applications_last_activity` indexes
+- `/appstats` — application statistics (total, per-status counts, average review time)
+- `/apphistory <user>` — user's application history with status emojis and detail dropdown
+- Configurable embed colors, messages, position name, channel IDs, and MySQL settings
+
+#### Suggestions Branch (`branches/suggestions/`)
+
+- Community suggestion system: intercepts messages in configured channel, replaces with
+  formatted embed, adds Like/Dislike/Manage voting buttons, creates discussion thread
+- Vote toggling (re-click to remove), opposite vote removal, live statistics update
+- Staff management: `ManageSuggestionView` with Approve (green embed), Deny (red embed),
+  Delete (removes message and thread) buttons
+- `StatusModal` for approval/denial reason with moderator mention, timestamp, and author DM
+  notification
+- Database: `suggestions` table with `id`, `message_id`, `thread_id`, `user_id`, `content`,
+  `likes` (JSON), `dislikes` (JSON), `status`, `reason`, `created_at`
+- Persistent `SuggestionVoteView` (formerly `DummyView`) surviving bot restarts
+- Configurable embed colors, validation (min/max length), and messages
+
+#### Tickets Branch (`branches/tickets/`)
+
+- Thread-based ticket system with configurable categories (default 5: ingame, billing,
+  reports, appeals, bugs)
+- `TicketPanelView` with dynamically generated buttons per category (configurable label,
+  emoji, style)
+- `TicketControlView` with Close and Reopen buttons
+- `CloseReasonModal` for close reason entry
+- Per-category sequential ticket numbering with `{number}` and `{nickname}` thread name
+  formatting
+- Anti-archive background task (30-minute loop) preventing open ticket archival
+- Thread update listener handling archive/unarchive events
+- Config hash tracking for automatic panel refresh on config change
+- Config validation (`validate_config()`) for required fields, channel IDs, and category
+  structure
+- Standardized log embeds (`format_log_embed()`) for open/close/reopen events
+- `/ticketstats` — total tickets, open/closed counts, per-category breakdown, average
+  resolution time
+- `/tickets` — user's open tickets (max 10)
+- Database: `tickets` and `ticket_counters` tables
+- Configurable: `panel_channel_id`, `log_channel_id`, per-category `channel_id`,
+  `staff_roles`, `welcome_message`, `thread_name`, `allow_adding_users`
+
+#### Status Channels Branch (`branches/status_channels/`)
+
+- Auto-updating voice channels displaying real-time server statistics
+- Member count channel with configurable format string (e.g., `"Total Members: {count:,}"`)
+- Minecraft player count channel via `mcstatus.JavaServer` with configurable format
+  (e.g., `"Online: {online}/{max}"`)
+- 6-minute update loop with 10% jitter for rate limit protection
+- Rate limit retry handling (`retry_after`)
+
+#### Link Branch (`branches/link/`)
+
+- `/link` command displaying configurable embed with account linking instructions
+- Embed title, description, and color configurable via `config.yml`
+
+#### Documentation
+
+- README with architecture overview, setup instructions, project structure, all branch
+  feature descriptions, configuration system, permission system, database architecture,
+  development workflow, and troubleshooting
+- CONTRIBUTING.md with coding standards, branch development guide, PR format, and testing
+  checklist
