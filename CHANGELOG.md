@@ -2,159 +2,115 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased] - 2026-02-06
+The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
-### Added - Shopkeepers Branch (New)
-A complete CSV-based trade log importer and market analysis system for Minecraft Shopkeepers plugin data.
+## [Unreleased]
 
-#### Core System
-- **CSV Importer**: Automatic and manual import of Shopkeepers trade log CSV files
-- **NBT Parser**: Identifies vanilla items, enchanted books, potions, tipped arrows, shulker boxes, and custom plugin items
-- **Dual NBT Format Support**: Handles both legacy Bukkit (`v:4189`) and modern 1.20.5+ component (`DataVersion:4440`) formats
-- **SHA-256 Deduplication**: Fingerprint-based trade dedup prevents double-counting on re-import
-- **Incremental Import**: Only processes new lines from each CSV, skips unchanged files entirely
-- **Price Summary Table**: Maintains daily price averages for fast lookups, rebuilt incrementally for affected dates only
+### Added
+- **Tickets**: Transcript web server (`branches/tickets/web.py`) — serves transcripts as hosted links instead of file attachments
+  - Configurable via `transcript.web` settings (port, base_url); fully backwards compatible
+  - New dependency: `aiohttp`
 
-#### Public Commands
-- **`/price <item> [days]`**: Check average, min, max price with daily price chart (1-365 days)
-- **`/top [sort_by]`**: View top traded items by trade count, volume, or total value
-- **`/search <query>`**: Search for items by name with price info
-- **`/player <name>`**: View trade stats for a player (spending, favorites, recent trades)
-- **`/shop <owner>`**: View trade stats for a shop owner (revenue, top items, recent trades)
-- **`/trending [period] [direction]`**: Items with biggest price changes (compares recent half vs prior half)
-- **`/shops [sort_by]`**: Top shop owner leaderboard (by revenue, trades, or unique items)
-- **`/players [sort_by]`**: Top player leaderboard (by spending, trades, or unique items)
+### Fixed
+- **Framework**: Audit log `details` field truncated to embed field limit (1024 chars)
+- **Framework**: Dependency cycle branches now recorded in load failures (visible in `/health`)
+- **Tickets**: Transcript "Closed:" header shows real timestamp instead of literal "now"
+- **Tickets**: Transcript embed renderer now displays embed fields (e.g. close reason)
+- **Application**: Status update is now atomic — prevents stale overwrites by concurrent staff
+- **Application**: Corrupted JSON in application answers no longer crashes the bot
+- **Shopkeepers**: Player name display no longer crashes when UUID is null
+- **Suggestions**: INSERT no longer writes to legacy `likes`/`dislikes` JSON columns
+- **Suggestions**: Rejection messages sent as temporary channel replies instead of DMs
 
-#### Admin Commands
-- **`/shopkeepers_import`**: Manually trigger CSV import
-- **`/shopkeepers_stats`**: View database statistics (total trades, items, files, etc.)
-- **`/economy [period]`**: Economy sink/faucet analysis (emerald flow through admin shops)
-- **`/sinks [period]`**: Detailed breakdown of items players buy from admin shops
-- **`/faucets [period]`**: Detailed breakdown of items players sell to admin shops
+## [0.3.0] - 2026-02-20
 
-#### Configuration
-- Configurable multi-tier currency system (Emeralds, Emerald Blocks, Compressed Emerald Blocks)
-- Plugin identity key support (ExecutableItems, ItemsAdder, PhoenixCrates, etc.)
-- Auto-import interval, UI settings, admin role IDs
-- Admin shop prices excluded from market averages
+Major framework rewrite: all branches now run on the Oak framework with centralized database access, config management, and lifecycle hooks.
 
-#### Architecture
-- 5 database tables: `imported_files`, `items`, `trades`, `players`, `price_summary`
-- 6 source files: `branch.py`, `importer.py`, `nbt_parser.py`, `helpers.py`, `views.py`, `__init__.py`
-- Paginated embeds with interactive Previous/Next buttons for all list commands
-- Background auto-import task with configurable interval
+### Added
+- **Oak framework** (`oak/` package) replacing the old `core/` module
+  - `OakBranch` base class with `on_enable`/`on_ready`/`on_disable` lifecycle
+  - `BranchDatabase` with persistent connection, WAL mode, write lock, transaction context manager, and migration tracking
+  - `EventBus` for inter-branch communication
+  - `InteractionRouter` for `oak:{branch}:{action}` custom ID routing
+  - `BranchLoader` with dependency resolution and hot-reload support
+  - Branch manifests (`branch.yml`) for metadata and dependency declaration
+  - `TaskRegistry` for tracking `discord.ext.tasks` loops across branches
+  - `BackupManager` for scheduled database backups with WAL checkpoint
+  - `PaginatedEmbedView` reusable paginated embed component
+  - In-memory metrics tracking (commands, events, DB ops, errors)
+  - Inter-branch service registry (`self.services` / `self.require_branch()`)
+  - Audit logging to a Discord channel for admin actions
+- **Admin commands**: `/reload`, `/load`, `/status`, `/health`, `/metrics`, `/backup`, `/enable`, `/disable`
+- **Branch developer guide** (`GUIDE.md`) covering config, database, lifecycle, commands, views, and migration
 
----
+### Changed
+- All branches migrated from raw `aiosqlite.connect()` to `BranchDatabase` methods
+- All disk-reading config helpers replaced with `self.config` / `self.setting()`
+- Views, modals, and handlers use module-level `configure(db, config)` pattern
+- Slash command sync moved from `on_ready` to `setup_hook` (runs once instead of on every reconnect)
+- Config loading uses deep merge so missing keys fall back to defaults
+- `.env` removed from tracking, replaced with `.env.example`
 
-## [Unreleased] - 2025-01-15
+### Fixed
+- **Suggestions**: Vote race condition fixed with atomic `suggestion_votes` table; null-safe JSON parsing; reason text truncated to embed field limit
+- **Applications**: Decline race condition fixed with status check before UPDATE; Read button permission check; modal title truncation
+- **Tickets**: Close race condition fixed with `AND status = 'open'` guard; ticket number race fixed with transaction; owner check on close confirmation; reminder messages now replaced instead of accumulating; anti-archive memory leak (unbounded `_thread_update_times`)
+- **Shopkeepers**: `_calculate_emerald_cost` None crash; TAG_Int unsigned handling; SQL injection via f-strings replaced with parameterized queries; import lock TOCTOU race
+- **Status Channels**: Players None check; task skipped when unconfigured
+- **Framework**: Duplicate branch ID detection; malformed custom ID rejection; stale manifest on reload; circular dependency handling; event listener timeout; persistent view cleanup on branch disable; config parse failure logging; exception details no longer leaked to Discord users
+- Error handlers added to all modals across all branches
 
-### Added - Tickets Branch
+## [0.2.0] - 2026-02-06
 
-#### Ticket Reminder System
-- **`/remindme` command**: Set custom reminders for tickets with optional initial delay and DM notifications
-  - Supports time formats like `30m`, `1h`, `2h`, `1d`
-  - Optional DM notifications when reminders fire
-  - Daily recurring reminders after initial reminder
-  - Snooze functionality (1h, 6h, 1d)
-  - Stop reminder functionality
-- **`/stopreminder` command**: Stop active reminders for the current ticket
-- **Reminder Control View**: Interactive buttons on reminder messages to stop or snooze
-- **Reminder background task**: Automatically sends reminders at scheduled times (checks every minute)
-- **Database schema**: Added `ticket_reminders` table with proper indexes and constraints
-- **Auto-cleanup**: Reminders are automatically cancelled when tickets are closed
+### Added
+- **Shopkeepers branch** (new) — Minecraft trade data analysis system
+  - CSV-based trade log importer with SHA-256 deduplication and incremental import
+  - NBT metadata parser supporting legacy Bukkit and modern 1.20.5+ component formats
+  - 13 slash commands: `/price`, `/top`, `/search`, `/player`, `/shop`, `/trending`, `/shops`, `/players`, `/shopkeepers_import`, `/shopkeepers_stats`, `/economy`, `/sinks`, `/faucets`
+  - Configurable multi-tier currency, plugin identity key support, auto-import task
+- **Tickets**: Reminder messages now tracked and replaced to avoid clutter in threads
 
-#### Staff Commands
-- **`/closeticket` command**: Staff command to close tickets with optional reason (works in any ticket thread)
-- **`/addticket` command**: Manually add existing threads to the tickets database with category autocomplete
-- **`/ticketstats` command**: View comprehensive ticket statistics including resolution times and category breakdowns
+### Fixed
+- Slash command sync no longer re-runs on every Discord reconnect
+- Global slash command error handler added
+- Config deep merge for missing keys
+- SQLite WAL journal mode enabled
+- Bug fixes across all branches (admin command display, snowflake validation, application status emojis, and more)
+- Removed 14 unused functions and ~300 lines of dead code
 
-#### Category-Based Permission System
-- **New permission model**: Staff can only manage tickets in categories they're assigned to
-- **`staff_roles` config setting**: Renamed from `ping_roles` for clarity (backwards compatible)
-  - Roles listed here can both manage tickets AND are pinged when tickets are created
-  - Provides granular access control per category (e.g., only admins can manage billing tickets)
-- **Global staff override**: Roles in `staff_role_ids` can manage ALL categories
-- **`can_manage_ticket_category()` helper**: Checks if user can manage tickets in specific categories
-- **Enhanced security**: Sensitive categories (billing, appeals) can be restricted to specific roles
+## [0.1.1] - 2025-11-15
 
-#### Ticket Reopening
-- **Auto-reopen detection**: Tickets automatically reopen if manually unarchived
-- **`on_raw_thread_update` listener**: Detects when closed tickets are unarchived and updates status
-- **Reopen logging**: Logs reopen events to the log channel
+### Added
+- **Tickets**: Reminder system with `/remindme` and `/stopreminder` commands
+  - Custom intervals, DM notifications, snooze (1h/6h/1d), auto-cancel on ticket close
+- **Tickets**: Staff commands `/closeticket`, `/addticket`, `/ticketstats`
+- **Tickets**: Category-based permission system for granular staff access control
+  - `staff_roles` per category (renamed from `ping_roles`, backwards compatible)
+  - Global staff override via `staff_role_ids`
+- **Tickets**: Auto-reopen detection when closed tickets are manually unarchived
 
-#### Configuration Improvements
-- **`categories_field_name` panel setting**: Customize or hide the categories field name in ticket panel
-- **Hot-reload support**: Config values are reloaded in `cog_load()` for better development experience
-- **Backwards compatibility**: Old configs using `ping_roles` still work seamlessly
+### Changed
+- Ticket close/manage operations now respect category-based permissions
+- Thread archived and locked before database update for consistency
+- Transaction safety with IMMEDIATE locking for ticket number generation
 
-### Changed - Tickets Branch
+### Fixed
+- Staff could previously access tickets outside their assigned categories
+- Closed tickets that were manually unarchived did not reopen properly
 
-#### Permission System Overhaul
-- **Close button permissions**: Now respect category-based permissions (uses `can_manage_ticket_category`)
-- **Command permissions**: All staff commands now use category-based permission checks
-- **Removed global staff checks**: Commands like `/closeticket` and `/reopenticket` now check category permissions instead of global staff only
+## [0.1.0] - 2025-11-08
 
-#### Database Operations
-- **Thread closure order**: Thread is now archived+locked BEFORE database update for better consistency
-- **Race condition protection**: Added retry logic with exponential backoff in `get_next_ticket_number()`
-- **Transaction safety**: Uses IMMEDIATE transactions to prevent concurrent ticket number collisions
+### Added
+- **Oak framework** — modular Discord bot with hot-reload branch system
+- **Application branch** — staff application system with configurable questions, review workflow, background checks, and inactivity tracking
+- **Suggestions branch** — community suggestion voting with status management (approve/deny/consider) and discussion threads
+- **Tickets branch** — support ticket system with configurable categories, panels, transcript logging, and auto-archive
+- **Status Channels branch** — voice channels displaying live server member/bot/role counts
+- **Admin branch** — bot management commands (`/reload`, `/load`, `/branches`, `/botinfo`)
+- **Link branch** — Minecraft account linking
+- Constants module with Discord API limits
+- Branch scaffolding tool (`create_branch.py`)
 
-#### Code Quality
-- **Improved error handling**: Better error messages for permission failures
-- **Enhanced logging**: More detailed logs for reminder operations and permission checks
-- **Type hints**: Added proper type annotations throughout
+## [0.0.1] - 2025-11-06
 
-### Fixed - Tickets Branch
-
-- **Privacy issue**: Staff members can no longer access/manage tickets outside their assigned categories
-- **Thread unarchive bug**: Closed tickets that are manually unarchived now properly reopen with correct status
-- **Permission checks**: Ticket creators can close their own tickets regardless of staff permissions
-- **Panel validation**: Panel now properly validates and recreates when config changes
-
-### Security - Tickets Branch
-
-- **Category isolation**: Sensitive categories (billing, appeals) can now be restricted to specific staff roles
-- **Dual-layer security**:
-  - Discord permission layer: Control thread visibility via "Manage Threads" permission
-  - Bot command layer: Control ticket management via `staff_roles` config
-- **Permission validation**: All management commands now validate category access before executing
-
----
-
-## Notes
-
-### Migration Guide: `ping_roles` → `staff_roles`
-
-The `ping_roles` setting has been renamed to `staff_roles` to better reflect its dual purpose:
-1. Roles that get pinged when tickets are created
-2. Roles that can manage tickets in that category
-
-**Action Required**: Update your `config.yml` to use `staff_roles` instead of `ping_roles`
-
-**Backwards Compatibility**: Old configs using `ping_roles` will continue to work, but updating is recommended.
-
-### Recommended Permission Setup
-
-For proper security with sensitive ticket categories:
-
-1. **Global staff roles** (`staff_role_ids`): Only admin/owner roles with full access
-2. **Category staff roles** (`staff_roles`): Specific roles per category
-3. **Discord permissions**: Remove "Manage Threads" from regular staff in ticket channel
-4. **Bot permissions**: Ensure bot has "Manage Threads" to create/close tickets
-
-Example:
-```yaml
-staff_role_ids:
-  - 123456  # Admin - full access
-  - 789012  # Owner - full access
-
-categories:
-  billing_support:
-    staff_roles:
-      - 123456  # Admin only
-      - 789012  # Owner only
-
-  ingame_support:
-    staff_roles:
-      - 345678  # Staff role
-```
+Initial commit with core bot structure, branch loader, and five branches (Application, Suggestions, Status Channels, Link).

@@ -22,12 +22,18 @@ from .errors import BranchLoadError, BranchNotFoundError
 from .events import BranchEventHandle, EventBus
 from .interactions import BranchInteractionHandle, InteractionRouter
 from .manifest import BranchManifest
+from . import __version__ as OAK_VERSION
 
 if TYPE_CHECKING:
     from .bot import OakBot
     from .branch import OakBranch
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_version(s: str) -> tuple[int, ...]:
+    """Parse a dotted version string into a tuple of ints."""
+    return tuple(int(x) for x in s.split("."))
 
 
 class BranchLoader:
@@ -45,6 +51,10 @@ class BranchLoader:
         self._paths: dict[str, Path] = {}
         # branch_id -> loaded OakBranch instance
         self._loaded: dict[str, "OakBranch"] = {}
+        # Branches skipped (disabled) during load_all
+        self._skipped: set[str] = set()
+        # Branches that failed to load: {branch_id: error_message}
+        self._load_failures: dict[str, str] = {}
 
     # -- Discovery --
 
@@ -52,6 +62,8 @@ class BranchLoader:
         """Scan branches/ for branch.yml files. Returns {id: manifest}."""
         self._manifests.clear()
         self._paths.clear()
+        self._skipped.clear()
+        self._load_failures.clear()
 
         if not self.branches_dir.exists():
             return {}
@@ -137,6 +149,10 @@ class BranchLoader:
         for bid in sorted(graph, key=lambda b: self._manifests[b].priority):
             visit(bid)
 
+        # Record cycle members as load failures so they're visible in /health
+        for bid in cycle_members:
+            self._load_failures[bid] = "Circular dependency detected"
+
         return order
 
     # -- Loading --
@@ -155,6 +171,24 @@ class BranchLoader:
             raise BranchNotFoundError(branch_id)
 
         branch_dir = self._paths[branch_id]
+
+        # Check oak_version requirement
+        if manifest.oak_version:
+            try:
+                required = _parse_version(manifest.oak_version)
+                current = _parse_version(OAK_VERSION)
+                if current < required:
+                    msg = (
+                        f"Requires Oak >= {manifest.oak_version}, "
+                        f"current is {OAK_VERSION}"
+                    )
+                    self._load_failures[branch_id] = msg
+                    raise BranchLoadError(branch_id, msg)
+            except ValueError:
+                logger.warning(
+                    f"Branch '{branch_id}' has unparseable oak_version: "
+                    f"'{manifest.oak_version}', skipping version check"
+                )
 
         # Check hard dependencies are loaded
         for dep in manifest.dependencies:
@@ -208,7 +242,8 @@ class BranchLoader:
         # Build database (if requested)
         db = None
         if manifest.database:
-            db = BranchDatabase(branch_dir / "data.db")
+            metrics = getattr(self.bot, "metrics", None)
+            db = BranchDatabase(branch_dir / "data.db", branch_id=branch_id, metrics=metrics)
 
         # Build context
         branch_logger = logging.getLogger(f"oak.branch.{branch_id}")
@@ -271,6 +306,9 @@ class BranchLoader:
 
         # Remove cog (triggers cog_unload -> on_disable)
         await self.bot.remove_cog(instance.qualified_name)
+
+        # Unregister scheduled tasks
+        self.bot.task_registry.unregister_all(branch_id)
 
         # Cleanup event subscriptions and database
         await self._cleanup_branch_resources(branch_id, instance.events, instance.db)
@@ -344,6 +382,7 @@ class BranchLoader:
 
             if not self._is_branch_enabled(branch_dir):
                 skipped.append(branch_id)
+                self._skipped.add(branch_id)
                 logger.info(f"Skipped {branch_id} (disabled)")
                 continue
 
@@ -352,6 +391,7 @@ class BranchLoader:
                 loaded.append(branch_id)
             except Exception as e:
                 failed.append((branch_id, str(e)))
+                self._load_failures[branch_id] = str(e)
                 logger.error(f"Failed to load {branch_id}: {e}")
 
         return loaded, skipped, failed
@@ -369,8 +409,25 @@ class BranchLoader:
     def get_branch(self, branch_id: str) -> "OakBranch | None":
         return self._loaded.get(branch_id)
 
+    def require_branch(self, branch_id: str) -> "OakBranch":
+        """Get a loaded branch by id, raising BranchNotFoundError if not loaded."""
+        instance = self._loaded.get(branch_id)
+        if instance is None:
+            raise BranchNotFoundError(branch_id)
+        return instance
+
     def is_loaded(self, branch_id: str) -> bool:
         return branch_id in self._loaded
+
+    @property
+    def skipped_branches(self) -> set[str]:
+        """Branch ids that were skipped (disabled) during load_all."""
+        return set(self._skipped)
+
+    @property
+    def failed_branches(self) -> dict[str, str]:
+        """Branch ids that failed to load, with error messages."""
+        return dict(self._load_failures)
 
     def discovered_ids(self) -> list[str]:
         """All discovered branch ids (loaded or not)."""

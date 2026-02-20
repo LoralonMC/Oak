@@ -11,9 +11,12 @@ import sqlite3
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import AsyncIterator
+from typing import AsyncIterator, Iterable, TYPE_CHECKING
 
 import aiosqlite
+
+if TYPE_CHECKING:
+    from .metrics import Metrics
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +34,9 @@ async def _execute_script(conn: aiosqlite.Connection, sql: str) -> None:
     Unlike ``executescript()`` which issues an implicit COMMIT first,
     this splits on ``;`` and runs each statement via ``execute()``,
     preserving the caller's transaction context.
+
+    Caution: naive ``;`` splitting will break on SQL strings containing
+    literal semicolons.
     """
     for statement in sql.split(";"):
         statement = statement.strip()
@@ -54,10 +60,12 @@ class BranchDatabase:
     and an asyncio.Lock guarding all write operations.
     """
 
-    def __init__(self, db_path: Path):
+    def __init__(self, db_path: Path, branch_id: str = "", metrics: "Metrics | None" = None):
         self._path = db_path
         self._conn: aiosqlite.Connection | None = None
         self._write_lock = asyncio.Lock()
+        self._branch_id = branch_id
+        self._metrics = metrics
 
     async def initialize(self, schema: str) -> None:
         """Open the persistent connection, set pragmas, run schema."""
@@ -144,15 +152,29 @@ class BranchDatabase:
         """Execute a write query (INSERT/UPDATE/DELETE) with lock."""
         if not self._conn:
             raise RuntimeError("Database not initialized")
+        if self._metrics and self._branch_id:
+            self._metrics.inc(self._metrics.db_writes, self._branch_id)
         async with self._write_lock:
             cursor = await self._conn.execute(query, params)
             await self._conn.commit()
             return cursor
 
+    async def executemany(self, query: str, params_seq: Iterable[tuple]) -> None:
+        """Execute a query against many parameter sets with lock."""
+        if not self._conn:
+            raise RuntimeError("Database not initialized")
+        if self._metrics and self._branch_id:
+            self._metrics.inc(self._metrics.db_writes, self._branch_id)
+        async with self._write_lock:
+            await self._conn.executemany(query, params_seq)
+            await self._conn.commit()
+
     async def fetchone(self, query: str, params: tuple = ()) -> aiosqlite.Row | None:
         """Execute a read query and return one row."""
         if not self._conn:
             raise RuntimeError("Database not initialized")
+        if self._metrics and self._branch_id:
+            self._metrics.inc(self._metrics.db_reads, self._branch_id)
         cursor = await self._conn.execute(query, params)
         return await cursor.fetchone()
 
@@ -160,6 +182,8 @@ class BranchDatabase:
         """Execute a read query and return all rows."""
         if not self._conn:
             raise RuntimeError("Database not initialized")
+        if self._metrics and self._branch_id:
+            self._metrics.inc(self._metrics.db_reads, self._branch_id)
         cursor = await self._conn.execute(query, params)
         return await cursor.fetchall()
 
@@ -183,6 +207,12 @@ class BranchDatabase:
     def path(self) -> Path:
         """Return the database file path."""
         return self._path
+
+    async def backup(self, backup_dir: Path | None = None, max_backups: int = 3) -> Path:
+        """Create a backup of this database. See ``backup.backup_database``."""
+        from .backup import backup_database
+
+        return await backup_database(self, backup_dir=backup_dir, max_backups=max_backups)
 
     async def close(self) -> None:
         """Close the persistent connection."""

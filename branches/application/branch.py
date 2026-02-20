@@ -4,7 +4,7 @@ Manages staff application workflow with multi-page forms, background checks, and
 """
 
 import discord
-import sqlite3
+from sqlite3 import IntegrityError
 from discord import app_commands
 from discord.ext import tasks
 from oak import OakBranch
@@ -25,6 +25,52 @@ from .views import (
     PostSubmissionView,
     ManageView
 )
+
+DEFAULT_CONFIG = {
+    "enabled": True,
+    "settings": {
+        "application": {
+            "position_name": "Staff Member",
+            "button_label": "Apply for Staff",
+            "channel_name_prefix": "application",
+        },
+        "application_channel_id": 0,
+        "application_category_id": 0,
+        "accepted_category_id": 0,
+        "admin_chat_id": 0,
+        "punishment_forum_channel_id": 0,
+        "reviewer_role_ids": [],
+        "required_link_role_id": 0,
+        "inactivity": {
+            "enabled": True,
+            "check_interval_hours": 12,
+            "warning_after_days": 3,
+            "abandon_after_days": 7,
+        },
+        "denial": {
+            "delete_delay_seconds": 10,
+            "auto_delete_no_dm": True,
+            "auto_delete_no_dm_after_hours": 24,
+        },
+        "mysql": {
+            "enabled": False,
+        },
+        "ui": {
+            "embed_colors": {
+                "info": 0x5865F2,
+                "success": 0x57F287,
+                "warning": 0xFEE75C,
+                "error": 0xED4245,
+            },
+        },
+        "questions": [
+            {"label": "What is your username?", "max_length": 50},
+            {"label": "What is your age?", "max_length": 20},
+            {"label": "How long have you been part of the community?", "max_length": 100},
+            {"label": "Why do you want to join the staff team?", "max_length": 1000},
+        ],
+    },
+}
 
 # Database schema for applications
 # NOTE: New columns (last_activity_at, warning_sent_at, denied_at, denial_dm_sent, denial_reason) are added via migration in on_enable
@@ -164,7 +210,7 @@ async def handle_application_start(interaction: discord.Interaction):
             except discord.HTTPException:
                 pass  # Non-critical: channel works even with temp name
 
-        except sqlite3.IntegrityError:
+        except IntegrityError:
             # Race condition: user already has an application
             await channel.delete(reason="Duplicate application (race condition)")
 
@@ -369,6 +415,7 @@ class Application(OakBranch):
             check_interval = inactivity_config.get("check_interval_hours", 12)
             self.check_inactive_applications.change_interval(hours=check_interval)
             self.check_inactive_applications.start()
+            self.register_task("check_inactive_applications", self.check_inactive_applications)
             self.log.info(f"Inactivity check task started (interval: {check_interval} hours)")
 
     async def on_disable(self):
@@ -605,6 +652,11 @@ class Application(OakBranch):
     async def before_check_inactive_applications(self):
         """Wait until bot is ready before starting task."""
         await self.bot.wait_until_ready()
+
+    @check_inactive_applications.error
+    async def check_inactive_applications_error(self, error: Exception):
+        """Log unhandled errors in the inactivity check task."""
+        self.log.error(f"Unhandled error in check_inactive_applications: {error}", exc_info=True)
 
     async def _send_inactivity_warning(self, user_id: int, channel_id: int, warning_days: int, abandon_days: int):
         """Send inactivity warning to user via DM and in channel."""

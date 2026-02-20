@@ -7,8 +7,11 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 import asyncio
-import sqlite3
+from datetime import datetime, timedelta, timezone
+from sqlite3 import IntegrityError
 import time
+
+from pathlib import Path
 
 from oak import OakBranch
 from oak.context import BranchContext
@@ -99,6 +102,8 @@ class Tickets(OakBranch):
         super().__init__(ctx)
         self._thread_update_times: dict[int, float] = {}
         self._registered_views: list = []
+        self._transcript_server = None
+        self._transcripts_dir: Path | None = None
 
     async def on_enable(self):
         """Initialize database and register persistent views."""
@@ -127,8 +132,14 @@ class Tickets(OakBranch):
         if self.staff_role_ids == [0]:
             self.log.warning("staff_role_ids contains placeholder value [0] - replace with actual role IDs")
 
+        # Prepare transcripts directory (used by web server and views)
+        web_config = settings.get("transcript", {}).get("web", {})
+        if web_config.get("enabled", False):
+            self._transcripts_dir = Path(self.data_dir) / "transcripts"
+            self._transcripts_dir.mkdir(parents=True, exist_ok=True)
+
         # Configure views module with DB and config references
-        configure_views(self.db, self.config)
+        configure_views(self.db, self.config, transcripts_dir=self._transcripts_dir)
 
         self.log.info("Registering persistent views for Tickets")
         panel_view = TicketPanelView()
@@ -147,12 +158,24 @@ class Tickets(OakBranch):
             ReminderSnooze6hButton, ReminderSnooze1dButton
         )
 
+        # Transcript web server
+        if web_config.get("enabled", False):
+            from .web import TranscriptServer
+
+            port = web_config.get("port", 5454)
+            base_url = web_config.get("base_url", f"http://localhost:{port}")
+
+            self._transcript_server = TranscriptServer(port, base_url, self._transcripts_dir, self.log)
+            await self._transcript_server.start()
+
         if self.anti_archive_enabled:
             self.anti_archive_task.change_interval(minutes=self.anti_archive_interval)
             self.anti_archive_task.start()
+            self.register_task("anti_archive", self.anti_archive_task)
             self.log.info(f"Anti-archive task started (interval: {self.anti_archive_interval} minutes)")
 
         self.check_reminders_task.start()
+        self.register_task("check_reminders", self.check_reminders_task)
         self.log.info("Reminder check task started (interval: 1 minute)")
 
     async def on_ready(self):
@@ -165,11 +188,18 @@ class Tickets(OakBranch):
             Migration(
                 name="add_last_reminder_message_id",
                 sql="ALTER TABLE ticket_reminders ADD COLUMN last_reminder_message_id INTEGER"
-            )
+            ),
+            Migration(
+                name="add_transcript_message_id",
+                sql="ALTER TABLE tickets ADD COLUMN transcript_message_id INTEGER"
+            ),
         ])
 
     async def on_disable(self):
         """Stop background tasks and remove persistent views."""
+        if self._transcript_server:
+            await self._transcript_server.stop()
+            self._transcript_server = None
         if self.anti_archive_task.is_running():
             self.anti_archive_task.cancel()
         if self.check_reminders_task.is_running():
@@ -366,8 +396,6 @@ class Tickets(OakBranch):
     @tasks.loop(minutes=1)
     async def check_reminders_task(self):
         """Check for due reminders and send notifications."""
-        from datetime import datetime, timezone
-
         try:
             now = datetime.now(timezone.utc)
             colors = get_embed_colors(self.config)
@@ -783,7 +811,7 @@ class Tickets(OakBranch):
 
         try:
             ticket = await self.db.fetchone(
-                "SELECT user_id, category, status FROM tickets WHERE thread_id = ?",
+                "SELECT user_id, category, status, ticket_number, created_at FROM tickets WHERE thread_id = ?",
                 (thread.id,)
             )
 
@@ -794,7 +822,7 @@ class Tickets(OakBranch):
                 )
                 return
 
-            creator_id, category, status = ticket
+            creator_id, category, status, ticket_number, created_at = ticket
 
             if not can_manage_ticket_category(interaction, category, self.config):
                 await interaction.followup.send(
@@ -825,6 +853,23 @@ class Tickets(OakBranch):
             except discord.HTTPException as e:
                 self.log.error(f"Failed to send close message: {e}")
 
+            # Generate transcript BEFORE archiving (must fetch history while thread is open)
+            transcript_buf = None
+            if self.setting("transcript", "enabled", default=False):
+                try:
+                    from .transcript import generate_transcript
+                    transcript_buf = await generate_transcript(thread, {
+                        "category": category,
+                        "ticket_number": ticket_number,
+                        "creator_id": creator_id,
+                        "created_at": created_at,
+                        "closed_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                        "closed_by": interaction.user.id,
+                        "close_reason": reason,
+                    })
+                except Exception as e:
+                    self.log.error(f"Failed to generate transcript: {e}", exc_info=True)
+
             # Update DB BEFORE archiving to prevent inconsistent state
             async with self.db.transaction() as conn:
                 await conn.execute(
@@ -853,6 +898,19 @@ class Tickets(OakBranch):
                     ephemeral=True
                 )
                 return
+
+            # Send transcript (after archive, outside thread)
+            if transcript_buf:
+                try:
+                    from .transcript import send_transcript
+                    await send_transcript(
+                        transcript_buf, thread,
+                        {"category": category, "ticket_number": ticket_number, "creator_id": creator_id},
+                        self.config, self.db, self.bot,
+                        transcripts_dir=self._transcripts_dir,
+                    )
+                except Exception as e:
+                    self.log.error(f"Failed to send transcript: {e}", exc_info=True)
 
             if self.log_channel_id:
                 log_channel = interaction.guild.get_channel(self.log_channel_id)
@@ -1109,7 +1167,6 @@ class Tickets(OakBranch):
     async def remind_me(self, interaction: discord.Interaction, time: str = None, dm: bool = False):
         """Set a reminder for this ticket."""
         from .helpers import parse_time_string
-        from datetime import datetime, timedelta, timezone
 
         if not isinstance(interaction.channel, discord.Thread):
             await interaction.response.send_message(
@@ -1183,7 +1240,7 @@ class Tickets(OakBranch):
                         1 if dm else 0
                     )
                 )
-            except sqlite3.IntegrityError:
+            except IntegrityError:
                 await interaction.followup.send(
                     "\u274c You already have an active reminder for this ticket.",
                     ephemeral=True

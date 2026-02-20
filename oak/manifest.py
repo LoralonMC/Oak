@@ -4,6 +4,8 @@ BranchManifest: parses and validates branch.yml files.
 
 from __future__ import annotations
 
+import logging
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -11,6 +13,10 @@ from typing import Any
 import yaml
 
 from .errors import ManifestError
+
+logger = logging.getLogger(__name__)
+
+_SEMVER_PATTERN = re.compile(r"^\d+\.\d+\.\d+$")
 
 
 @dataclass(frozen=True)
@@ -65,21 +71,44 @@ class BranchManifest:
                 f"id must be alphanumeric (with _ or -), got: '{branch_id}'",
             )
 
+        # Reject IDs that start with a digit
+        if branch_id[0].isdigit():
+            raise ManifestError(
+                str(path),
+                f"id must not start with a digit, got: '{branch_id}'",
+            )
+
+        # Dependencies — warn on wrong type
         deps = data.get("dependencies", [])
         if not isinstance(deps, list):
+            logger.warning(
+                f"Manifest {path}: 'dependencies' should be a list, got {type(deps).__name__}; defaulting to []"
+            )
             deps = []
 
         soft_deps = data.get("soft_dependencies", [])
         if not isinstance(soft_deps, list):
+            logger.warning(
+                f"Manifest {path}: 'soft_dependencies' should be a list, got {type(soft_deps).__name__}; defaulting to []"
+            )
             soft_deps = []
 
         permissions = data.get("permissions", {})
         if not isinstance(permissions, dict):
+            logger.warning(
+                f"Manifest {path}: 'permissions' should be a dict, got {type(permissions).__name__}; defaulting to {{}}"
+            )
             permissions = {}
+
+        version = str(data["version"])
+        if version and not _SEMVER_PATTERN.match(version):
+            logger.warning(
+                f"Manifest {path}: version '{version}' does not match X.Y.Z semver format"
+            )
 
         return cls(
             id=branch_id,
-            version=str(data["version"]),
+            version=version,
             main=str(data["main"]),
             name=str(data.get("name", "")),
             description=str(data.get("description", "")),

@@ -8,6 +8,7 @@ import logging
 from typing import Any, TYPE_CHECKING
 
 from discord.ext import commands
+from discord.ext.tasks import Loop
 
 from .context import BranchContext
 
@@ -34,6 +35,12 @@ class OakBranch(commands.Cog):
         self.data_dir = ctx.data_dir
         self.events: BranchEventHandle = ctx.events
         self.interactions: BranchInteractionHandle = ctx.interactions
+        self.services: dict[str, Any] = {}
+
+    @property
+    def branch_id(self) -> str:
+        """The unique identifier for this branch."""
+        return self.ctx.id
 
     # -- Lifecycle hooks (override in subclass) --
 
@@ -55,6 +62,18 @@ class OakBranch(commands.Cog):
     async def cog_unload(self) -> None:
         """Bridges discord.py cog_unload to on_disable."""
         await self.on_disable()
+
+    # -- Service registry --
+
+    def require_branch(self, branch_id: str) -> "OakBranch":
+        """Get a loaded branch by id, raising BranchNotFoundError if not loaded."""
+        return self.bot.loader.require_branch(branch_id)
+
+    # -- Task registration --
+
+    def register_task(self, name: str, task: Loop) -> None:
+        """Register a discord.ext.tasks loop so it appears in /health."""
+        self.bot.task_registry.register(self.branch_id, name, task)
 
     # -- Config helper --
 

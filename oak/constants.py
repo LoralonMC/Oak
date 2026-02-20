@@ -97,6 +97,8 @@ BRANCH_DATABASE_FILE = "data.db"
 CUSTOM_ID_PREFIX = "oak"
 CUSTOM_ID_MAX_LENGTH = 100
 
+EVENT_LISTENER_TIMEOUT = 30
+
 LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 

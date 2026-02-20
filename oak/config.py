@@ -55,6 +55,23 @@ def load_branch_config(branch_dir: Path, default_config: dict, branch_id: str) -
     return copy.deepcopy(default_config)
 
 
+def write_branch_enabled(branch_dir: Path, enabled: bool) -> None:
+    """Set the ``enabled`` flag in a branch's config.yml."""
+    config_path = branch_dir / "config.yml"
+    try:
+        if config_path.exists():
+            with open(config_path, "r", encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
+        else:
+            data = {}
+        data["enabled"] = enabled
+        with open(config_path, "w", encoding="utf-8") as f:
+            yaml.safe_dump(data, f, default_flow_style=False)
+    except Exception as e:
+        logger.error(f"Failed to write enabled={enabled} to {config_path}: {e}")
+        raise
+
+
 class OakConfig:
     """Loads and validates environment variables for the bot."""
 
@@ -62,6 +79,11 @@ class OakConfig:
         load_dotenv(env_path)
         self.token = self._require("DISCORD_TOKEN")
         self.guild_id = self._require_int("GUILD_ID")
+        self.command_prefix = os.getenv("COMMAND_PREFIX", "!")
+        self.dev_mode = os.getenv("DEV_MODE", "").lower() in ("true", "1", "yes")
+        self.audit_log_channel = int(os.getenv("AUDIT_LOG_CHANNEL", "0"))
+        self.db_backup_interval = float(os.getenv("DB_BACKUP_INTERVAL", "0"))
+        self.db_backup_max_count = int(os.getenv("DB_BACKUP_MAX_COUNT", "3"))
         self._validate()
 
     def _require(self, key: str) -> str:

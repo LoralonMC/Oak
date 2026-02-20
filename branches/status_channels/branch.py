@@ -64,6 +64,7 @@ class StatusChannels(OakBranch):
 
     async def on_enable(self) -> None:
         self.update_status_channels.start()
+        self.register_task("update_status_channels", self.update_status_channels)
 
     async def on_disable(self) -> None:
         self.update_status_channels.cancel()

@@ -75,11 +75,16 @@ Oak/
 │   ├── database.py               # BranchDatabase — per-branch SQLite (WAL + write lock)
 │   ├── events.py                 # EventBus + BranchEventHandle
 │   ├── interactions.py           # InteractionRouter + BranchInteractionHandle
-│   ├── constants.py              # Discord API limits, utility functions
+│   ├── views.py                  # Reusable views (PaginatedEmbedView)
+│   ├── tasks.py                  # TaskRegistry for scheduled task loops
+│   ├── backup.py                 # Database backup utilities
+│   ├── metrics.py                # In-memory counters (commands, events, DB, errors)
+│   ├── constants.py              # Discord API limits
 │   ├── errors.py                 # Framework exceptions
 │   ├── utils.py                  # Shared utilities (sanitization, truncation)
 │   └── admin/                    # Built-in admin branch (always loaded)
-│       ├── branch.py             # /reload, /load, /unload, /branches, /sync, /botinfo
+│       ├── branch.py             # /reload, /load, /unload, /enable, /disable, /branches,
+│       │                         #   /sync, /botinfo, /health, /metrics, /backup
 │       └── branch.yml
 └── branches/                     # User branches (auto-discovered)
     ├── suggestions/
@@ -114,7 +119,7 @@ The `main` field is `module.ClassName` — the loader imports `branches.<folder>
 
 ### Configuration
 
-**Global** (`.env`): bot token, guild ID.
+**Global** (`.env`): bot token, guild ID, audit log channel, backup settings.
 
 **Per-branch** (`config.yml`): each branch defines a `DEFAULT_CONFIG` dict in its module. The framework deep-merges `config.yml` on top, so you only need to override what you change.
 
@@ -141,9 +146,14 @@ Built-in commands (require Discord Administrator permission):
 | `/reload <branch>` | Hot-reload a branch and its config |
 | `/load <branch>` | Load a branch |
 | `/unload <branch>` | Unload a branch |
+| `/enable <branch>` | Enable a disabled branch and load it |
+| `/disable <branch>` | Disable and unload a branch |
 | `/branches` | List loaded and discovered branches |
 | `/sync` | Force-sync slash commands to the guild |
 | `/botinfo` | Show bot stats |
+| `/health` | Check bot and branch health (DB, scheduled tasks) |
+| `/metrics` | Show command usage, event counts, DB activity, errors |
+| `/backup [branch]` | Back up branch database(s) to timestamped files |
 
 All responses are ephemeral. Branch names autocomplete.
 

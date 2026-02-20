@@ -16,7 +16,7 @@ from .errors import OakError
 
 logger = logging.getLogger(__name__)
 
-_VALUE_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
+_VALUE_PATTERN = re.compile(r"^[A-Za-z0-9._\-]+$")
 
 
 @dataclass(frozen=True)

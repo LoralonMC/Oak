@@ -209,6 +209,7 @@ class Shopkeepers(OakBranch):
             self.auto_import_task.change_interval(minutes=self.auto_import_interval)
             self.auto_import_task.start()
             self._auto_import_task = self.auto_import_task
+            self.register_task("auto_import", self.auto_import_task)
             self.log.info(f"Auto-import task started (interval: {self.auto_import_interval} minutes)")
 
         self.log.info("Shopkeepers branch loaded")
@@ -560,24 +561,62 @@ class Shopkeepers(OakBranch):
             embed.add_field(name="Trades", value=f"{int(trades):,}" if trades else "0", inline=True)
             embed.add_field(name="Period", value=f"Last {period_days} days", inline=True)
 
-            # Recent history (last 10 daily entries)
-            history = await self.db.fetchall(
-                """SELECT trade_date, avg_price, total_volume
-                   FROM price_summary
-                   WHERE item_id = ?
-                   ORDER BY trade_date DESC
-                   LIMIT 10""",
-                (item_id,),
-            )
-            if history:
-                lines = []
-                for h_date, h_price, h_vol in history:
-                    date_short = h_date[5:]  # MM-DD
-                    lines.append(f"`{date_short}` {format_price(h_price)} ({int(h_vol):,} vol)")
-                embed.add_field(name="Recent History", value=truncate_for_embed_field("\n".join(lines)), inline=False)
+            # Price history chart
+            chart_file = None
+            try:
+                from .chart import generate_price_chart
+
+                chart_rows = await self.db.fetchall(
+                    """SELECT trade_date, avg_price, min_price, max_price
+                       FROM price_summary
+                       WHERE item_id = ? AND trade_date >= date('now', ?)
+                       ORDER BY trade_date ASC""",
+                    (item_id, f"-{period_days} days"),
+                )
+                if len(chart_rows) >= 2:
+                    buf = await generate_price_chart(chart_rows, name, self.embed_color)
+                    chart_file = discord.File(buf, filename="price_chart.png")
+                    embed.set_image(url="attachment://price_chart.png")
+                else:
+                    # Fallback: text history when not enough data for chart
+                    history = await self.db.fetchall(
+                        """SELECT trade_date, avg_price, total_volume
+                           FROM price_summary
+                           WHERE item_id = ?
+                           ORDER BY trade_date DESC
+                           LIMIT 10""",
+                        (item_id,),
+                    )
+                    if history:
+                        lines = []
+                        for h_date, h_price, h_vol in history:
+                            date_short = h_date[5:]  # MM-DD
+                            lines.append(f"`{date_short}` {format_price(h_price)} ({int(h_vol):,} vol)")
+                        embed.add_field(name="Recent History", value=truncate_for_embed_field("\n".join(lines)), inline=False)
+            except ImportError:
+                self.log.warning("matplotlib not installed — chart generation unavailable")
+                # Fallback to text history
+                history = await self.db.fetchall(
+                    """SELECT trade_date, avg_price, total_volume
+                       FROM price_summary
+                       WHERE item_id = ?
+                       ORDER BY trade_date DESC
+                       LIMIT 10""",
+                    (item_id,),
+                )
+                if history:
+                    lines = []
+                    for h_date, h_price, h_vol in history:
+                        date_short = h_date[5:]  # MM-DD
+                        lines.append(f"`{date_short}` {format_price(h_price)} ({int(h_vol):,} vol)")
+                    embed.add_field(name="Recent History", value=truncate_for_embed_field("\n".join(lines)), inline=False)
 
             embed.set_footer(text=f"Item key: {item_key} | Stack prices assume x64")
-            await interaction.followup.send(embed=embed, ephemeral=not public)
+
+            kwargs = {"embed": embed, "ephemeral": not public}
+            if chart_file:
+                kwargs["file"] = chart_file
+            await interaction.followup.send(**kwargs)
 
         except Exception as e:
             self.log.error(f"Error in /price command: {e}", exc_info=True)
@@ -1499,7 +1538,7 @@ class Shopkeepers(OakBranch):
                 rows, self.top_entries,
                 f"Shop Leaderboard -- {sort_labels.get(sort_by)}",
                 lambda i, row: (
-                    f"**{i}.** {row[1] if row[1] else row[0][:8] + '...'}\n"
+                    f"**{i}.** {row[1] if row[1] else (row[0][:8] + '...' if row[0] else 'Unknown')}\n"
                     f"   {format_price(row[2]) if row[2] else 'N/A'} | "
                     f"{row[3]:,} trades | {row[4]:,} customers"
                 ),
@@ -1554,7 +1593,7 @@ class Shopkeepers(OakBranch):
                 rows, self.top_entries,
                 f"Player Leaderboard -- {sort_labels.get(sort_by)}",
                 lambda i, row: (
-                    f"**{i}.** {row[1] if row[1] else row[0][:8] + '...'}\n"
+                    f"**{i}.** {row[1] if row[1] else (row[0][:8] + '...' if row[0] else 'Unknown')}\n"
                     f"   {format_price(row[2]) if row[2] else 'N/A'} | "
                     f"{row[3]:,} trades | {row[4]:,} items"
                 ),

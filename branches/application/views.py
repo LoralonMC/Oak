@@ -6,8 +6,8 @@ Handles all view components (buttons, etc.) for the application system.
 import discord
 from discord.ui import View, button
 import json
-import asyncio
 import logging
+from oak.views import PaginatedEmbedView
 from .helpers import get_embed_colors, is_staff, get_application_questions, paginate_application_embed
 
 logger = logging.getLogger(__name__)
@@ -144,28 +144,25 @@ class PostSubmissionView(View):
                 return
 
             applicant_id, answers_json = row
-            answers = json.loads(answers_json)
+            try:
+                answers = json.loads(answers_json)
+            except (json.JSONDecodeError, TypeError):
+                await interaction.response.send_message("Application data is corrupted.", ephemeral=True)
+                return
             applicant = interaction.guild.get_member(applicant_id)
             questions = get_application_questions(_config)
 
             embeds = paginate_application_embed(applicant, answers, questions, colors)
 
-            try:
-                await interaction.response.send_message(embed=embeds[0], ephemeral=True)
-            except discord.HTTPException as exc:
-                logger.error(f"Failed to send first embed: {exc}")
-                # m12: Check if response was consumed before trying again
-                if not interaction.response.is_done():
-                    await interaction.response.send_message("Failed to send application data.", ephemeral=True)
-                return
-
-            # If multiple embeds (pagination), send as additional followups
-            for embed in embeds[1:]:
-                await asyncio.sleep(1)
-                try:
-                    await interaction.followup.send(embed=embed, ephemeral=True)
-                except discord.HTTPException as exc:
-                    logger.error(f"Failed to send followup embed: {exc}")
+            if len(embeds) <= 1:
+                await interaction.response.send_message(
+                    embed=embeds[0] if embeds else discord.Embed(description="No data."),
+                    ephemeral=True,
+                )
+            else:
+                view = PaginatedEmbedView(embeds, author_id=interaction.user.id)
+                await interaction.response.send_message(embed=embeds[0], view=view, ephemeral=True)
+                view.message = await interaction.original_response()
 
         except Exception as e:
             logger.error(f"Error reading application: {e}")
@@ -660,12 +657,17 @@ class ApplicationHistoryView(View):
             embeds[0].title = f"📜 Previous Application #{app_index}"
             embeds[0].description = header_info + "\n" + (embeds[0].description or "")
 
-        # Send embeds with status change buttons
-        await interaction.response.send_message(
-            embeds=embeds[:10],  # Discord limit of 10 embeds
-            view=StatusChangeView(app_index),
-            ephemeral=True
-        )
+        # Send embeds with pagination if multiple pages
+        if len(embeds) <= 1:
+            await interaction.response.send_message(
+                embed=embeds[0] if embeds else discord.Embed(description="No data."),
+                view=StatusChangeView(app_index),
+                ephemeral=True,
+            )
+        else:
+            view = PaginatedEmbedView(embeds, author_id=interaction.user.id)
+            await interaction.response.send_message(embed=embeds[0], view=view, ephemeral=True)
+            view.message = await interaction.original_response()
 
 
 class StatusChangeView(View):
@@ -719,11 +721,21 @@ class StatusChangeView(View):
             )
             old_status = old_row[0] if old_row else "unknown"
 
-            # Update status for this specific application
-            await _db.execute(
-                "UPDATE applications SET status = ? WHERE app_index = ?",
-                (new_status, self.app_index)
+            # Update status atomically — WHERE status = old prevents stale overwrites
+            cursor = await _db.execute(
+                "UPDATE applications SET status = ? WHERE app_index = ? AND status = ?",
+                (new_status, self.app_index, old_status)
             )
+
+            if cursor.rowcount == 0:
+                await interaction.response.send_message(
+                    embed=discord.Embed(
+                        description="This application's status was already changed by another staff member. Please refresh and try again.",
+                        color=colors["error"]
+                    ),
+                    ephemeral=True
+                )
+                return
 
             logger.info(
                 f"Staff {interaction.user} ({interaction.user.id}) changed app #{self.app_index} "

@@ -3,12 +3,14 @@
 import json
 
 import discord
+from discord import app_commands
 from discord.ext import commands
 
 from oak import OakBranch
 from oak.constants import THREAD_NAME_MAX
 from oak.context import BranchContext
-from oak.utils import sanitize_text
+from oak.utils import sanitize_text, truncate_for_embed_field
+from oak.views import PaginatedEmbedView
 
 from .helpers import truncate
 from .views import SuggestionVoteView, configure as configure_views
@@ -136,24 +138,30 @@ class Suggestions(OakBranch):
 
         if not content:
             try:
-                await message.author.send(self.setting("messages", "empty", default="Your suggestion was empty or invalid."))
-            except discord.Forbidden:
-                pass
-            try:
                 await message.delete()
             except discord.HTTPException:
                 self.log.warning(f"Failed to delete empty suggestion message from {message.author}")
+            try:
+                notice = await message.channel.send(
+                    f"{message.author.mention} {self.setting('messages', 'empty', default='Your suggestion was empty or invalid.')}",
+                    delete_after=10,
+                )
+            except discord.HTTPException:
+                pass
             return
 
         if len(content) < min_length:
             try:
-                await message.author.send(self.setting("messages", "too_short", default="Your suggestion is too short."))
-            except discord.Forbidden:
-                pass
-            try:
                 await message.delete()
             except discord.HTTPException:
                 self.log.warning(f"Failed to delete short suggestion message from {message.author}")
+            try:
+                notice = await message.channel.send(
+                    f"{message.author.mention} {self.setting('messages', 'too_short', default='Your suggestion is too short.')}",
+                    delete_after=10,
+                )
+            except discord.HTTPException:
+                pass
             return
 
         sent = None
@@ -184,9 +192,9 @@ class Suggestions(OakBranch):
             if self.db:
                 try:
                     await self.db.execute(
-                        """INSERT INTO suggestions (message_id, thread_id, user_id, content, likes, dislikes, status, reason)
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                        (sent.id, thread.id, message.author.id, content, json.dumps([]), json.dumps([]), "Pending", None),
+                        """INSERT INTO suggestions (message_id, thread_id, user_id, content, status)
+                           VALUES (?, ?, ?, ?, ?)""",
+                        (sent.id, thread.id, message.author.id, content, "Pending"),
                     )
                 except Exception as db_err:
                     self.log.error(f"Failed to insert suggestion into DB: {db_err}")
@@ -224,3 +232,129 @@ class Suggestions(OakBranch):
                 await message.author.send("An error occurred while creating your suggestion.")
             except discord.Forbidden:
                 pass
+
+    # ------------------------------------------------------------------
+    # /topsuggestions
+    # ------------------------------------------------------------------
+
+    @app_commands.command(
+        name="topsuggestions",
+        description="View the highest-voted suggestions",
+    )
+    @app_commands.describe(
+        status="Filter by status (default: All)",
+        sort="Sort order (default: Net votes)",
+    )
+    @app_commands.choices(status=[
+        app_commands.Choice(name="All", value="all"),
+        app_commands.Choice(name="Pending", value="Pending"),
+        app_commands.Choice(name="Approved", value="Approved"),
+        app_commands.Choice(name="Denied", value="Denied"),
+    ])
+    @app_commands.choices(sort=[
+        app_commands.Choice(name="Net votes (likes - dislikes)", value="net"),
+        app_commands.Choice(name="Most likes", value="likes"),
+        app_commands.Choice(name="Most dislikes", value="dislikes"),
+    ])
+    async def topsuggestions(
+        self,
+        interaction: discord.Interaction,
+        status: str = "all",
+        sort: str = "net",
+    ):
+        """Show a leaderboard of the highest-voted suggestions."""
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            # Build query
+            sort_map = {
+                "net": "(likes - dislikes) DESC",
+                "likes": "likes DESC",
+                "dislikes": "dislikes DESC",
+            }
+            order_clause = sort_map.get(sort, "(likes - dislikes) DESC")
+
+            if status != "all":
+                query = f"""
+                    SELECT s.id, s.message_id, s.user_id, s.content, s.status,
+                           COALESCE(SUM(CASE WHEN sv.vote_type='like' THEN 1 ELSE 0 END), 0) AS likes,
+                           COALESCE(SUM(CASE WHEN sv.vote_type='dislike' THEN 1 ELSE 0 END), 0) AS dislikes
+                    FROM suggestions s
+                    LEFT JOIN suggestion_votes sv ON sv.suggestion_id = s.id
+                    WHERE s.status = ?
+                    GROUP BY s.id
+                    ORDER BY {order_clause}
+                    LIMIT 50
+                """
+                rows = await self.db.fetchall(query, (status,))
+            else:
+                query = f"""
+                    SELECT s.id, s.message_id, s.user_id, s.content, s.status,
+                           COALESCE(SUM(CASE WHEN sv.vote_type='like' THEN 1 ELSE 0 END), 0) AS likes,
+                           COALESCE(SUM(CASE WHEN sv.vote_type='dislike' THEN 1 ELSE 0 END), 0) AS dislikes
+                    FROM suggestions s
+                    LEFT JOIN suggestion_votes sv ON sv.suggestion_id = s.id
+                    GROUP BY s.id
+                    ORDER BY {order_clause}
+                    LIMIT 50
+                """
+                rows = await self.db.fetchall(query)
+
+            if not rows:
+                label = status if status != "all" else "any"
+                await interaction.followup.send(
+                    f"No suggestions found with status: **{label}**.",
+                    ephemeral=True,
+                )
+                return
+
+            # Build paginated embeds (5 per page)
+            channel_id = self.setting("channel_id", default=0)
+            guild_id = interaction.guild_id
+            per_page = 5
+
+            sort_labels = {"net": "Net Votes", "likes": "Most Likes", "dislikes": "Most Dislikes"}
+            status_label = status if status != "all" else "All"
+            title = f"Top Suggestions — {status_label} — {sort_labels.get(sort, sort)}"
+
+            pages = []
+            for page_start in range(0, len(rows), per_page):
+                page_rows = rows[page_start:page_start + per_page]
+                page_num = (page_start // per_page) + 1
+                total_pages = -(-len(rows) // per_page)
+
+                embed = discord.Embed(title=title, color=self.setting("ui", "embed_colors", "pending", default=0x2B2D31))
+
+                for i, (sid, msg_id, user_id, content, s_status, likes, dislikes) in enumerate(page_rows, start=page_start + 1):
+                    net = likes - dislikes
+                    preview = truncate_for_embed_field(content or "*(no content)*", max_length=80)
+                    jump = f"https://discord.com/channels/{guild_id}/{channel_id}/{msg_id}" if msg_id and channel_id else ""
+                    jump_text = f" — [Jump]({jump})" if jump else ""
+
+                    embed.add_field(
+                        name=f"#{i} — {s_status}",
+                        value=(
+                            f"{preview}\n"
+                            f"By <@{user_id}> — "
+                            f"\U0001f44d {likes}  \U0001f44e {dislikes}  (net: {net:+d})"
+                            f"{jump_text}"
+                        ),
+                        inline=False,
+                    )
+
+                embed.set_footer(text=f"Page {page_num}/{total_pages} — {len(rows)} suggestions")
+                pages.append(embed)
+
+            if len(pages) == 1:
+                await interaction.followup.send(embed=pages[0], ephemeral=True)
+            else:
+                view = PaginatedEmbedView(pages, interaction.user.id)
+                message = await interaction.followup.send(embed=pages[0], view=view, ephemeral=True)
+                view.message = message
+
+        except Exception as e:
+            self.log.error(f"Error in /topsuggestions command: {e}", exc_info=True)
+            await interaction.followup.send(
+                "An error occurred while fetching the leaderboard.",
+                ephemeral=True,
+            )

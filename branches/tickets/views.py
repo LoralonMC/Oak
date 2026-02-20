@@ -4,8 +4,9 @@ Discord UI components for ticket interactions.
 """
 
 import discord
-import sqlite3
+from sqlite3 import IntegrityError
 import asyncio
+from datetime import datetime, timedelta, timezone
 import logging
 import time
 from .helpers import (
@@ -25,13 +26,15 @@ logger = logging.getLogger(__name__)
 # Module-level references, set by configure()
 _db = None
 _config: dict = {}
+_transcripts_dir = None
 
 
-def configure(db, config: dict) -> None:
+def configure(db, config: dict, transcripts_dir=None) -> None:
     """Set module-level DB and config references. Called from branch on_enable."""
-    global _db, _config
+    global _db, _config, _transcripts_dir
     _db = db
     _config = config
+    _transcripts_dir = transcripts_dir
 
 
 # Rate limiting: Track last ticket creation time per user
@@ -271,7 +274,7 @@ class TicketPanelView(discord.ui.View):
                         (thread.id, interaction.user.id, category_key, ticket_number)
                     )
 
-            except sqlite3.IntegrityError:
+            except IntegrityError:
                 # Race condition - user created ticket between check and creation
                 if thread:
                     try:
@@ -524,7 +527,7 @@ class TicketControlView(discord.ui.View):
 
         # Get ticket from database
         ticket = await _db.fetchone(
-            "SELECT user_id, category FROM tickets WHERE thread_id = ? AND status = 'open'",
+            "SELECT user_id, category, ticket_number, created_at FROM tickets WHERE thread_id = ? AND status = 'open'",
             (thread.id,)
         )
 
@@ -535,7 +538,7 @@ class TicketControlView(discord.ui.View):
             )
             return
 
-        creator_id, category = ticket
+        creator_id, category, ticket_number, created_at = ticket
 
         # Check permissions - ticket creator or staff who can manage this category can close
         is_creator = interaction.user.id == creator_id
@@ -572,6 +575,24 @@ class TicketControlView(discord.ui.View):
         except discord.HTTPException as e:
             logger.error(f"Failed to send close message: {e}")
 
+        # Generate transcript BEFORE archiving (must fetch history while thread is open)
+        transcript_buf = None
+        transcript_enabled = _config.get("settings", {}).get("transcript", {}).get("enabled", False)
+        if transcript_enabled:
+            try:
+                from .transcript import generate_transcript
+                transcript_buf = await generate_transcript(thread, {
+                    "category": category,
+                    "ticket_number": ticket_number,
+                    "creator_id": creator_id,
+                    "created_at": created_at,
+                    "closed_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                    "closed_by": interaction.user.id,
+                    "close_reason": reason,
+                })
+            except Exception as e:
+                logger.error(f"Failed to generate transcript: {e}", exc_info=True)
+
         # Update database BEFORE archiving to prevent inconsistent state
         async with _db.transaction() as conn:
             cursor = await conn.execute(
@@ -603,6 +624,19 @@ class TicketControlView(discord.ui.View):
                 ephemeral=True
             )
             return
+
+        # Send transcript (after archive, outside thread)
+        if transcript_buf:
+            try:
+                from .transcript import send_transcript
+                await send_transcript(
+                    transcript_buf, thread,
+                    {"category": category, "ticket_number": ticket_number, "creator_id": creator_id},
+                    _config, _db, interaction.client,
+                    transcripts_dir=_transcripts_dir,
+                )
+            except Exception as e:
+                logger.error(f"Failed to send transcript: {e}", exc_info=True)
 
         # Log to log channel
         log_channel_id = _config.get("settings", {}).get("log_channel_id", 0)
@@ -674,8 +708,6 @@ async def _stop_reminder(interaction: discord.Interaction, reminder_id: int):
 async def _snooze_reminder(interaction: discord.Interaction, reminder_id: int, seconds: int):
     """Snooze a reminder by ID. Shared logic for DynamicItem and legacy views."""
     try:
-        from datetime import datetime, timedelta, timezone
-
         row = await _db.fetchone(
             "SELECT user_id FROM ticket_reminders WHERE id = ?",
             (reminder_id,)

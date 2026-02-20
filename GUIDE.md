@@ -202,6 +202,7 @@ All set by `super().__init__(ctx)` — use them anywhere in your branch:
 | `self.data_dir` | `Path` | Path to the branch's directory. |
 | `self.events` | `BranchEventHandle` | Scoped event bus handle. |
 | `self.interactions` | `BranchInteractionHandle` | Scoped custom\_id builder/parser. |
+| `self.services` | `dict[str, Any]` | Public API dict — populate in `on_enable()` for inter-branch access. |
 
 ### Example
 
@@ -534,6 +535,18 @@ class StatusChannels(OakBranch):
         self.log.error(f"Unhandled error in update task: {error}", exc_info=True)
 ```
 
+### Registering tasks for /health
+
+Call `self.register_task()` in `on_enable` so your task loop appears in the `/health` dashboard:
+
+```python
+async def on_enable(self) -> None:
+    self.update_channels.start()
+    self.register_task("update_channels", self.update_channels)
+```
+
+Registration is optional — tasks work fine without it, they just won't show up in `/health`.
+
 ### Key points
 
 - **Start in `on_enable`**, **cancel in `on_disable`** — this ensures tasks stop on `/unload` or `/reload`.
@@ -590,9 +603,14 @@ These are built-in commands (require Discord Administrator permission):
 | `/load <branch>` | Load a discovered but unloaded branch |
 | `/unload <branch>` | Unload a running branch |
 | `/reload <branch>` | Hot-reload a branch (re-reads manifest + config + code) |
+| `/enable <branch>` | Enable a disabled branch and load it |
+| `/disable <branch>` | Disable and unload a branch |
 | `/branches` | List all loaded and discovered branches |
 | `/sync` | Force-sync slash commands to the guild |
 | `/botinfo` | Show bot stats |
+| `/health` | Check bot and branch health (DB, scheduled tasks) |
+| `/metrics` | Show command usage, event counts, DB activity, errors |
+| `/backup [branch]` | Back up branch database(s) to timestamped files |
 
 All responses are ephemeral. Branch names autocomplete.
 
@@ -605,7 +623,77 @@ All responses are ephemeral. Branch names autocomplete.
 
 No bot restart needed for branch changes.
 
-## 12. Migrating from Pre-Framework Branches
+## 12. Paginated Embeds
+
+The framework provides `PaginatedEmbedView` for paginating through a list of embeds with Previous/Next buttons:
+
+```python
+from oak.views import PaginatedEmbedView
+
+# Build your pages
+pages = [discord.Embed(title=f"Page {i+1}") for i in range(5)]
+
+# Send with the view
+view = PaginatedEmbedView(pages, author_id=interaction.user.id)
+await interaction.response.send_message(embed=pages[0], view=view)
+view.message = await interaction.original_response()
+```
+
+Features:
+- Previous/Next buttons with disabled states at boundaries
+- Only the original author can interact (others get an ephemeral "not your query" message)
+- Buttons are automatically disabled on timeout (default 180s)
+- Set `timeout=None` for persistent pagination (not recommended — register a persistent view instead)
+
+## 13. Inter-Branch Services
+
+Branches can expose a public API via `self.services` and consume other branches with `self.require_branch()`:
+
+### Exposing services
+
+```python
+async def on_enable(self) -> None:
+    await self.db.initialize(SCHEMA)
+    self.services["get_player"] = self.get_player
+    self.services["lookup_price"] = self.lookup_price
+```
+
+### Consuming services
+
+```python
+async def on_enable(self) -> None:
+    shopkeepers = self.require_branch("shopkeepers")
+    price_fn = shopkeepers.services["lookup_price"]
+    price = await price_fn("diamond")
+```
+
+`require_branch()` raises `BranchNotFoundError` if the target branch isn't loaded. Use `dependencies` in `branch.yml` to ensure load order.
+
+## 14. Database Backups
+
+Branch databases can be backed up manually or on a schedule.
+
+### Manual backup
+
+```python
+# From within a branch
+path = await self.db.backup()
+```
+
+Or use the `/backup` admin command (backs up one branch or all).
+
+### Periodic backups
+
+Set environment variables in `.env`:
+
+```env
+DB_BACKUP_INTERVAL=6    # Back up every 6 hours (0 = disabled)
+DB_BACKUP_MAX_COUNT=3   # Keep 3 most recent backups per branch
+```
+
+Backups are saved to `branches/<name>/backups/<stem>_YYYYMMDD_HHMMSS.db` and old backups are pruned automatically.
+
+## 15. Migrating from Pre-Framework Branches
 
 If you have branches written for the old codebase (before the Oak framework refactor), this section covers everything you need to update.
 
@@ -819,3 +907,9 @@ These systems didn't exist before — you don't need to migrate anything, but th
 - **Migration system** (`self.db.migrate()`) — tracked schema migrations. See [Section 5](#5-database).
 - **Dependency resolution** — declare `dependencies` in `branch.yml` to control load order.
 - **Graceful shutdown** — the framework calls `on_disable` and closes databases automatically on bot shutdown.
+- **Paginated embeds** (`PaginatedEmbedView`) — framework-level Previous/Next pagination. See [Section 12](#12-paginated-embeds).
+- **Task registry** (`self.register_task()`) — register background tasks so they appear in `/health`. See [Section 9](#9-background-tasks).
+- **Service registry** (`self.services` + `self.require_branch()`) — inter-branch public APIs. See [Section 13](#13-inter-branch-services).
+- **Database backups** (`self.db.backup()`, `/backup` command, periodic scheduling). See [Section 14](#14-database-backups).
+- **Audit logging** — admin actions are logged to a configurable Discord channel.
+- **Command metrics** — slash and text command usage tracked in `/metrics`.

@@ -5,6 +5,7 @@ OakBot: the main bot class.
 from __future__ import annotations
 
 import logging
+import time
 from pathlib import Path
 
 import discord
@@ -15,6 +16,9 @@ from .config import OakConfig
 from .events import EventBus
 from .interactions import InteractionRouter
 from .loader import BranchLoader
+from .constants import EMBED_FIELD_VALUE_MAX
+from .metrics import Metrics
+from .tasks import TaskRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -29,11 +33,13 @@ class OakBot(commands.Bot):
         intents.guilds = True
         intents.members = True
 
-        super().__init__(command_prefix="!", intents=intents)
+        super().__init__(command_prefix=config.command_prefix, intents=intents)
 
         self.oak_config = config
         self.guild_id = config.guild_id
-        self.event_bus = EventBus()
+        self.metrics = Metrics()
+        self.task_registry = TaskRegistry()
+        self.event_bus = EventBus(metrics=self.metrics)
         self.router = InteractionRouter()
         self.loader = BranchLoader(
             bot=self,
@@ -42,9 +48,17 @@ class OakBot(commands.Bot):
             router=self.router,
         )
         self._ready_fired = False
+        self._start_time = time.monotonic()
+        self._watcher = None
+        self._backup_manager = None
+
+        if config.dev_mode:
+            logging.getLogger("oak").setLevel(logging.DEBUG)
+            logger.info("Dev mode enabled — debug logging active")
 
     async def setup_hook(self) -> None:
         self.tree.on_error = self._on_app_command_error
+        self.tree.interaction_check = self._track_slash_command
 
         # Load built-in admin branch
         logger.info("Loading admin branch...")
@@ -64,15 +78,11 @@ class OakBot(commands.Bot):
             for bid, err in failed:
                 logger.warning(f"  - {bid}: {err}")
 
-        # Sync slash commands to guild
-        guild = discord.Object(id=self.guild_id)
-        self.tree.copy_global_to(guild=guild)
-        try:
-            synced = await self.tree.sync(guild=guild)
-            logger.info(f"Synced {len(synced)} commands to guild {self.guild_id}")
-        except discord.HTTPException as exc:
-            logger.error(f"Failed to sync commands to guild {self.guild_id}: {exc}")
-            raise
+        # Sync slash commands to guild (skipped in dev mode — use /sync manually)
+        if self.oak_config.dev_mode:
+            logger.info("Dev mode: skipping automatic command sync (use /sync)")
+        else:
+            await self.sync_commands()
 
         logger.info("Oak setup complete!")
 
@@ -102,9 +112,29 @@ class OakBot(commands.Bot):
             interactions=BranchInteractionHandle(self.router, "admin"),
         )
 
+    async def sync_commands(self) -> None:
+        """Sync slash commands to the guild. Logs errors instead of crashing."""
+        guild = discord.Object(id=self.guild_id)
+        self.tree.copy_global_to(guild=guild)
+        try:
+            synced = await self.tree.sync(guild=guild)
+            logger.info(f"Synced {len(synced)} commands to guild {self.guild_id}")
+        except discord.HTTPException as exc:
+            logger.error(f"Failed to sync commands to guild {self.guild_id}: {exc}")
+
     async def close(self) -> None:
         """Shut down gracefully: unload all branches via the loader, then close."""
         logger.info("Shutting down Oak...")
+
+        # Stop backup manager if running
+        if self._backup_manager:
+            self._backup_manager.stop()
+            self._backup_manager = None
+
+        # Stop file watcher if running
+        if self._watcher:
+            self._watcher.stop()
+            self._watcher = None
 
         # Unload all branches through the loader for proper cleanup
         # (on_disable → close DB → clean up events)
@@ -113,6 +143,14 @@ class OakBot(commands.Bot):
                 await self.loader.unload_branch(branch_id)
             except Exception:
                 logger.exception(f"Error unloading branch '{branch_id}' during shutdown")
+
+        # Unload admin branch so its on_disable() fires
+        admin_cog = self.get_cog("AdminBranch")
+        if admin_cog:
+            try:
+                await self.remove_cog("AdminBranch")
+            except Exception:
+                logger.exception("Error unloading admin branch during shutdown")
 
         # Let discord.py handle websocket/HTTP cleanup
         await super().close()
@@ -134,15 +172,68 @@ class OakBot(commands.Bot):
             except Exception:
                 logger.exception(f"on_ready() failed for branch '{branch_id}'")
 
+        # Start file watcher in dev mode
+        if self.oak_config.dev_mode and self._watcher is None:
+            from .watcher import BranchWatcher
+
+            self._watcher = BranchWatcher(self, self.loader)
+            self._watcher.start()
+            logger.info("Dev mode: file watcher started")
+
+        # Start periodic database backups
+        if self.oak_config.db_backup_interval > 0 and self._backup_manager is None:
+            from .backup import BackupManager
+
+            self._backup_manager = BackupManager(
+                self,
+                interval_hours=self.oak_config.db_backup_interval,
+                max_backups=self.oak_config.db_backup_max_count,
+            )
+            self._backup_manager.start()
+
         logger.info("Bot is ready!")
+
+    async def _track_slash_command(self, interaction: discord.Interaction) -> bool:
+        """Interaction check that records slash command usage in metrics."""
+        if interaction.command:
+            self.metrics.inc(self.metrics.commands, interaction.command.qualified_name)
+        return True
 
     async def on_message(self, message: discord.Message) -> None:
         if message.content.startswith(str(self.command_prefix)) and not message.author.bot:
             command_name = message.content.split(maxsplit=1)[0]
+            cmd_key = command_name.lstrip(str(self.command_prefix))
+            if cmd_key:
+                self.metrics.inc(self.metrics.commands, f"text:{cmd_key}")
             logger.info(f"Command from {message.author}: {command_name}")
         await self.process_commands(message)
 
+    async def audit_log(self, action: str, user: discord.User | discord.Member, details: str = "") -> None:
+        """Send an audit log embed to the configured channel. Silently warns on failure."""
+        channel_id = self.oak_config.audit_log_channel
+        if not channel_id:
+            return
+        channel = self.get_channel(channel_id)
+        if channel is None:
+            logger.warning(f"Audit log channel {channel_id} not found")
+            return
+        embed = discord.Embed(
+            title=f"Audit: {action}",
+            color=discord.Color.orange(),
+            timestamp=discord.utils.utcnow(),
+        )
+        embed.add_field(name="User", value=f"{user} ({user.id})", inline=True)
+        if details:
+            if len(details) > EMBED_FIELD_VALUE_MAX:
+                details = details[:EMBED_FIELD_VALUE_MAX - 3] + "..."
+            embed.add_field(name="Details", value=details, inline=False)
+        try:
+            await channel.send(embed=embed)  # type: ignore[union-attr]
+        except discord.HTTPException as e:
+            logger.warning(f"Failed to send audit log: {e}")
+
     async def on_error(self, event_method: str, *args, **kwargs) -> None:
+        self.metrics.inc(self.metrics.errors, event_method)
         logger.error(f"Error in {event_method}", exc_info=True)
 
     async def on_command_error(self, ctx: commands.Context, error: commands.CommandError) -> None:
@@ -156,12 +247,15 @@ class OakBot(commands.Bot):
         elif isinstance(error, commands.MissingRequiredArgument):
             await ctx.send(f"Missing required argument: `{error.param.name}`", delete_after=10)
         else:
+            self.metrics.inc(self.metrics.errors, f"cmd:{ctx.command}")
             logger.error(f"Command error in {ctx.command}: {error}", exc_info=True)
             await ctx.send("An error occurred while executing the command.", delete_after=10)
 
     async def _on_app_command_error(
         self, interaction: discord.Interaction, error: app_commands.AppCommandError
     ) -> None:
+        cmd_name = str(interaction.command) if interaction.command else "unknown"
+        self.metrics.inc(self.metrics.errors, f"app_cmd:{cmd_name}")
         logger.error(f"Slash command error in {interaction.command}: {error}", exc_info=True)
         try:
             message = "An error occurred while executing the command."
