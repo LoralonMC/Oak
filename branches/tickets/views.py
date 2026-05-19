@@ -648,7 +648,9 @@ class TicketControlView(discord.ui.View):
             except Exception as e:
                 logger.error(f"Failed to generate transcript: {e}", exc_info=True)
 
-        # Update database BEFORE archiving to prevent inconsistent state
+        # Atomically claim the close. If status was already 'closed', rowcount
+        # is 0 and we bail without touching reminders or thread state \u2014 another
+        # writer already won the race.
         async with _db.transaction() as conn:
             cursor = await conn.execute(
                 """UPDATE tickets
@@ -656,12 +658,21 @@ class TicketControlView(discord.ui.View):
                 WHERE thread_id = ? AND status = 'open'""",
                 (interaction.user.id, reason, thread.id)
             )
-            if cursor.rowcount == 0:
-                logger.warning(f"Ticket {thread.id} was already closed by another user")
-            await conn.execute(
-                "UPDATE ticket_reminders SET active = 0 WHERE ticket_thread_id = ? AND active = 1",
-                (thread.id,)
+            claim_rowcount = cursor.rowcount
+            if claim_rowcount:
+                await conn.execute(
+                    "UPDATE ticket_reminders SET active = 0 WHERE ticket_thread_id = ? AND active = 1",
+                    (thread.id,)
+                )
+
+        if not claim_rowcount:
+            logger.warning(f"Ticket {thread.id} was already closed by another user")
+            await interaction.followup.send(
+                "\u274c This ticket is already closed.",
+                ephemeral=True
             )
+            return
+
         logger.info(f"Closed ticket {thread.id} and cancelled reminders")
 
         # Now close thread (archived + locked = closed in Discord UI)
@@ -669,10 +680,13 @@ class TicketControlView(discord.ui.View):
             await thread.edit(archived=True, locked=True)
         except discord.HTTPException as e:
             logger.error(f"Failed to close thread: {e}")
-            # Revert DB since thread couldn't be archived
+            # Revert only if our claim is still the current state \u2014 scoping by
+            # closed_by prevents reopening a ticket someone else closed.
             await _db.execute(
-                "UPDATE tickets SET status = 'open', closed_by = NULL, close_reason = NULL, closed_at = NULL WHERE thread_id = ?",
-                (thread.id,)
+                """UPDATE tickets
+                SET status = 'open', closed_by = NULL, close_reason = NULL, closed_at = NULL
+                WHERE thread_id = ? AND status = 'closed' AND closed_by = ?""",
+                (thread.id, interaction.user.id)
             )
             await interaction.followup.send(
                 "\u274c Failed to close the ticket thread. Please check bot permissions and try again.",

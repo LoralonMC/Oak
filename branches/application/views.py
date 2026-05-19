@@ -322,7 +322,10 @@ class ManageView(View):
         applicant = interaction.guild.get_member(applicant_id)
         dm_failed = False
 
-        # DM the user
+        # DM the user. Broad HTTPException catch so a transient Discord
+        # outage doesn't bubble out and leave the application in 'accepted'
+        # with no public message — see the channel send below which assumes
+        # the DM step ran to completion.
         if applicant:
             try:
                 await applicant.send(
@@ -336,7 +339,8 @@ class ManageView(View):
                         color=colors["success"]
                     )
                 )
-            except discord.Forbidden:
+            except discord.HTTPException as e:
+                logger.error(f"Failed to DM acceptance to {applicant_id}: {e}")
                 dm_failed = True
 
         # Public message in the ticket
@@ -655,7 +659,16 @@ class ApplicationHistoryView(View):
             return
 
         app_index, status, submitted_at, answers_json, channel_id, denied_at, denial_reason = selected_app
-        answers = json.loads(answers_json)
+        try:
+            answers = json.loads(answers_json) if answers_json else []
+        except (json.JSONDecodeError, TypeError):
+            await interaction.response.send_message(
+                "This application's answers are corrupted and cannot be displayed.",
+                ephemeral=True,
+            )
+            return
+        if not isinstance(answers, list):
+            answers = []
 
         # Get applicant
         applicant = interaction.guild.get_member(self.applicant_id)

@@ -126,14 +126,16 @@ class OakBot(commands.Bot):
         """Shut down gracefully: unload all branches via the loader, then close."""
         logger.info("Shutting down Oak...")
 
-        # Stop backup manager if running
+        # Stop backup manager if running (await so a mid-flight backup
+        # finishes or cancels cleanly before we close DB connections)
         if self._backup_manager:
-            self._backup_manager.stop()
+            await self._backup_manager.stop()
             self._backup_manager = None
 
-        # Stop file watcher if running
+        # Stop file watcher if running (await so a mid-reload completes
+        # before we unload branches below)
         if self._watcher:
-            self._watcher.stop()
+            await self._watcher.stop()
             self._watcher = None
 
         # Unload all branches through the loader for proper cleanup
@@ -200,9 +202,20 @@ class OakBot(commands.Bot):
         return True
 
     async def on_message(self, message: discord.Message) -> None:
-        if message.content.startswith(str(self.command_prefix)) and not message.author.bot:
+        # Only track metrics for string prefixes — callable prefixes (used by
+        # advanced configs) don't have a fixed length we can slice off.
+        prefix = self.command_prefix
+        if (
+            isinstance(prefix, str)
+            and prefix
+            and message.content.startswith(prefix)
+            and not message.author.bot
+        ):
             command_name = message.content.split(maxsplit=1)[0]
-            cmd_key = command_name.lstrip(str(self.command_prefix))
+            # Strip the prefix as a substring, not a character set. ``lstrip``
+            # accepts a set of characters to remove, so a prefix like "oak "
+            # would chew any combination of o/a/k/space off the front.
+            cmd_key = command_name[len(prefix):]
             if cmd_key:
                 self.metrics.inc(self.metrics.commands, f"text:{cmd_key}")
             logger.info(f"Command from {message.author}: {command_name}")

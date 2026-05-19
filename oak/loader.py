@@ -268,10 +268,23 @@ class BranchLoader:
         except Exception as e:
             raise BranchLoadError(branch_id, f"Instantiation failed: {e}") from e
 
-        # Add as cog (triggers cog_load -> on_enable)
+        # Add as cog (triggers cog_load -> on_enable). If on_enable fails
+        # partway, it may have registered persistent views via bot.add_view()
+        # or scheduled tasks via register_task() that discord.py's add_cog
+        # rollback won't touch. Clean those up explicitly.
         try:
             await self.bot.add_cog(instance)
         except Exception as e:
+            # Best-effort: try to remove the cog in case it was partially added
+            try:
+                await self.bot.remove_cog(instance.qualified_name)
+            except Exception:
+                pass
+            # Unregister any tasks the branch had time to schedule
+            try:
+                self.bot.task_registry.unregister_all(branch_id)
+            except Exception:
+                logger.exception(f"Failed to unregister tasks for failed branch '{branch_id}'")
             await self._cleanup_branch_resources(branch_id, event_handle, db)
             raise BranchLoadError(branch_id, f"add_cog/on_enable failed: {e}") from e
 
@@ -335,7 +348,10 @@ class BranchLoader:
 
         try:
             instance = await self.load_branch(branch_id)
-        except Exception:
+        except Exception as e:
+            # Record the failure so /branches and /health show the broken state
+            # instead of treating the branch as cleanly absent.
+            self._load_failures[branch_id] = str(e)
             logger.error(
                 f"Reload failed for branch '{branch_id}'; branch is now unloaded"
             )

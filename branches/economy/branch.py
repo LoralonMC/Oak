@@ -6,6 +6,7 @@ REST API — no local database.
 
 import time
 import urllib.parse
+from collections import OrderedDict
 
 import aiohttp
 
@@ -15,9 +16,14 @@ from discord.ext import commands
 
 from oak import OakBranch
 from oak.context import BranchContext
-from oak.constants import EMBED_DESCRIPTION_MAX
+from oak.constants import EMBED_DESCRIPTION_MAX, EMBED_TITLE_MAX
 
 from .views import PaginatedEmbedView
+
+# Bound on the in-memory response cache. Autocomplete generates a unique key
+# per keystroke (q=d, q=di, q=dia, ...) so without a cap the dict grows
+# forever during normal use.
+_API_CACHE_MAX_ENTRIES = 500
 
 # Default configuration for this branch
 DEFAULT_CONFIG = {
@@ -61,7 +67,8 @@ class Economy(OakBranch):
         self._cache_default_ttl = self.setting("cache", "default_ttl", default=30)
         self._cache_overview_ttl = self.setting("cache", "overview_ttl", default=60)
         self._session: aiohttp.ClientSession | None = None
-        self._api_cache: dict[tuple, tuple[float, dict]] = {}
+        # OrderedDict gives us LRU eviction via move_to_end / popitem(last=False).
+        self._api_cache: OrderedDict[tuple, tuple[float, dict]] = OrderedDict()
 
     async def on_enable(self):
         self._session = aiohttp.ClientSession()
@@ -72,6 +79,9 @@ class Economy(OakBranch):
         if self._session:
             await self._session.close()
             self._session = None
+        # Drop cached responses so a hot reload starts with a clean slate
+        # instead of serving stale data from the previous instance.
+        self._api_cache.clear()
 
     # ------------------------------------------------------------------
     # API Client
@@ -101,9 +111,11 @@ class Economy(OakBranch):
         # Cache key includes params so different queries don't collide
         cache_key = (path, tuple(sorted(params.items())) if params else ())
         now = time.monotonic()
-        cached = self._api_cache.get(cache_key)
-        if cached and (now - cached[0]) < cache_ttl:
-            return cached[1]
+        if cache_ttl > 0:
+            cached = self._api_cache.get(cache_key)
+            if cached and (now - cached[0]) < cache_ttl:
+                self._api_cache.move_to_end(cache_key)
+                return cached[1]
         try:
             url = f"{self.api_url}/api/economy/{path}"
             headers = {"Authorization": f"Bearer {self.api_key}"}
@@ -115,12 +127,20 @@ class Economy(OakBranch):
             ) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    self._api_cache[cache_key] = (now, data)
+                    if cache_ttl > 0:
+                        self._api_cache[cache_key] = (now, data)
+                        self._api_cache.move_to_end(cache_key)
+                        # LRU eviction — keep memory bounded under autocomplete pressure
+                        while len(self._api_cache) > _API_CACHE_MAX_ENTRIES:
+                            self._api_cache.popitem(last=False)
                     return data
                 self.log.warning(f"API {resp.status}: {path}")
                 return None
         except Exception as e:
-            self.log.error(f"API error ({path}): {e}")
+            # Log type + message separately so a future ContentTypeError with
+            # an echoed Authorization header in the body doesn't leak via the
+            # default __str__.
+            self.log.error(f"API error ({path}): {type(e).__name__}: {e}")
             return None
 
     # ------------------------------------------------------------------
@@ -161,7 +181,7 @@ class Economy(OakBranch):
             view.message = message
 
     def _fmt(self, n) -> str:
-        """Format a number with commas, or '--' if None/0."""
+        """Format a number with commas, or '--' if None."""
         if n is None:
             return "--"
         return f"{int(n):,}"
@@ -370,7 +390,7 @@ class Economy(OakBranch):
             source = f" `{plugin}`" if plugin != "vanilla" else ""
             return f"**{rank}.** {name}{source}\n　`{key}`"
 
-        pages = self._build_pages(rows, self.per_page, f"Search: {query}", fmt)
+        pages = self._build_pages(rows, self.per_page, f"Search: {query}"[:EMBED_TITLE_MAX], fmt)
         await self._send_paginated(interaction, pages, ephemeral=not public)
 
     @search.autocomplete("query")
@@ -391,7 +411,9 @@ class Economy(OakBranch):
         # We need the UUID — for now pass the name and let the portal-side resolve it
         # The API uses UUID, so this is a limitation until we add name→UUID resolution
         data = await self.api_get(f"player/{urllib.parse.quote(name, safe='')}", params={"period": p})
-        if not data or not data.get("tradeCount"):
+        # `tradeCount=0` is a valid response (known player with no trades in
+        # period), so only treat None/missing as "not found".
+        if not data or data.get("tradeCount") is None:
             await interaction.followup.send(f"No trade data found for **{name[:100]}**.", ephemeral=True)
             return
 
@@ -562,7 +584,8 @@ class Economy(OakBranch):
         await interaction.response.defer(ephemeral=not public)
         limit = max(1, min(limit, 100))
 
-        data = await self.api_get("recent", params={"limit": limit})
+        # ttl=0 disables caching for /recent — the command name promises freshness
+        data = await self.api_get("recent", params={"limit": limit}, ttl=0)
         if not data:
             await interaction.followup.send("Could not fetch recent trades.", ephemeral=True)
             return
@@ -670,5 +693,5 @@ class Economy(OakBranch):
             trades = int(row.get("tradeCount", 0))
             return f"**{rank}.** {shop_name} — {item} ({trades:,} trades)"
 
-        pages = self._build_pages(shops, self.per_page, f"{name}'s Shops", fmt)
+        pages = self._build_pages(shops, self.per_page, f"{name}'s Shops"[:EMBED_TITLE_MAX], fmt)
         await self._send_paginated(interaction, pages, ephemeral=not public)

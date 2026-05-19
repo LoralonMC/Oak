@@ -81,12 +81,20 @@ class BackupManager:
                 f"keep {self._max_backups})"
             )
 
-    def stop(self) -> None:
-        """Stop the periodic backup loop."""
+    async def stop(self) -> None:
+        """Stop the periodic backup loop and wait for it to finish.
+
+        Awaiting the cancellation prevents a half-finished backup_all() from
+        racing with branch unload / database close on shutdown.
+        """
         if self._task and not self._task.done():
             self._task.cancel()
-            self._task = None
+            try:
+                await self._task
+            except (asyncio.CancelledError, Exception):
+                pass
             logger.info("Backup manager stopped")
+        self._task = None
 
     async def _loop(self) -> None:
         """Run backups on a fixed interval."""

@@ -382,6 +382,21 @@ class Application(OakBranch):
                 name="add_user_id_index",
                 sql="CREATE INDEX IF NOT EXISTS idx_applications_user_id ON applications(user_id)"
             ),
+            # Make the in-memory _creating_users dedupe authoritative at the DB
+            # layer. A user can have at most one active application at a time;
+            # cancelled/abandoned/denied/accepted rows are unconstrained so a
+            # user can reapply after their previous attempt closes out.
+            Migration(
+                name="add_active_application_unique",
+                sql=(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_applications_active_unique "
+                    "ON applications(user_id) WHERE status IN ('in_progress', 'pending')"
+                ),
+            ),
+            Migration(
+                name="add_cleanup_completed_at",
+                sql="ALTER TABLE applications ADD COLUMN cleanup_completed_at TIMESTAMP",
+            ),
         ])
 
         if self.application_channel_id == 0:
@@ -439,7 +454,31 @@ class Application(OakBranch):
     async def on_ready(self):
         """Ensure application message exists when bot is ready."""
         await self.ensure_application_message()
+        self._warn_if_accepted_category_is_permissive()
         self.log.info("Application branch ready")
+
+    def _warn_if_accepted_category_is_permissive(self) -> None:
+        """Emit a warning if accepted_category_id grants @everyone view access.
+
+        Moving an application channel into that category inherits its
+        permission overwrites — a misconfigured destination would silently
+        expose confidential application answers to the whole server.
+        """
+        if not self.accepted_category_id:
+            return
+        guild = self.bot.get_guild(self.bot.guild_id)
+        if not guild:
+            return
+        category = guild.get_channel(self.accepted_category_id)
+        if category is None or not isinstance(category, discord.CategoryChannel):
+            return
+        default_overwrite = category.overwrites_for(guild.default_role)
+        if default_overwrite.view_channel is True:
+            self.log.warning(
+                f"accepted_category_id {self.accepted_category_id} grants "
+                f"@everyone view_channel — moving applications there will expose "
+                "their contents. Set a restrictive @everyone overwrite on that category."
+            )
 
     @app_commands.command(name="appstats", description="Show application statistics")
     async def application_stats(self, interaction: discord.Interaction):
@@ -831,13 +870,17 @@ class Application(OakBranch):
 
             auto_delete_hours = denial_config.get("auto_delete_no_dm_after_hours", 24)
 
-            # Find denied apps where DM failed and time has expired
+            # Find denied apps where DM failed, the time has expired, and we
+            # haven't already completed cleanup for this row (so a channel
+            # that's been manually deleted doesn't get rediscovered every
+            # tick forever).
             apps_to_delete = await self.db.fetchall("""
                 SELECT user_id, channel_id, denied_at
                 FROM applications
                 WHERE status = 'denied'
                 AND denial_dm_sent = 0
                 AND denied_at IS NOT NULL
+                AND cleanup_completed_at IS NULL
                 AND (julianday('now') - julianday(denied_at)) * 24 >= ?
             """, (auto_delete_hours,))
 
@@ -852,13 +895,27 @@ class Application(OakBranch):
             deleted_count = 0
             for user_id, channel_id, denied_at in apps_to_delete:
                 channel = guild.get_channel(channel_id)
+                channel_gone = channel is None
                 if channel:
                     try:
                         await channel.delete(reason=f"Denied application auto-cleanup (DM failed, {auto_delete_hours}h elapsed)")
                         self.log.info(f"Auto-deleted denied application channel {channel_id} for user {user_id} (DM failed, waited {auto_delete_hours}h)")
                         deleted_count += 1
+                        channel_gone = True
+                    except discord.NotFound:
+                        channel_gone = True
                     except discord.HTTPException as e:
                         self.log.error(f"Failed to auto-delete denied channel {channel_id}: {e}")
+
+                if channel_gone:
+                    # Mark the row so we don't keep finding it every 12h.
+                    try:
+                        await self.db.execute(
+                            "UPDATE applications SET cleanup_completed_at = datetime('now') WHERE channel_id = ?",
+                            (channel_id,),
+                        )
+                    except Exception as e:
+                        self.log.error(f"Failed to record cleanup for {channel_id}: {e}")
 
             return deleted_count
 

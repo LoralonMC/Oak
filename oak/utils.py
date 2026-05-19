@@ -78,6 +78,8 @@ def paginate(text: str, page_size: int = 4096) -> list[str]:
     Each chunk is at most ``page_size`` characters. Splits prefer line
     breaks so that output remains readable.
     """
+    if page_size <= 0:
+        raise ValueError("page_size must be positive")
     if not text:
         return []
     if len(text) <= page_size:

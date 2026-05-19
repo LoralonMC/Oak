@@ -152,6 +152,7 @@ def _build_html(
     messages: list[discord.Message],
     ticket_data: dict,
     guild: discord.Guild | None,
+    truncated: bool = False,
 ) -> str:
     """Build the full HTML transcript string."""
     # Header metadata
@@ -291,6 +292,11 @@ def _build_html(
 
     messages_html = "\n".join(msg_html_parts)
     msg_count = len(messages)
+    truncation_notice = (
+        '<div class="system-msg">⚠ Transcript truncated — only the first '
+        f'{msg_count} messages are shown.</div>'
+        if truncated else ""
+    )
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -307,9 +313,10 @@ def _build_html(
 </div>
 <div class="messages">
 {messages_html}
+{truncation_notice}
 </div>
 <div class="footer">
-{msg_count} messages &mdash; Generated {_format_timestamp(datetime.now(timezone.utc))} UTC
+{msg_count} messages{' (truncated)' if truncated else ''} &mdash; Generated {_format_timestamp(datetime.now(timezone.utc))} UTC
 </div>
 </body>
 </html>"""
@@ -331,17 +338,25 @@ async def generate_transcript(
     Returns:
         BytesIO buffer containing the HTML file.
     """
+    # Cap to a sensible upper bound so a multi-thousand-message ticket can't
+    # exhaust memory or blow past Discord's attachment limits. Anything above
+    # the cap is dropped with a "transcript truncated" notice at the end.
+    MAX_MESSAGES = 5000
     messages = []
+    truncated = False
     async for msg in thread.history(limit=None, oldest_first=True):
+        if len(messages) >= MAX_MESSAGES:
+            truncated = True
+            break
         messages.append(msg)
 
     guild = thread.guild
 
     # Use thread for large transcripts
     if len(messages) > 100:
-        html = await asyncio.to_thread(_build_html, messages, ticket_data, guild)
+        html = await asyncio.to_thread(_build_html, messages, ticket_data, guild, truncated)
     else:
-        html = _build_html(messages, ticket_data, guild)
+        html = _build_html(messages, ticket_data, guild, truncated)
 
     buf = io.BytesIO(html.encode("utf-8"))
     buf.seek(0)
@@ -390,6 +405,7 @@ async def send_transcript(
     # by ticket number. Discord attachments keep the plain name.
     transcript_url = None
     filename = base_filename
+    saved_filename = None
     if base_url and transcripts_dir:
         token = secrets.token_urlsafe(16)
         web_filename = f"ticket-{category}-{ticket_label}-{token}.html"
@@ -397,8 +413,20 @@ async def send_transcript(
             from .web import save_transcript
             await save_transcript(transcripts_dir, web_filename, buffer)
             transcript_url = f"{base_url}/transcripts/{web_filename}"
+            saved_filename = web_filename
         except Exception as e:
             logger.error(f"Failed to save transcript to disk: {e}", exc_info=True)
+
+    # Record the on-disk filename so the cleanup task can distinguish
+    # active transcripts from orphans even if the Discord send below fails.
+    if saved_filename:
+        try:
+            await db.execute(
+                "UPDATE tickets SET transcript_filename = ? WHERE thread_id = ?",
+                (saved_filename, thread.id),
+            )
+        except Exception as e:
+            logger.error(f"Failed to record transcript_filename: {e}")
 
     # Post to log channel
     transcript_message_id = None

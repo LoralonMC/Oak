@@ -57,6 +57,105 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Tickets**: New `transcript.web.bind_host` config option (defaults to
   `"127.0.0.1"`) so the transcript server's listen address is discoverable
   in `config.yml`.
+- **Tickets**: Periodic cleanup task prunes orphan transcript HTML files —
+  ones whose Discord delivery failed before the filename was recorded, or
+  whose ticket row was later deleted. Files newer than
+  `transcript.web.retention_hours` (default 24) are left alone.
+- **Application**: New `cleanup_completed_at` column on `applications`
+  tracks denied-channel auto-deletion so the inactivity loop doesn't keep
+  rediscovering the same row every 12h forever.
+
+### Security
+
+- **Tickets**: Transcript web server adds strict security headers
+  (`Content-Security-Policy: default-src 'none'`, `X-Content-Type-Options`,
+  `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`) and a
+  `Path.resolve()` containment check, plus NUL-byte rejection on
+  filenames. Defense in depth on top of the existing token-in-filename.
+- **Suggestions**: `on_message` now rejects DMs and threads, and validation
+  notice messages use `allowed_mentions` scoped to the author so a forged
+  `@everyone` in suggestion content can't ride through the reply.
+- **Application**: Startup warning if `accepted_category_id` grants
+  `@everyone view_channel` — moving an application channel into that
+  category inherits its overwrites and would expose answers.
+
+### Changed
+
+- Framework: Migrations now run inside `BEGIN IMMEDIATE`/`COMMIT` so a
+  multi-statement migration that fails partway through rolls back cleanly
+  instead of silently leaving the schema half-applied with the migration
+  row marked complete. "Already applied" is only swallowed for a single
+  `ALTER TABLE ADD COLUMN` against legacy databases.
+- Framework: `BackupManager.stop()` and `BranchWatcher.stop()` are now
+  async and await task cancellation, so a mid-flight backup or reload
+  can't race with branch unload during shutdown.
+- Framework: `OakBot.on_message()` prefix handling now slices the prefix
+  off as a substring (was `lstrip(str(prefix))`, which strips any
+  combination of the prefix's characters — a prefix like `"oak "` would
+  chew o/a/k/space off the front of the command name).
+- Framework: `write_branch_enabled()` writes to a temp file in the same
+  directory then `os.replace()`s, so a crash mid-write can't truncate
+  the YAML file (branch configs may hold secrets).
+- Framework: `OakConfig` clamps `DB_BACKUP_INTERVAL` to >= 0 and
+  `DB_BACKUP_MAX_COUNT` to >= 1 so misconfigured env vars can't burn CPU
+  in a tight asyncio sleep loop or delete every backup immediately.
+- **Tickets**: `/closeticket` and the close button now claim the close
+  atomically (`UPDATE ... WHERE status = 'open'`) and bail without
+  touching reminders or thread state if another writer already won the
+  race. The thread-edit-failure revert is scoped by `closed_by` so it
+  can't unconditionally reopen a ticket someone else legitimately closed.
+- **Tickets**: Reminder send failures now bump `last_reminded_at` so a
+  Discord outage doesn't make the same reminder refire every minute.
+- **Tickets**: Anti-archive unauthorized-unarchive check now scans up to
+  25 recent audit log entries within the last 2 minutes (was 5 entries
+  with no time bound), so a burst of unrelated thread updates can't push
+  the relevant entry out of the search window.
+- **Tickets**: Transcripts are capped at 5000 messages; the remainder is
+  noted with a truncation footer rather than swallowing memory on a
+  multi-thousand-message ticket.
+- **Economy**: Response cache is now an LRU bounded at 500 entries —
+  autocomplete keystrokes (`q=d`, `q=di`, …) no longer grow the dict
+  forever. `/recent` skips the cache entirely (`ttl=0`). API error
+  logs now show `type(e).__name__` to avoid leaking response bodies.
+- **Economy**: `/player` treats `tradeCount=0` as a valid response
+  instead of "no data found"; embed titles for `/search` and
+  `/playershops` are clamped to 256 chars so a long input can't bust
+  Discord's title limit.
+- **Suggestions**: `topsuggestions` ORDER BY now uses the explicit
+  aggregate expressions instead of bare identifiers, so the legacy
+  `likes`/`dislikes` text columns can't accidentally shadow the
+  aggregates and yield lexicographic ordering on JSON.
+- **Suggestions**: `_migrate_votes` is now per-row tolerant — a single
+  malformed legacy JSON payload no longer aborts the whole migration
+  and loses votes for every other suggestion.
+- **Status Channels**: Member and player updates are independent helpers
+  so a failure in one no longer early-returns the whole tick and skips
+  the other. The Minecraft `JavaServer` lookup result is cached and
+  re-resolved only on failure (was a fresh DNS+SRV lookup every tick).
+
+### Fixed
+
+- Framework: `reload_branch()` failures now record the error in
+  `_load_failures`, so `/branches` and `/health` show the broken state
+  instead of treating the branch as cleanly absent.
+- Framework: When `add_cog`/`on_enable` fails, the loader now also
+  unregisters any tasks the branch had time to schedule and attempts a
+  `remove_cog` cleanup, so partial state from a half-loaded branch
+  doesn't survive the failed load.
+- Framework: `paginate()` raises on `page_size <= 0` instead of looping
+  forever.
+- **Application**: New partial unique index on `applications(user_id)
+  WHERE status IN ('in_progress', 'pending')` makes the in-memory
+  `_creating_users` dedupe authoritative — a user whose previous
+  application is `cancelled`/`abandoned`/`denied` can still re-apply,
+  but can't spam the button to create multiple channels in flight.
+- **Application**: Accept button now catches `discord.HTTPException`
+  (not just `Forbidden`), so a transient outage during the DM doesn't
+  leave the application in `accepted` with no public message and no
+  notification.
+- **Application**: `ApplicationHistoryView` selection handles
+  malformed `answers_json` without raising — the user gets an
+  ephemeral error rather than a silent "interaction failed".
 
 ## [2.0.0] - 2026-02-20
 

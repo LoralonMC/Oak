@@ -42,15 +42,31 @@ class TranscriptServer:
         """Serve a transcript HTML file."""
         filename = request.match_info["filename"]
 
-        # Reject path traversal
-        if ".." in filename or "/" in filename or "\\" in filename:
+        # Reject obvious path traversal and NUL bytes
+        if ".." in filename or "/" in filename or "\\" in filename or "\x00" in filename:
             raise web.HTTPForbidden()
 
         filepath = self.transcripts_dir / filename
-        if not filepath.is_file():
+        # Defense in depth: ensure the resolved path is still inside transcripts_dir
+        try:
+            resolved = filepath.resolve()
+            resolved.relative_to(self.transcripts_dir.resolve())
+        except (ValueError, OSError):
+            raise web.HTTPForbidden()
+
+        if not resolved.is_file():
             raise web.HTTPNotFound()
 
-        return web.FileResponse(filepath, headers={"Content-Type": "text/html; charset=utf-8"})
+        # Tight security headers: even if a future renderer bug introduces an
+        # injection, the browser shouldn't be able to do much with it.
+        headers = {
+            "Content-Type": "text/html; charset=utf-8",
+            "Content-Security-Policy": "default-src 'none'; img-src https:; style-src 'unsafe-inline'",
+            "X-Content-Type-Options": "nosniff",
+            "X-Frame-Options": "DENY",
+            "Referrer-Policy": "no-referrer",
+        }
+        return web.FileResponse(resolved, headers=headers)
 
     def transcript_url(self, filename: str) -> str:
         """Build the public URL for a transcript file."""

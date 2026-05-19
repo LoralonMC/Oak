@@ -84,7 +84,18 @@ class BranchDatabase:
         logger.info(f"Database initialized at {self._path}")
 
     async def migrate(self, migrations: list[Migration]) -> None:
-        """Run named migrations that haven't been applied yet."""
+        """Run named migrations that haven't been applied yet.
+
+        Each migration runs inside its own transaction so a multi-statement
+        migration that fails mid-way rolls back cleanly instead of leaving
+        the schema half-applied with the migration row inserted.
+
+        ALTER TABLE ADD COLUMN migrations that hit "duplicate column name"
+        are treated as already-applied (legacy databases that predate the
+        _oak_migrations tracking table) — but only when the migration is a
+        single ALTER TABLE ADD COLUMN statement, so we can't mask half-applied
+        multi-statement migrations.
+        """
         if not self._conn:
             raise RuntimeError("Database not initialized — call initialize() first")
 
@@ -104,14 +115,34 @@ class BranchDatabase:
                     continue  # already applied
 
                 logger.info(f"Running migration: {migration.name}")
+                statements = [s.strip() for s in migration.sql.split(";") if s.strip()]
+                is_single_add_column = (
+                    len(statements) == 1
+                    and statements[0].upper().startswith("ALTER TABLE")
+                    and "ADD COLUMN" in statements[0].upper()
+                )
+
+                await self._conn.execute("BEGIN IMMEDIATE")
                 try:
-                    await _execute_script(self._conn, migration.sql)
+                    for stmt in statements:
+                        await self._conn.execute(stmt)
+                    await self._conn.execute(
+                        "INSERT INTO _oak_migrations (name) VALUES (?)",
+                        (migration.name,),
+                    )
+                    await self._conn.commit()
                 except sqlite3.OperationalError as e:
-                    if "duplicate column name" in str(e):
-                        # Column already exists (migration was applied before tracking).
+                    await self._conn.rollback()
+                    if is_single_add_column and "duplicate column name" in str(e):
+                        # Legacy DB predating tracking — record as applied
                         logger.info(
                             f"Migration '{migration.name}' already applied (column exists), recording it"
                         )
+                        await self._conn.execute(
+                            "INSERT INTO _oak_migrations (name) VALUES (?)",
+                            (migration.name,),
+                        )
+                        await self._conn.commit()
                     else:
                         logger.error(
                             f"Migration '{migration.name}' failed: {e}",
@@ -119,16 +150,12 @@ class BranchDatabase:
                         )
                         raise
                 except Exception as e:
+                    await self._conn.rollback()
                     logger.error(
                         f"Migration '{migration.name}' failed: {e}",
                         exc_info=True,
                     )
                     raise
-                await self._conn.execute(
-                    "INSERT INTO _oak_migrations (name) VALUES (?)",
-                    (migration.name,),
-                )
-                await self._conn.commit()
 
     @asynccontextmanager
     async def transaction(self) -> AsyncIterator[aiosqlite.Connection]:

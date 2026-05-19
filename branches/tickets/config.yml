@@ -269,6 +269,7 @@ settings:
       port: 5454                 # Bind port (default: 5454)
       bind_host: "127.0.0.1"     # Listen address; use "0.0.0.0" only behind a trusted reverse proxy
       base_url: "http://localhost:5454"  # Override with your domain when using a reverse proxy
+      retention_hours: 24        # Orphan transcript files on disk are pruned after this many hours
 
   # UI colors
   ui:

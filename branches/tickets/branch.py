@@ -180,6 +180,15 @@ class Tickets(OakBranch):
         self.register_task("check_reminders", self.check_reminders_task)
         self.log.info("Reminder check task started (interval: 1 minute)")
 
+        # Periodically delete orphaned transcript HTML files. A transcript can
+        # become orphan if the web save succeeded but the subsequent Discord
+        # send failed before we recorded transcript_filename — or if a row was
+        # later hard-deleted. Disabled when the web server is off.
+        if self._transcripts_dir is not None:
+            self.cleanup_transcripts_task.start()
+            self.register_task("cleanup_transcripts", self.cleanup_transcripts_task)
+            self.log.info("Transcript cleanup task started (interval: 6 hours)")
+
     async def on_ready(self):
         """Validate panel after bot is connected and channel cache is populated."""
         await self.validate_panel()
@@ -194,6 +203,10 @@ class Tickets(OakBranch):
             Migration(
                 name="add_transcript_message_id",
                 sql="ALTER TABLE tickets ADD COLUMN transcript_message_id INTEGER"
+            ),
+            Migration(
+                name="add_transcript_filename",
+                sql="ALTER TABLE tickets ADD COLUMN transcript_filename TEXT"
             ),
         ])
 
@@ -217,6 +230,8 @@ class Tickets(OakBranch):
             self.anti_archive_task.cancel()
         if self.check_reminders_task.is_running():
             self.check_reminders_task.cancel()
+        if self.cleanup_transcripts_task.is_running():
+            self.cleanup_transcripts_task.cancel()
         for view in self._registered_views:
             view.stop()
         self._registered_views.clear()
@@ -482,7 +497,21 @@ class Tickets(OakBranch):
                     )
                     embed.set_footer(text="Use the buttons below to stop or snooze this reminder")
 
-                    reminder_message = await thread.send(content=user.mention, embed=embed, view=view)
+                    try:
+                        reminder_message = await thread.send(content=user.mention, embed=embed, view=view)
+                    except discord.HTTPException as e:
+                        # Don't refire every minute during a Discord outage or
+                        # a permissions hiccup. Bump last_reminded_at so the
+                        # next attempt waits a full day, and move on.
+                        self.log.error(f"Failed to send reminder for ticket {thread_id}: {e}")
+                        try:
+                            await self.db.execute(
+                                "UPDATE ticket_reminders SET last_reminded_at = ? WHERE id = ?",
+                                (now.strftime('%Y-%m-%d %H:%M:%S'), reminder_id),
+                            )
+                        except Exception:
+                            self.log.exception(f"Failed to mark reminder {reminder_id} after send failure")
+                        continue
                     self.log.info(f"Sent {reminder_type.lower()} reminder for ticket {thread_id} to user {user_id}")
 
                     if dm_enabled:
@@ -526,6 +555,53 @@ class Tickets(OakBranch):
     async def check_reminders_task_error(self, error):
         """Log errors from the check reminders task."""
         self.log.error(f"Unhandled error in check_reminders_task: {error}", exc_info=True)
+
+    @tasks.loop(hours=6)
+    async def cleanup_transcripts_task(self):
+        """Delete on-disk transcripts that aren't referenced by any ticket row.
+
+        Orphans arise when the web-save succeeded but recording the filename
+        in the tickets row failed, or when a tickets row was later deleted.
+        Files newer than the retention window are left alone so an in-flight
+        transcript send isn't yanked out from under itself.
+        """
+        if self._transcripts_dir is None or not self._transcripts_dir.exists():
+            return
+        retention_hours = self.setting(
+            "transcript", "web", "retention_hours", default=24
+        )
+        retention_seconds = max(1, int(retention_hours)) * 3600
+        try:
+            referenced_rows = await self.db.fetchall(
+                "SELECT transcript_filename FROM tickets WHERE transcript_filename IS NOT NULL"
+            )
+            referenced = {row[0] for row in referenced_rows if row[0]}
+        except Exception as e:
+            self.log.error(f"Failed to read transcript filenames for cleanup: {e}")
+            return
+
+        now = time.time()
+        removed = 0
+        for path in self._transcripts_dir.glob("*.html"):
+            if path.name in referenced:
+                continue
+            try:
+                if now - path.stat().st_mtime < retention_seconds:
+                    continue
+                path.unlink()
+                removed += 1
+            except OSError as e:
+                self.log.warning(f"Failed to remove orphan transcript {path.name}: {e}")
+        if removed:
+            self.log.info(f"Cleaned up {removed} orphan transcript file(s)")
+
+    @cleanup_transcripts_task.before_loop
+    async def before_cleanup_transcripts_task(self):
+        await self.bot.wait_until_ready()
+
+    @cleanup_transcripts_task.error
+    async def cleanup_transcripts_task_error(self, error):
+        self.log.error(f"Unhandled error in cleanup_transcripts_task: {error}", exc_info=True)
 
     @commands.Cog.listener()
     async def on_raw_thread_update(self, payload):
@@ -577,11 +653,16 @@ class Tickets(OakBranch):
             if not thread or not isinstance(thread, discord.Thread):
                 return
 
-            # Check if the unarchiver is authorized (admin, global staff, or category staff)
+            # Check if the unarchiver is authorized (admin, global staff, or category staff).
+            # Look at more recent entries and constrain to the last few minutes so a busy
+            # guild's audit log doesn't push the relevant entry out of our window.
             unarchiver = None
             try:
                 guild = thread.guild
-                async for entry in guild.audit_logs(limit=5, action=discord.AuditLogAction.thread_update):
+                cutoff = datetime.now(timezone.utc) - timedelta(minutes=2)
+                async for entry in guild.audit_logs(limit=25, action=discord.AuditLogAction.thread_update):
+                    if entry.created_at < cutoff:
+                        break
                     if entry.target and entry.target.id == payload.thread_id:
                         unarchiver = entry.user
                         break
@@ -883,28 +964,44 @@ class Tickets(OakBranch):
                 except Exception as e:
                     self.log.error(f"Failed to generate transcript: {e}", exc_info=True)
 
-            # Update DB BEFORE archiving to prevent inconsistent state
+            # Atomically claim the close. The status='open' predicate prevents
+            # two concurrent /closeticket invocations from both "succeeding";
+            # only the writer that flipped status='open' -> 'closed' continues.
             async with self.db.transaction() as conn:
-                await conn.execute(
+                cursor = await conn.execute(
                     """UPDATE tickets
                     SET status = 'closed', closed_by = ?, close_reason = ?, closed_at = datetime('now')
-                    WHERE thread_id = ?""",
+                    WHERE thread_id = ? AND status = 'open'""",
                     (interaction.user.id, reason, thread.id)
                 )
-                await conn.execute(
-                    "UPDATE ticket_reminders SET active = 0 WHERE ticket_thread_id = ? AND active = 1",
-                    (thread.id,)
+                claim_rowcount = cursor.rowcount
+                if claim_rowcount:
+                    await conn.execute(
+                        "UPDATE ticket_reminders SET active = 0 WHERE ticket_thread_id = ? AND active = 1",
+                        (thread.id,)
+                    )
+
+            if not claim_rowcount:
+                await interaction.followup.send(
+                    "\u274c This ticket is already closed.",
+                    ephemeral=True
                 )
+                return
+
             self.log.info(f"Closed ticket {thread.id} and cancelled reminders")
 
             try:
                 await thread.edit(archived=True, locked=True)
             except discord.HTTPException as e:
                 self.log.error(f"Failed to close thread: {e}")
-                # Revert DB since thread couldn't be archived
+                # Revert ONLY if our row is still in the state we just wrote \u2014
+                # scoping by closed_by + status='closed' prevents reopening a
+                # ticket someone else legitimately closed in the meantime.
                 await self.db.execute(
-                    "UPDATE tickets SET status = 'open', closed_by = NULL, close_reason = NULL, closed_at = NULL WHERE thread_id = ?",
-                    (thread.id,)
+                    """UPDATE tickets
+                    SET status = 'open', closed_by = NULL, close_reason = NULL, closed_at = NULL
+                    WHERE thread_id = ? AND status = 'closed' AND closed_by = ?""",
+                    (thread.id, interaction.user.id)
                 )
                 await interaction.followup.send(
                     "\u274c Failed to close the ticket thread. Please check bot permissions and try again.",

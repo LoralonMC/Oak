@@ -5,6 +5,7 @@ Oak configuration: environment loading, branch config merge.
 import copy
 import logging
 import os
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -56,7 +57,12 @@ def load_branch_config(branch_dir: Path, default_config: dict, branch_id: str) -
 
 
 def write_branch_enabled(branch_dir: Path, enabled: bool) -> None:
-    """Set the ``enabled`` flag in a branch's config.yml."""
+    """Set the ``enabled`` flag in a branch's config.yml.
+
+    Writes to a temp file in the same directory then atomically replaces
+    the target, so a crash mid-write can't truncate the file (branch
+    configs may contain secrets — partial writes would be very bad).
+    """
     config_path = branch_dir / "config.yml"
     try:
         if config_path.exists():
@@ -65,8 +71,22 @@ def write_branch_enabled(branch_dir: Path, enabled: bool) -> None:
         else:
             data = {}
         data["enabled"] = enabled
-        with open(config_path, "w", encoding="utf-8") as f:
-            yaml.safe_dump(data, f, default_flow_style=False)
+
+        # Write to a temp file in the same directory then os.replace —
+        # atomic on POSIX and Windows (same-volume rename).
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=".config.", suffix=".tmp", dir=str(branch_dir)
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                yaml.safe_dump(data, f, default_flow_style=False)
+            os.replace(tmp_path, config_path)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
     except Exception as e:
         logger.error(f"Failed to write enabled={enabled} to {config_path}: {e}")
         raise
@@ -82,8 +102,11 @@ class OakConfig:
         self.command_prefix = os.getenv("COMMAND_PREFIX", "!")
         self.dev_mode = os.getenv("DEV_MODE", "").lower() in ("true", "1", "yes")
         self.audit_log_channel = int(os.getenv("AUDIT_LOG_CHANNEL", "0"))
-        self.db_backup_interval = float(os.getenv("DB_BACKUP_INTERVAL", "0"))
-        self.db_backup_max_count = int(os.getenv("DB_BACKUP_MAX_COUNT", "3"))
+        # Clamp to safe ranges — a negative interval would burn CPU in a tight
+        # asyncio.sleep loop; a zero max-count would delete every backup
+        # immediately after creating it.
+        self.db_backup_interval = max(0.0, float(os.getenv("DB_BACKUP_INTERVAL", "0")))
+        self.db_backup_max_count = max(1, int(os.getenv("DB_BACKUP_MAX_COUNT", "3")))
         self._validate()
 
     def _require(self, key: str) -> str:

@@ -105,7 +105,11 @@ class Suggestions(OakBranch):
         self._registered_views.clear()
 
     async def _migrate_votes(self):
-        """Backfill suggestion_votes table from legacy JSON columns."""
+        """Backfill suggestion_votes table from legacy JSON columns.
+
+        Per-row try/except so a single malformed legacy payload doesn't
+        abort the whole migration and lose votes for every other suggestion.
+        """
         try:
             row = await self.db.fetchone("SELECT COUNT(*) FROM suggestion_votes")
             if row and row[0] > 0:
@@ -115,27 +119,52 @@ class Suggestions(OakBranch):
             if not rows:
                 return
 
+            def _parse_user_ids(payload: str | None) -> list[int]:
+                if not payload:
+                    return []
+                try:
+                    data = json.loads(payload)
+                except (json.JSONDecodeError, TypeError):
+                    return []
+                if not isinstance(data, list):
+                    return []
+                return [uid for uid in data if isinstance(uid, int)]
+
+            skipped = 0
             async with self.db.transaction() as conn:
                 for suggestion_id, likes_json, dislikes_json in rows:
-                    likes = json.loads(likes_json) if likes_json else []
-                    dislikes = json.loads(dislikes_json) if dislikes_json else []
+                    try:
+                        likes = _parse_user_ids(likes_json)
+                        dislikes = _parse_user_ids(dislikes_json)
+                    except Exception:
+                        skipped += 1
+                        continue
                     for user_id in likes:
                         await conn.execute(
                             "INSERT OR IGNORE INTO suggestion_votes (suggestion_id, user_id, vote_type) VALUES (?, ?, 'like')",
                             (suggestion_id, user_id),
                         )
                     for user_id in dislikes:
+                        # Skip if the user is in both lists — likes wins (it was inserted first)
                         await conn.execute(
                             "INSERT OR IGNORE INTO suggestion_votes (suggestion_id, user_id, vote_type) VALUES (?, ?, 'dislike')",
                             (suggestion_id, user_id),
                         )
-            self.log.info("Migrated suggestion votes to new table")
+            if skipped:
+                self.log.warning(f"Migrated suggestion votes (skipped {skipped} malformed rows)")
+            else:
+                self.log.info("Migrated suggestion votes to new table")
         except Exception as e:
             self.log.error(f"Failed to migrate suggestion votes: {e}", exc_info=True)
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
         if message.author.bot:
+            return
+        # Only act on guild messages in the configured suggestion channel.
+        # Explicitly reject DMs and threads — otherwise a DM whose channel.id
+        # somehow matched would have the bot try to delete a DM message.
+        if message.guild is None or isinstance(message.channel, discord.Thread):
             return
         channel_id = self.setting("channel_id", default=0)
         if message.channel.id != channel_id:
@@ -145,15 +174,22 @@ class Suggestions(OakBranch):
         min_length = self.setting("validation", "min_length", default=10)
         content = sanitize_text(message.content, max_length=max_length)
 
+        # Allow only the author's mention in notices so a forged @everyone in
+        # the suggestion content can't ride through the validation reply.
+        notice_mentions = discord.AllowedMentions(
+            users=[message.author], roles=False, everyone=False
+        )
+
         if not content:
             try:
                 await message.delete()
             except discord.HTTPException:
                 self.log.warning(f"Failed to delete empty suggestion message from {message.author}")
             try:
-                notice = await message.channel.send(
+                await message.channel.send(
                     f"{message.author.mention} {self.setting('messages', 'empty', default='Your suggestion was empty or invalid.')}",
                     delete_after=10,
+                    allowed_mentions=notice_mentions,
                 )
             except discord.HTTPException:
                 pass
@@ -165,9 +201,10 @@ class Suggestions(OakBranch):
             except discord.HTTPException:
                 self.log.warning(f"Failed to delete short suggestion message from {message.author}")
             try:
-                notice = await message.channel.send(
+                await message.channel.send(
                     f"{message.author.mention} {self.setting('messages', 'too_short', default='Your suggestion is too short.')}",
                     delete_after=10,
+                    allowed_mentions=notice_mentions,
                 )
             except discord.HTTPException:
                 pass
@@ -275,19 +312,25 @@ class Suggestions(OakBranch):
         await interaction.response.defer(ephemeral=True)
 
         try:
-            # Build query
+            # The aggregates and the legacy `suggestions.likes`/`dislikes` text
+            # columns share names; some SQLite versions resolve ORDER BY to the
+            # base column instead of the alias, which would sort lexicographically
+            # on JSON text. Use the explicit aggregate expression so the order
+            # is unambiguous regardless of resolution order.
+            like_agg = "COALESCE(SUM(CASE WHEN sv.vote_type='like' THEN 1 ELSE 0 END), 0)"
+            dislike_agg = "COALESCE(SUM(CASE WHEN sv.vote_type='dislike' THEN 1 ELSE 0 END), 0)"
             sort_map = {
-                "net": "(likes - dislikes) DESC",
-                "likes": "likes DESC",
-                "dislikes": "dislikes DESC",
+                "net": f"({like_agg} - {dislike_agg}) DESC",
+                "likes": f"{like_agg} DESC",
+                "dislikes": f"{dislike_agg} DESC",
             }
-            order_clause = sort_map.get(sort, "(likes - dislikes) DESC")
+            order_clause = sort_map.get(sort, sort_map["net"])
 
             if status != "all":
                 query = f"""
                     SELECT s.id, s.message_id, s.user_id, s.content, s.status,
-                           COALESCE(SUM(CASE WHEN sv.vote_type='like' THEN 1 ELSE 0 END), 0) AS likes,
-                           COALESCE(SUM(CASE WHEN sv.vote_type='dislike' THEN 1 ELSE 0 END), 0) AS dislikes
+                           {like_agg} AS likes,
+                           {dislike_agg} AS dislikes
                     FROM suggestions s
                     LEFT JOIN suggestion_votes sv ON sv.suggestion_id = s.id
                     WHERE s.status = ?
@@ -299,8 +342,8 @@ class Suggestions(OakBranch):
             else:
                 query = f"""
                     SELECT s.id, s.message_id, s.user_id, s.content, s.status,
-                           COALESCE(SUM(CASE WHEN sv.vote_type='like' THEN 1 ELSE 0 END), 0) AS likes,
-                           COALESCE(SUM(CASE WHEN sv.vote_type='dislike' THEN 1 ELSE 0 END), 0) AS dislikes
+                           {like_agg} AS likes,
+                           {dislike_agg} AS dislikes
                     FROM suggestions s
                     LEFT JOIN suggestion_votes sv ON sv.suggestion_id = s.id
                     GROUP BY s.id

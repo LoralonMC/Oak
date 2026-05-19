@@ -33,10 +33,18 @@ class BranchWatcher:
         if self._task is None:
             self._task = asyncio.create_task(self._poll())
 
-    def stop(self) -> None:
-        """Cancel the background polling task."""
+    async def stop(self) -> None:
+        """Cancel the polling task and wait for it to finish.
+
+        Awaiting prevents a mid-reload from being torn down on shutdown
+        while the loader is still mutating branch state.
+        """
         if self._task is not None:
             self._task.cancel()
+            try:
+                await self._task
+            except (asyncio.CancelledError, Exception):
+                pass
             self._task = None
 
     def _scan_branch(self, branch_id: str) -> dict[str, float]:
