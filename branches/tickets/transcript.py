@@ -4,6 +4,7 @@ import asyncio
 import io
 import logging
 import re
+import secrets
 from datetime import datetime, timezone
 
 import discord
@@ -383,15 +384,19 @@ async def send_transcript(
     category = ticket_data.get("category", "unknown")
     ticket_number = ticket_data.get("ticket_number")
     ticket_label = str(ticket_number) if ticket_number else str(ticket_data.get("creator_id", "unknown"))
-    filename = f"ticket-{category}-{ticket_label}.html"
+    base_filename = f"ticket-{category}-{ticket_label}.html"
 
-    # If web server is enabled, save to disk and build a URL
+    # Web URLs embed a 22-char URL-safe token so transcripts can't be enumerated
+    # by ticket number. Discord attachments keep the plain name.
     transcript_url = None
+    filename = base_filename
     if base_url and transcripts_dir:
+        token = secrets.token_urlsafe(16)
+        web_filename = f"ticket-{category}-{ticket_label}-{token}.html"
         try:
             from .web import save_transcript
-            await save_transcript(transcripts_dir, filename, buffer)
-            transcript_url = f"{base_url}/transcripts/{filename}"
+            await save_transcript(transcripts_dir, web_filename, buffer)
+            transcript_url = f"{base_url}/transcripts/{web_filename}"
         except Exception as e:
             logger.error(f"Failed to save transcript to disk: {e}", exc_info=True)
 

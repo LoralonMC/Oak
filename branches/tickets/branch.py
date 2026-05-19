@@ -111,6 +111,7 @@ class Tickets(OakBranch):
             await self.db.initialize(TICKETS_SCHEMA)
 
         await self._run_migrations()
+        await self._cleanup_orphaned_reservations()
 
         # Validate framework-provided config
         is_valid, errors = validate_config(self.config)
@@ -164,8 +165,9 @@ class Tickets(OakBranch):
 
             port = web_config.get("port", 5454)
             base_url = web_config.get("base_url", f"http://localhost:{port}")
+            bind_host = web_config.get("bind_host", "127.0.0.1")
 
-            self._transcript_server = TranscriptServer(port, base_url, self._transcripts_dir, self.log)
+            self._transcript_server = TranscriptServer(port, base_url, self._transcripts_dir, self.log, host=bind_host)
             await self._transcript_server.start()
 
         if self.anti_archive_enabled:
@@ -194,6 +196,17 @@ class Tickets(OakBranch):
                 sql="ALTER TABLE tickets ADD COLUMN transcript_message_id INTEGER"
             ),
         ])
+
+    async def _cleanup_orphaned_reservations(self):
+        """Drop ticket reservations older than 5 minutes left over from a crashed creation flow."""
+        try:
+            cursor = await self.db.execute(
+                "DELETE FROM tickets WHERE status = 'reserved' AND created_at < datetime('now', '-5 minutes')"
+            )
+            if cursor.rowcount:
+                self.log.info(f"Cleared {cursor.rowcount} orphaned ticket reservation(s)")
+        except Exception as e:
+            self.log.error(f"Failed to clean up orphaned ticket reservations: {e}")
 
     async def on_disable(self):
         """Stop background tasks and remove persistent views."""
@@ -1096,16 +1109,20 @@ class Tickets(OakBranch):
         try:
             colors = get_embed_colors(self.config)
 
-            total_row = await self.db.fetchone("SELECT COUNT(*) FROM tickets")
+            # Exclude 'reserved' rows — they're transient placeholders from
+            # in-flight ticket creation, not real tickets.
+            total_row = await self.db.fetchone(
+                "SELECT COUNT(*) FROM tickets WHERE status IN ('open', 'closed')"
+            )
             total = total_row[0]
 
             status_rows = await self.db.fetchall(
-                "SELECT status, COUNT(*) FROM tickets GROUP BY status"
+                "SELECT status, COUNT(*) FROM tickets WHERE status IN ('open', 'closed') GROUP BY status"
             )
             status_counts = {row[0]: row[1] for row in status_rows}
 
             category_rows = await self.db.fetchall(
-                "SELECT category, COUNT(*) FROM tickets GROUP BY category ORDER BY COUNT(*) DESC LIMIT 5"
+                "SELECT category, COUNT(*) FROM tickets WHERE status IN ('open', 'closed') GROUP BY category ORDER BY COUNT(*) DESC LIMIT 5"
             )
 
             avg_row = await self.db.fetchone(

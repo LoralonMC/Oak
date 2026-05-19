@@ -8,6 +8,7 @@ from sqlite3 import IntegrityError
 import asyncio
 from datetime import datetime, timedelta, timezone
 import logging
+import secrets
 import time
 from .helpers import (
     get_embed_colors,
@@ -228,72 +229,126 @@ class TicketPanelView(discord.ui.View):
             else:
                 auto_archive_duration = 1440   # 1 day
 
-            # Combine SELECT MAX + INSERT in a single transaction
-            # to prevent ticket number races
+            # Three-step ticket creation: reserve number \u2192 create thread \u2192 finalize.
+            # The Discord call must stay outside any DB transaction so the write
+            # lock isn't held during network I/O.
             thread = None
+            reservation_id = None
+            ticket_number = None
+
+            # Step 1: build thread name + (if numbered) reserve the ticket number
             try:
-                async with _db.transaction() as conn:
-                    # Generate thread name
-                    if "{number}" in naming_pattern:
+                if "{number}" in naming_pattern:
+                    # Reserve a number atomically. The row uses a random negative
+                    # placeholder thread_id (Discord IDs are always positive
+                    # snowflakes) and status='reserved' so the partial unique
+                    # index on (user_id, category, status='open') isn't tripped.
+                    async with _db.transaction() as conn:
                         ticket_number = await get_next_ticket_number(category_key, conn)
                         thread_name = naming_pattern.replace("{number}", str(ticket_number))
-                    elif "{nickname}" in naming_pattern:
-                        nickname = sanitize_name(interaction.user.display_name, interaction.user.id)
-                        thread_name = naming_pattern.replace("{nickname}", nickname)
-                        ticket_number = None
-                    elif "{username}" in naming_pattern:
-                        username = sanitize_name(interaction.user.name, interaction.user.id)
-                        thread_name = naming_pattern.replace("{username}", username)
-                        ticket_number = None
-                    else:
-                        thread_name = f"ticket-{interaction.user.id}"
-                        ticket_number = None
+                        placeholder_thread_id = -secrets.randbits(62) - 1
+                        cursor = await conn.execute(
+                            """INSERT INTO tickets
+                            (thread_id, user_id, category, ticket_number, status, created_at)
+                            VALUES (?, ?, ?, ?, 'reserved', datetime('now'))""",
+                            (placeholder_thread_id, interaction.user.id, category_key, ticket_number)
+                        )
+                        reservation_id = cursor.lastrowid
+                elif "{nickname}" in naming_pattern:
+                    nickname = sanitize_name(interaction.user.display_name, interaction.user.id)
+                    thread_name = naming_pattern.replace("{nickname}", nickname)
+                elif "{username}" in naming_pattern:
+                    username = sanitize_name(interaction.user.name, interaction.user.id)
+                    thread_name = naming_pattern.replace("{username}", username)
+                else:
+                    thread_name = f"ticket-{interaction.user.id}"
+            except IntegrityError:
+                # Concurrent ticket_number collision \u2014 vanishingly rare after MAX()
+                await interaction.followup.send(
+                    "\u274c Couldn't reserve a ticket number. Please try again.",
+                    ephemeral=True
+                )
+                return
+            except Exception as e:
+                logger.error(f"Failed to reserve ticket: {e}", exc_info=True)
+                await interaction.followup.send(
+                    "\u274c An error occurred while preparing your ticket. Please try again.",
+                    ephemeral=True
+                )
+                return
 
-                    # Create private thread
+            # Step 2: create the Discord thread \u2014 no DB lock held here
+            try:
+                thread = await channel.create_thread(
+                    name=thread_name,
+                    type=discord.ChannelType.private_thread,
+                    auto_archive_duration=auto_archive_duration,
+                    invitable=False
+                )
+            except discord.HTTPException as e:
+                logger.error(f"Failed to create thread: {e}")
+                if reservation_id is not None:
                     try:
-                        thread = await channel.create_thread(
-                            name=thread_name,
-                            type=discord.ChannelType.private_thread,
-                            auto_archive_duration=auto_archive_duration,
-                            invitable=False
+                        await _db.execute(
+                            "DELETE FROM tickets WHERE id = ? AND status = 'reserved'",
+                            (reservation_id,)
                         )
-                    except discord.HTTPException as e:
-                        logger.error(f"Failed to create thread: {e}")
-                        await interaction.followup.send(
-                            "\u26a0\ufe0f Failed to create your ticket thread. This might be due to Discord's thread limit (1000 active threads per channel). "
-                            "Please contact an administrator.",
-                            ephemeral=True
-                        )
-                        return  # transaction commits with no DB changes
+                    except Exception:
+                        logger.exception("Failed to release ticket reservation after thread error")
+                await interaction.followup.send(
+                    "\u26a0\ufe0f Failed to create your ticket thread. This might be due to Discord's thread limit (1000 active threads per channel). "
+                    "Please contact an administrator.",
+                    ephemeral=True
+                )
+                return
 
-                    # Insert ticket record atomically with number generation
-                    await conn.execute(
+            # Step 3: finalize \u2014 promote the reservation, or insert if unnumbered
+            try:
+                if reservation_id is not None:
+                    await _db.execute(
+                        "UPDATE tickets SET thread_id = ?, status = 'open' WHERE id = ?",
+                        (thread.id, reservation_id)
+                    )
+                else:
+                    await _db.execute(
                         """INSERT INTO tickets
                         (thread_id, user_id, category, ticket_number, status, created_at)
-                        VALUES (?, ?, ?, ?, 'open', datetime('now'))""",
-                        (thread.id, interaction.user.id, category_key, ticket_number)
+                        VALUES (?, ?, ?, NULL, 'open', datetime('now'))""",
+                        (thread.id, interaction.user.id, category_key)
                     )
-
             except IntegrityError:
-                # Race condition - user created ticket between check and creation
-                if thread:
+                # Race condition - user created another open ticket in the meantime
+                try:
+                    await thread.delete(reason="Duplicate ticket (race condition)")
+                except discord.HTTPException:
+                    pass
+                if reservation_id is not None:
                     try:
-                        await thread.delete(reason="Duplicate ticket (race condition)")
-                    except discord.HTTPException:
-                        pass
+                        await _db.execute(
+                            "DELETE FROM tickets WHERE id = ? AND status = 'reserved'",
+                            (reservation_id,)
+                        )
+                    except Exception:
+                        logger.exception("Failed to release ticket reservation after duplicate")
                 await interaction.followup.send(
                     "\u274c You already have an open ticket in this category. Please try again.",
                     ephemeral=True
                 )
                 return
             except Exception as e:
-                # DB operation failed - clean up orphaned thread if it was created
                 logger.error(f"DB operation failed for ticket: {e}", exc_info=True)
-                if thread:
+                try:
+                    await thread.delete(reason="Orphan cleanup: DB operation failed")
+                except discord.HTTPException:
+                    pass
+                if reservation_id is not None:
                     try:
-                        await thread.delete(reason="Orphan cleanup: DB operation failed")
-                    except discord.HTTPException:
-                        pass
+                        await _db.execute(
+                            "DELETE FROM tickets WHERE id = ? AND status = 'reserved'",
+                            (reservation_id,)
+                        )
+                    except Exception:
+                        logger.exception("Failed to release ticket reservation after DB error")
                 await interaction.followup.send(
                     "\u274c An error occurred while saving your ticket. Please try again.",
                     ephemeral=True

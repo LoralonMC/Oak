@@ -318,9 +318,19 @@ class DeclineReasonModal(Modal):
         delete_delay = denial_config.get("delete_delay_seconds", 10)
 
         applicant = interaction.guild.get_member(self.applicant_id)
-        dm_sent = False
 
-        # DM the user
+        # Claim the denial atomically BEFORE sending the DM so two reviewers
+        # can't both DM conflicting decisions for the same application.
+        cursor = await _db.execute(
+            "UPDATE applications SET status = 'denied', denied_at = datetime('now'), denial_dm_sent = 0, denial_reason = ? WHERE channel_id = ? AND status = 'pending'",
+            (raw_reason, interaction.channel.id)
+        )
+        if cursor.rowcount == 0:
+            await interaction.followup.send("This application was already processed.", ephemeral=True)
+            return
+
+        # DM the user — we won the claim, so this is safe to send
+        dm_sent = False
         if applicant:
             try:
                 await applicant.send(
@@ -338,14 +348,15 @@ class DeclineReasonModal(Modal):
             except discord.Forbidden:
                 pass  # DM failed
 
-        # Update database with denial info (store raw reason for DB, display sanitized)
-        cursor = await _db.execute(
-            "UPDATE applications SET status = 'denied', denied_at = datetime('now'), denial_dm_sent = ?, denial_reason = ? WHERE channel_id = ? AND status = 'pending'",
-            (1 if dm_sent else 0, raw_reason, interaction.channel.id)
-        )
-        if cursor.rowcount == 0:
-            await interaction.followup.send("This application was already processed.", ephemeral=True)
-            return
+        # Record whether the DM landed (best-effort — the claim is already committed)
+        if dm_sent:
+            try:
+                await _db.execute(
+                    "UPDATE applications SET denial_dm_sent = 1 WHERE channel_id = ?",
+                    (interaction.channel.id,)
+                )
+            except Exception as e:
+                logger.error(f"Failed to record denial_dm_sent: {e}")
 
         # Public message in the channel
         await interaction.channel.send(

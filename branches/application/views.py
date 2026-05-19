@@ -83,22 +83,46 @@ class ContinueView(View):
     async def continue_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         from .modals import ApplicationModal
 
+        # Verify the clicking user is the applicant for this channel
+        if _db:
+            try:
+                row = await _db.fetchone(
+                    "SELECT user_id, answers FROM applications WHERE channel_id = ?",
+                    (interaction.channel.id,)
+                )
+            except Exception as e:
+                logger.error(f"Failed to load application for continue button: {e}")
+                await interaction.response.send_message(
+                    "Could not load application data. Please try again.", ephemeral=True
+                )
+                return
+
+            if not row:
+                await interaction.response.send_message(
+                    "No application data found for this channel.", ephemeral=True
+                )
+                return
+
+            applicant_id, answers_json = row
+            if interaction.user.id != applicant_id:
+                await interaction.response.send_message(
+                    "Only the applicant can continue this application.", ephemeral=True
+                )
+                return
+        else:
+            answers_json = None
+
         step = self.step
         answers = self.answers
 
         # Post-restart recovery: answers may be empty after bot restart
-        if not answers and _db:
+        if not answers and answers_json:
             try:
-                row = await _db.fetchone(
-                    "SELECT answers FROM applications WHERE channel_id = ?",
-                    (interaction.channel.id,)
-                )
-                if row and row[0]:
-                    answers = json.loads(row[0])
-                    questions_per_page = 5
-                    step = len(answers) // questions_per_page
-                    logger.info(f"Recovered {len(answers)} partial answers from DB, resuming at step {step}")
-            except Exception as e:
+                answers = json.loads(answers_json)
+                questions_per_page = 5
+                step = len(answers) // questions_per_page
+                logger.info(f"Recovered {len(answers)} partial answers from DB, resuming at step {step}")
+            except (json.JSONDecodeError, TypeError) as e:
                 logger.error(f"Failed to recover partial answers from DB: {e}")
 
         await interaction.response.send_modal(
@@ -776,6 +800,23 @@ class StartCancelView(View):
     @button(label="Start Application", style=discord.ButtonStyle.green, custom_id="start_application")
     async def start(self, interaction: discord.Interaction, button: discord.ui.Button):
         from .modals import ApplicationModal
+
+        # Verify the clicking user is the applicant for this channel
+        row = await _db.fetchone(
+            "SELECT user_id FROM applications WHERE channel_id = ?",
+            (interaction.channel.id,)
+        )
+        if not row:
+            await interaction.response.send_message(
+                "No application data found for this channel.", ephemeral=True
+            )
+            return
+        if interaction.user.id != row[0]:
+            await interaction.response.send_message(
+                "Only the applicant can start this application.", ephemeral=True
+            )
+            return
+
         await interaction.response.send_modal(
             ApplicationModal(step=0, answers=[])
         )

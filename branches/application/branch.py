@@ -14,7 +14,8 @@ from oak.database import Migration
 # Import our modularized components
 from .helpers import (
     get_application_questions,
-    get_embed_colors
+    get_embed_colors,
+    is_staff,
 )
 from .views import (
     configure as configure_views,
@@ -332,6 +333,7 @@ class Application(OakBranch):
 
         # Application button view
         self._application_button_view = ApplicationButtonView(handle_application_start_func=handle_application_start)
+        self._registered_views: list = []
 
         self.log.info("Application branch initialized")
 
@@ -396,18 +398,25 @@ class Application(OakBranch):
                 f"abandon_after_days ({abandon_days}) must be greater than warning_after_days ({warning_days})"
             )
 
-        # Register persistent views (both legacy and namespaced)
+        # Register persistent views (both legacy and namespaced).
+        # Track them so on_disable() can stop their callbacks on /reload —
+        # otherwise stale closures keep pointing at the old DB/config refs.
         self.log.info("Registering persistent views for Application")
-        self.bot.add_view(ApplicationButtonView(handle_application_start_func=handle_application_start, legacy=True))
-        self.bot.add_view(self._application_button_view)
-        self.bot.add_view(StartCancelView(legacy=True))
-        self.bot.add_view(StartCancelView())
-        self.bot.add_view(ContinueView(legacy=True))
-        self.bot.add_view(ContinueView())
-        self.bot.add_view(PostSubmissionView(legacy=True))
-        self.bot.add_view(PostSubmissionView())
-        self.bot.add_view(ManageView(legacy=True))
-        self.bot.add_view(ManageView())
+        app_button_legacy = ApplicationButtonView(handle_application_start_func=handle_application_start, legacy=True)
+        self._registered_views = [
+            app_button_legacy,
+            self._application_button_view,
+            StartCancelView(legacy=True),
+            StartCancelView(),
+            ContinueView(legacy=True),
+            ContinueView(),
+            PostSubmissionView(legacy=True),
+            PostSubmissionView(),
+            ManageView(legacy=True),
+            ManageView(),
+        ]
+        for view in self._registered_views:
+            self.bot.add_view(view)
 
         # Start inactivity check task if enabled
         inactivity_config = self.config.get("settings", {}).get("inactivity", {})
@@ -419,9 +428,12 @@ class Application(OakBranch):
             self.log.info(f"Inactivity check task started (interval: {check_interval} hours)")
 
     async def on_disable(self):
-        """Stop background tasks when branch is unloaded."""
+        """Stop background tasks and tear down persistent views on unload."""
         if self.check_inactive_applications.is_running():
             self.check_inactive_applications.cancel()
+        for view in self._registered_views:
+            view.stop()
+        self._registered_views.clear()
         self.log.info("Application branch unloaded")
 
     async def on_ready(self):
@@ -430,16 +442,14 @@ class Application(OakBranch):
         self.log.info("Application branch ready")
 
     @app_commands.command(name="appstats", description="Show application statistics")
-    @app_commands.default_permissions(administrator=True)
     async def application_stats(self, interaction: discord.Interaction):
         """Show application statistics (Staff only)"""
         try:
             colors = get_embed_colors(self.config)
             # Check permissions
             reviewer_role_ids = self.config.get("settings", {}).get("reviewer_role_ids", [])
-            user_role_ids = [role.id for role in interaction.user.roles]
 
-            if not any(role_id in reviewer_role_ids for role_id in user_role_ids):
+            if not is_staff(interaction.user, reviewer_role_ids):
                 await interaction.response.send_message(
                     embed=discord.Embed(
                         description="You don't have permission to use this command.",
@@ -494,7 +504,6 @@ class Application(OakBranch):
             await interaction.response.send_message("Failed to retrieve statistics.", ephemeral=True)
 
     @app_commands.command(name="apphistory", description="View a user's application history")
-    @app_commands.default_permissions(administrator=True)
     @app_commands.describe(user="The user whose application history you want to view")
     async def application_history(self, interaction: discord.Interaction, user: discord.Member):
         """View a user's application history (Staff only)"""
@@ -504,9 +513,8 @@ class Application(OakBranch):
             colors = get_embed_colors(self.config)
             # Check permissions
             reviewer_role_ids = self.config.get("settings", {}).get("reviewer_role_ids", [])
-            user_role_ids = [role.id for role in interaction.user.roles]
 
-            if not any(role_id in reviewer_role_ids for role_id in user_role_ids):
+            if not is_staff(interaction.user, reviewer_role_ids):
                 await interaction.response.send_message(
                     embed=discord.Embed(
                         description="You don't have permission to use this command.",

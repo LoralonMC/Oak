@@ -261,11 +261,13 @@ settings:
     log_channel: true            # Post transcript to the log channel
     dm_creator: false            # DM the transcript to the ticket creator
 
-    # Web server — serves transcripts as hosted links instead of file attachments
-    # Requires aiohttp. Set base_url to your reverse-proxied domain.
+    # Web server — serves transcripts as hosted links instead of file attachments.
+    # Requires aiohttp. URLs include an unguessable token so they can't be enumerated.
+    # Set base_url to your reverse-proxied domain.
     web:
       enabled: false
       port: 5454                 # Bind port (default: 5454)
+      bind_host: "127.0.0.1"     # Listen address; use "0.0.0.0" only behind a trusted reverse proxy
       base_url: "http://localhost:5454"  # Override with your domain when using a reverse proxy
 
   # UI colors

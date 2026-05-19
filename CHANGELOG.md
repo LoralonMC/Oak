@@ -6,6 +6,58 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Security
+
+- **Application**: Start/Continue application buttons now verify that the
+  clicking user is the applicant for the channel, so a stray reviewer or
+  anyone else who can see the channel can't submit answers on someone else's
+  behalf.
+- **Tickets**: Hosted transcript URLs now embed an unguessable 22-character
+  token in the filename, so transcripts can no longer be enumerated by ticket
+  number. The transcript web server also defaults to binding `127.0.0.1`
+  (set `transcript.web.bind_host` to override) instead of all interfaces.
+
+### Changed
+
+- **Tickets**: Ticket creation no longer holds the SQLite write lock during
+  the Discord thread-creation API call. Numbered tickets now use a three-step
+  reserve → create thread → finalize flow, and orphaned reservations from
+  crashed runs are cleared on branch startup.
+- **Application**: Decline modal now claims the denial in the database before
+  sending the DM, so two reviewers can't both DM conflicting decisions for the
+  same application.
+- **Application**: `appstats` and `apphistory` now accept Discord
+  administrators as well as configured reviewer roles, matching the
+  `default_permissions(administrator=True)` already on those commands.
+- **Economy**: API calls now build query strings via aiohttp's `params=` and
+  URL-encode path segments with `urllib.parse.quote`, so user-supplied values
+  (item, query, player, currency) can't break the URL or override parameters.
+
+### Fixed
+
+- Framework: `/enable` and successful `load_branch()` now clear stale entries
+  from `_skipped` and `_load_failures`, so `/branches` and `/health` no longer
+  report a freshly-loaded branch as disabled or failed.
+- **Application**: `on_disable()` now stops every persistent view it
+  registered, so `/reload` no longer leaves stale view callbacks pointing at
+  the old module globals or a closed DB.
+- **Suggestions**: Added `on_disable()` to stop registered `SuggestionVoteView`
+  instances on unload/reload, matching the tickets/application pattern.
+- **Tickets**: `/ticketstats` now filters out `status='reserved'` rows so
+  transient in-flight reservations don't briefly inflate totals or appear as
+  a phantom status bucket.
+- **Application**: Removed `default_permissions(administrator=True)` from
+  `/appstats` and `/apphistory` — the decorator hid the commands from
+  non-admin reviewers in Discord's UI even though the runtime `is_staff()`
+  check would have let them through. Permissions are now enforced solely at
+  runtime.
+
+### Added
+
+- **Tickets**: New `transcript.web.bind_host` config option (defaults to
+  `"127.0.0.1"`) so the transcript server's listen address is discoverable
+  in `config.yml`.
+
 ## [2.0.0] - 2026-02-20
 
 Complete architectural rewrite to the Oak framework. All branches now use centralized

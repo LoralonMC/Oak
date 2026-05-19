@@ -11,8 +11,9 @@ logger = logging.getLogger(__name__)
 class TranscriptServer:
     """Lightweight aiohttp server that serves transcript HTML files."""
 
-    def __init__(self, port: int, base_url: str, transcripts_dir: Path, server_logger: logging.Logger):
+    def __init__(self, port: int, base_url: str, transcripts_dir: Path, server_logger: logging.Logger, host: str = "127.0.0.1"):
         self.port = port
+        self.host = host
         self.base_url = base_url.rstrip("/")
         self.transcripts_dir = transcripts_dir
         self.log = server_logger
@@ -26,9 +27,9 @@ class TranscriptServer:
         self._runner = web.AppRunner(app, access_log=None)
         await self._runner.setup()
 
-        site = web.TCPSite(self._runner, "0.0.0.0", self.port)
+        site = web.TCPSite(self._runner, self.host, self.port)
         await site.start()
-        self.log.info(f"Transcript web server listening on port {self.port}")
+        self.log.info(f"Transcript web server listening on {self.host}:{self.port}")
 
     async def stop(self) -> None:
         """Gracefully shut down the server."""

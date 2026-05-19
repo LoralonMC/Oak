@@ -74,6 +74,7 @@ class Suggestions(OakBranch):
 
     def __init__(self, ctx: BranchContext):
         super().__init__(ctx)
+        self._registered_views: list = []
 
     async def on_enable(self) -> None:
         if self.db:
@@ -91,9 +92,17 @@ class Suggestions(OakBranch):
         if not manager_role_ids or manager_role_ids == [0]:
             self.log.warning("manager_role_ids is empty or placeholder — suggestion management will not work")
 
+        # Track views so on_disable() can stop their callbacks on /reload
         self.log.info("Registering SuggestionVoteView for persistent interactions")
-        self.bot.add_view(SuggestionVoteView(legacy=True))
-        self.bot.add_view(SuggestionVoteView())
+        self._registered_views = [SuggestionVoteView(legacy=True), SuggestionVoteView()]
+        for view in self._registered_views:
+            self.bot.add_view(view)
+
+    async def on_disable(self) -> None:
+        """Stop persistent views so stale callbacks don't survive a /reload."""
+        for view in self._registered_views:
+            view.stop()
+        self._registered_views.clear()
 
     async def _migrate_votes(self):
         """Backfill suggestion_votes table from legacy JSON columns."""

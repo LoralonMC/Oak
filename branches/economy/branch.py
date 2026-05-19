@@ -61,7 +61,7 @@ class Economy(OakBranch):
         self._cache_default_ttl = self.setting("cache", "default_ttl", default=30)
         self._cache_overview_ttl = self.setting("cache", "overview_ttl", default=60)
         self._session: aiohttp.ClientSession | None = None
-        self._api_cache: dict[str, tuple[float, dict]] = {}
+        self._api_cache: dict[tuple, tuple[float, dict]] = {}
 
     async def on_enable(self):
         self._session = aiohttp.ClientSession()
@@ -77,32 +77,50 @@ class Economy(OakBranch):
     # API Client
     # ------------------------------------------------------------------
 
-    async def api_get(self, endpoint: str, ttl: int | None = None) -> dict | None:
+    async def api_get(
+        self,
+        path: str,
+        params: dict | None = None,
+        ttl: int | None = None,
+    ) -> dict | None:
         """GET request to OakheartWeb API with in-memory caching.
 
-        Returns parsed JSON or None on error. The `ttl` arg overrides the
-        default cache TTL — pass `self._cache_overview_ttl` for slow-changing
+        ``path`` is the endpoint path (e.g. ``"item/diamond"``); user-supplied
+        path segments must be URL-encoded by the caller via
+        ``urllib.parse.quote(value, safe="")``. ``params`` is sent as the query
+        string so aiohttp handles encoding — never interpolate raw user input
+        into the path or query.
+
+        Returns parsed JSON or None on error. The ``ttl`` arg overrides the
+        default cache TTL — pass ``self._cache_overview_ttl`` for slow-changing
         endpoints like overview / trending / anomalies.
         """
         if not self._session or not self.api_url:
             return None
         cache_ttl = ttl if ttl is not None else self._cache_default_ttl
+        # Cache key includes params so different queries don't collide
+        cache_key = (path, tuple(sorted(params.items())) if params else ())
         now = time.monotonic()
-        cached = self._api_cache.get(endpoint)
+        cached = self._api_cache.get(cache_key)
         if cached and (now - cached[0]) < cache_ttl:
             return cached[1]
         try:
-            url = f"{self.api_url}/api/economy/{endpoint}"
+            url = f"{self.api_url}/api/economy/{path}"
             headers = {"Authorization": f"Bearer {self.api_key}"}
-            async with self._session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            async with self._session.get(
+                url,
+                headers=headers,
+                params=params,
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    self._api_cache[endpoint] = (now, data)
+                    self._api_cache[cache_key] = (now, data)
                     return data
-                self.log.warning(f"API {resp.status}: {endpoint}")
+                self.log.warning(f"API {resp.status}: {path}")
                 return None
         except Exception as e:
-            self.log.error(f"API error ({endpoint}): {e}")
+            self.log.error(f"API error ({path}): {e}")
             return None
 
     # ------------------------------------------------------------------
@@ -186,7 +204,7 @@ class Economy(OakBranch):
         try:
             if not current.strip():
                 return []
-            data = await self.api_get(f"search?q={current}&limit=25")
+            data = await self.api_get("search", params={"q": current, "limit": 25})
             if not data or not data.get("results"):
                 return []
             choices = []
@@ -213,7 +231,7 @@ class Economy(OakBranch):
         await interaction.response.defer(ephemeral=not public)
         p = period if period is not None else self.default_period
 
-        data = await self.api_get(f"overview?period={p}", ttl=self._cache_overview_ttl)
+        data = await self.api_get("overview", params={"period": p}, ttl=self._cache_overview_ttl)
         if not data:
             await interaction.followup.send("Could not fetch economy data.", ephemeral=True)
             return
@@ -253,7 +271,7 @@ class Economy(OakBranch):
         await interaction.response.defer(ephemeral=not public)
         p = period if period is not None else self.default_period
 
-        data = await self.api_get(f"item/{item}?period={p}")
+        data = await self.api_get(f"item/{urllib.parse.quote(item, safe='')}", params={"period": p})
         if not data:
             await interaction.followup.send(f"No data found for **{item[:100]}**.", ephemeral=True)
             return
@@ -291,7 +309,10 @@ class Economy(OakBranch):
         await interaction.response.defer(ephemeral=not public)
         p = period if period is not None else self.default_period
 
-        data = await self.api_get(f"top-{category}?period={p}&limit=50")
+        data = await self.api_get(
+            f"top-{urllib.parse.quote(category, safe='')}",
+            params={"period": p, "limit": 50},
+        )
         if not data:
             await interaction.followup.send("Could not fetch leaderboard data.", ephemeral=True)
             return
@@ -336,7 +357,7 @@ class Economy(OakBranch):
         """Search for items by name or key."""
         await interaction.response.defer(ephemeral=not public)
 
-        data = await self.api_get(f"search?q={query}&limit=25")
+        data = await self.api_get("search", params={"q": query, "limit": 25})
         if not data or not data.get("results"):
             await interaction.followup.send(f"No items found matching **{query[:100]}**.", ephemeral=True)
             return
@@ -369,7 +390,7 @@ class Economy(OakBranch):
 
         # We need the UUID — for now pass the name and let the portal-side resolve it
         # The API uses UUID, so this is a limitation until we add name→UUID resolution
-        data = await self.api_get(f"player/{name}?period={p}")
+        data = await self.api_get(f"player/{urllib.parse.quote(name, safe='')}", params={"period": p})
         if not data or not data.get("tradeCount"):
             await interaction.followup.send(f"No trade data found for **{name[:100]}**.", ephemeral=True)
             return
@@ -409,7 +430,11 @@ class Economy(OakBranch):
         await interaction.response.defer(ephemeral=not public)
         p = period if period is not None else self.default_period
 
-        data = await self.api_get(f"currency/{currency}/flow?period={p}", ttl=self._cache_overview_ttl)
+        data = await self.api_get(
+            f"currency/{urllib.parse.quote(currency, safe='')}/flow",
+            params={"period": p},
+            ttl=self._cache_overview_ttl,
+        )
         if not data:
             await interaction.followup.send("Could not fetch currency flow data.", ephemeral=True)
             return
@@ -472,7 +497,10 @@ class Economy(OakBranch):
         p = period if period is not None else self.default_period
 
         if crate_type:
-            data = await self.api_get(f"crates/item/{crate_type}?period={p}")
+            data = await self.api_get(
+                f"crates/item/{urllib.parse.quote(crate_type, safe='')}",
+                params={"period": p},
+            )
             if not data:
                 await interaction.followup.send(f"No data for crate type **{crate_type[:100]}**.", ephemeral=True)
                 return
@@ -494,7 +522,7 @@ class Economy(OakBranch):
             embed.set_footer(text=self._period_label(p))
             await interaction.followup.send(embed=embed, ephemeral=not public)
         else:
-            data = await self.api_get(f"crates/overview?period={p}")
+            data = await self.api_get("crates/overview", params={"period": p})
             if not data:
                 await interaction.followup.send("Could not fetch crate data.", ephemeral=True)
                 return
@@ -534,7 +562,7 @@ class Economy(OakBranch):
         await interaction.response.defer(ephemeral=not public)
         limit = max(1, min(limit, 100))
 
-        data = await self.api_get(f"recent?limit={limit}")
+        data = await self.api_get("recent", params={"limit": limit})
         if not data:
             await interaction.followup.send("Could not fetch recent trades.", ephemeral=True)
             return
@@ -626,8 +654,7 @@ class Economy(OakBranch):
         """Show shops owned by a specific player."""
         await interaction.response.defer(ephemeral=not public)
 
-        encoded = urllib.parse.quote(name)
-        data = await self.api_get(f"player-shops?player={encoded}")
+        data = await self.api_get("player-shops", params={"player": name})
         if not data:
             await interaction.followup.send(f"Could not fetch shops for **{name[:100]}**.", ephemeral=True)
             return

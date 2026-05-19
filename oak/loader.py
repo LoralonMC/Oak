@@ -276,6 +276,9 @@ class BranchLoader:
             raise BranchLoadError(branch_id, f"add_cog/on_enable failed: {e}") from e
 
         self._loaded[branch_id] = instance
+        # Clear any stale skip/failure state so /health and /branches reflect reality
+        self._skipped.discard(branch_id)
+        self._load_failures.pop(branch_id, None)
         logger.info(f"Loaded branch: {manifest.name} v{manifest.version}")
 
         return instance

@@ -145,13 +145,20 @@ def paginate_application_embed(applicant, answers, questions: list, colors: dict
 def is_staff(member, reviewer_role_ids: list) -> bool:
     """Check if member has application reviewer permissions.
 
+    Discord administrators always pass — `appstats`/`apphistory` are exposed
+    via `default_permissions(administrator=True)`, so the runtime check needs
+    to honor that or admins get told they lack permission.
+
     Args:
         member: Discord member
         reviewer_role_ids: List of reviewer role IDs
 
     Returns:
-        True if member has reviewer permissions
+        True if member is an administrator or holds a reviewer role
     """
+    perms = getattr(member, "guild_permissions", None)
+    if perms is not None and perms.administrator:
+        return True
     return any(role.id in reviewer_role_ids for role in getattr(member, "roles", []))
 
 
