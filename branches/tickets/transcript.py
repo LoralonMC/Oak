@@ -417,19 +417,9 @@ async def send_transcript(
         except Exception as e:
             logger.error(f"Failed to save transcript to disk: {e}", exc_info=True)
 
-    # Record the on-disk filename so the cleanup task can distinguish
-    # active transcripts from orphans even if the Discord send below fails.
-    if saved_filename:
-        try:
-            await db.execute(
-                "UPDATE tickets SET transcript_filename = ? WHERE thread_id = ?",
-                (saved_filename, thread.id),
-            )
-        except Exception as e:
-            logger.error(f"Failed to record transcript_filename: {e}")
-
     # Post to log channel
     transcript_message_id = None
+    log_delivered = False
     if log_to_channel:
         log_channel_id = settings.get("log_channel_id", 0)
         if log_channel_id:
@@ -452,6 +442,7 @@ async def send_transcript(
                             file=file,
                         )
                     transcript_message_id = msg.id
+                    log_delivered = True
                 except discord.HTTPException as e:
                     logger.error(f"Failed to send transcript to log channel: {e}")
 
@@ -466,6 +457,7 @@ async def send_transcript(
             logger.error(f"Failed to save transcript_message_id: {e}")
 
     # DM creator
+    dm_delivered = False
     if dm_creator:
         creator_id = ticket_data.get("creator_id")
         if creator_id:
@@ -490,9 +482,33 @@ async def send_transcript(
                         content=f"Here is the transcript for your ticket ({thread.name}):",
                         file=file,
                     )
+                dm_delivered = True
             except discord.Forbidden:
                 logger.warning(f"Could not DM transcript to user {creator_id} — DMs disabled")
             except discord.HTTPException as e:
                 logger.error(f"Failed to DM transcript to user {creator_id}: {e}")
             except Exception as e:
                 logger.error(f"Error sending transcript DM: {e}")
+
+    # Final accounting for the saved-to-disk web copy. Only record the
+    # filename in the DB if at least one delivery actually landed —
+    # otherwise no one received the link, and the file is orphaned by
+    # definition. Delete it immediately rather than relying on retention.
+    if saved_filename:
+        if log_delivered or dm_delivered:
+            try:
+                await db.execute(
+                    "UPDATE tickets SET transcript_filename = ? WHERE thread_id = ?",
+                    (saved_filename, thread.id),
+                )
+            except Exception as e:
+                logger.error(f"Failed to record transcript_filename: {e}")
+        else:
+            logger.warning(
+                f"No delivery path succeeded for transcript {saved_filename}; "
+                "removing orphan file"
+            )
+            try:
+                (transcripts_dir / saved_filename).unlink()
+            except OSError as e:
+                logger.error(f"Failed to remove orphan transcript {saved_filename}: {e}")

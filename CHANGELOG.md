@@ -135,6 +135,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Tickets**: Transcript on-disk filename is now recorded in the DB
+  only after at least one Discord delivery succeeds; if every delivery
+  path fails, the saved HTML is deleted immediately rather than left
+  on disk for retention pruning. Previous fix recorded the filename
+  too eagerly and would have kept truly-orphan files referenced
+  forever.
+- Framework: `BranchWatcher` now sets a `_stopping` flag and shields
+  in-flight reloads with `asyncio.shield`, so shutdown cancellation
+  can't interrupt the loader while it's mutating branch state. The
+  prior change only awaited the cancelled task, which doesn't prevent
+  cancellation from cutting through the reload mid-flight.
 - Framework: `reload_branch()` failures now record the error in
   `_load_failures`, so `/branches` and `/health` show the broken state
   instead of treating the branch as cleanly absent.
