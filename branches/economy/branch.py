@@ -4,6 +4,7 @@ Thin API client for OakheartWeb economy data. All data comes from the plugin's
 REST API — no local database.
 """
 
+import asyncio
 import time
 import urllib.parse
 from collections import OrderedDict
@@ -92,6 +93,7 @@ class Economy(OakBranch):
         path: str,
         params: dict | None = None,
         ttl: int | None = None,
+        timeout: float = 10.0,
     ) -> dict | None:
         """GET request to OakheartWeb API with in-memory caching.
 
@@ -100,6 +102,11 @@ class Economy(OakBranch):
         ``urllib.parse.quote(value, safe="")``. ``params`` is sent as the query
         string so aiohttp handles encoding — never interpolate raw user input
         into the path or query.
+
+        ``timeout`` is the total request budget in seconds. Autocomplete must
+        pass a short value (≤ 2s) — Discord invalidates the interaction after
+        ~3s, so anything longer means the autocomplete reply gets a 404
+        ``Unknown interaction`` even when the API does eventually answer.
 
         Returns parsed JSON or None on error. The ``ttl`` arg overrides the
         default cache TTL — pass ``self._cache_overview_ttl`` for slow-changing
@@ -123,7 +130,7 @@ class Economy(OakBranch):
                 url,
                 headers=headers,
                 params=params,
-                timeout=aiohttp.ClientTimeout(total=10),
+                timeout=aiohttp.ClientTimeout(total=timeout),
             ) as resp:
                 if resp.status == 200:
                     data = await resp.json()
@@ -136,6 +143,10 @@ class Economy(OakBranch):
                     return data
                 self.log.warning(f"API {resp.status}: {path}")
                 return None
+        except asyncio.TimeoutError:
+            # aiohttp's TimeoutError has an empty str(); make the log useful.
+            self.log.warning(f"API timeout ({path}) after {timeout:.1f}s")
+            return None
         except Exception as e:
             # Log type + message separately so a future ContentTypeError with
             # an echoed Authorization header in the body doesn't leak via the
@@ -220,11 +231,23 @@ class Economy(OakBranch):
     async def item_autocomplete(
         self, interaction: discord.Interaction, current: str
     ) -> list[app_commands.Choice[str]]:
-        """Autocomplete for item searches via OakheartWeb API."""
+        """Autocomplete for item searches via OakheartWeb API.
+
+        Discord invalidates an autocomplete interaction after ~3 seconds.
+        We use a short API timeout and skip caching (ttl=0) so a stale slow
+        response never blocks fresh keystrokes — if the API is unhealthy,
+        autocomplete silently returns no suggestions rather than spamming
+        "Unknown interaction" 404s.
+        """
         try:
             if not current.strip():
                 return []
-            data = await self.api_get("search", params={"q": current, "limit": 25})
+            data = await self.api_get(
+                "search",
+                params={"q": current, "limit": 25},
+                ttl=0,
+                timeout=2.0,
+            )
             if not data or not data.get("results"):
                 return []
             choices = []
