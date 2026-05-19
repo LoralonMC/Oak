@@ -1,0 +1,6 @@
+id: economy
+name: Economy
+version: "1.0.0"
+description: Economy dashboard powered by OakheartWeb API
+main: branch.Economy
+database: false

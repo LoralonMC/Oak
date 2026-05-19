@@ -1,5 +1,5 @@
 """
-Shopkeepers Views
+Economy Views
 Re-exports the framework PaginatedEmbedView for branch use.
 """
 
