@@ -1,0 +1,6 @@
+id: vote_reminders
+name: Vote Reminders
+version: "1.0.0"
+description: Daily reminder ping for voting at a configured channel and time
+main: branch.VoteReminders
+database: false

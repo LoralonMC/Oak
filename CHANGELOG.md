@@ -57,6 +57,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Vote Reminders**: New branch that posts a daily vote reminder embed in
+  a configured channel at a configured UTC time, pinging a subscriber role.
+  Includes an admin-only `/votereminder` command to post on demand for
+  testing or ad-hoc pushes.
 - **Tickets**: New `transcript.web.bind_host` config option (defaults to
   `"127.0.0.1"`) so the transcript server's listen address is discoverable
   in `config.yml`.
