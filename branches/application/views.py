@@ -184,7 +184,7 @@ class PostSubmissionView(View):
                     ephemeral=True,
                 )
             else:
-                view = PaginatedEmbedView(embeds, author_id=interaction.user.id)
+                view = PaginatedEmbedView(embeds, author_id=interaction.user.id, timeout=900)
                 await interaction.response.send_message(embed=embeds[0], view=view, ephemeral=True)
                 view.message = await interaction.original_response()
 
@@ -702,7 +702,7 @@ class ApplicationHistoryView(View):
                 ephemeral=True,
             )
         else:
-            view = PaginatedEmbedView(embeds, author_id=interaction.user.id)
+            view = PaginatedEmbedView(embeds, author_id=interaction.user.id, timeout=900)
             await interaction.response.send_message(embed=embeds[0], view=view, ephemeral=True)
             view.message = await interaction.original_response()
 

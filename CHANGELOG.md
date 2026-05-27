@@ -51,6 +51,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   non-admin reviewers in Discord's UI even though the runtime `is_staff()`
   check would have let them through. Permissions are now enforced solely at
   runtime.
+- **Application**: Bumped the paginated-application view timeout from 3
+  minutes to 15 minutes so reviewers reading long applications don't lose
+  the Next button while they're still reading.
 
 ### Added
 
