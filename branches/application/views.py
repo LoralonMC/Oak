@@ -911,6 +911,33 @@ class ApplicationButtonView(View):
         user_id = interaction.user.id
         colors = get_embed_colors(_config)
 
+        # Gate: require a linked Minecraft account (the role DiscordSRV assigns
+        # on link) before an application can be started. Rejected here, before a
+        # channel is created, with guidance on how to link.
+        required_link_role_id = _config.get("settings", {}).get("required_link_role_id", 0)
+        if required_link_role_id and not any(
+            getattr(r, "id", None) == required_link_role_id
+            for r in getattr(interaction.user, "roles", [])
+        ):
+            link_title, link_description = get_message(
+                _config,
+                "link_required",
+                "Link Your Minecraft Account First",
+                (
+                    "You need to link your Minecraft account before you can apply.\n\n"
+                    "Run `/discord link` in-game and follow the instructions, then come back and click Apply."
+                ),
+            )
+            await interaction.response.send_message(
+                embed=discord.Embed(
+                    title=link_title,
+                    description=link_description,
+                    color=colors["warning"]
+                ),
+                ephemeral=True
+            )
+            return
+
         # Prevent race condition
         if user_id in ApplicationButtonView._creating_users:
             await interaction.response.send_message(

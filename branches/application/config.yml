@@ -102,6 +102,7 @@ settings:
         Interested in becoming staff? Click below to start your application!
 
         **Requirements:**
+        - A linked Minecraft account (use /discord link in-game)
         - Be an active member of the community
         - Have a good understanding of server rules
         - Be willing to help other players
@@ -128,6 +129,12 @@ settings:
         **Reason:** {reason}
 
         We encourage you to continue contributing to the community and consider reapplying in the future.
+    link_required:
+      title: "Link Your Minecraft Account First"
+      description: |
+        You need to link your Minecraft account before you can apply.
+
+        Run `/discord link` in-game and follow the instructions, then come back and click Apply.
 
   # MySQL/Plan Database (for background checks - playtime stats)
   # Set enabled to false if you don't use MySQL/Plan

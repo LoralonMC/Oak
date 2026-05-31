@@ -12,6 +12,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   clicking user is the applicant for the channel, so a stray reviewer or
   anyone else who can see the channel can't submit answers on someone else's
   behalf.
+- **Application**: The Apply button now enforces `required_link_role_id` as a
+  real gate, rejecting users without the linked-account role before a channel
+  is created (previously the setting only sent a reminder after submission).
+  The apply panel lists the requirement and a configurable `link_required`
+  message explains how to link.
 - **Tickets**: Hosted transcript URLs now embed an unguessable 22-character
   token in the filename, so transcripts can no longer be enumerated by ticket
   number. The transcript web server also defaults to binding `127.0.0.1`

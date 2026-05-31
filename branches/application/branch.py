@@ -639,6 +639,7 @@ class Application(OakBranch):
                     (
                         "Interested in becoming staff? Click below to start your application!\n\n"
                         "**Requirements:**\n"
+                        "- A linked Minecraft account (use /discord link in-game)\n"
                         "- Be an active member of the community\n"
                         "- Have a good understanding of server rules\n"
                         "- Be willing to help other players\n"
