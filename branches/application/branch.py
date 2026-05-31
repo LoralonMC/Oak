@@ -15,6 +15,7 @@ from oak.database import Migration
 from .helpers import (
     get_application_questions,
     get_embed_colors,
+    get_message,
     is_staff,
 )
 from .views import (
@@ -254,18 +255,23 @@ async def handle_application_start(interaction: discord.Interaction):
             pass
 
         # Send welcome message in application channel
+        welcome_title, welcome_description = get_message(
+            _config,
+            "welcome",
+            "Welcome to the Application Process",
+            (
+                "Use the buttons below to begin your application or cancel if you changed your mind.\n\n"
+                "**Before you start:**\n"
+                "- Answer all questions honestly and thoroughly\n"
+                "- Your progress is saved after each page\n\n"
+                "Good luck!"
+            ),
+        )
         await channel.send(
             content=user.mention,
             embed=discord.Embed(
-                title="Welcome to the Application Process",
-                description=(
-                    "Use the buttons below to begin your application or cancel if you changed your mind.\n\n"
-                    "**Before you start:**\n"
-                    "- Answer all questions honestly and thoroughly\n"
-                    "- This will take about 5-10 minutes\n"
-                    "- Your progress is saved after each page\n\n"
-                    "Good luck!"
-                ),
+                title=welcome_title,
+                description=welcome_description,
                 color=colors["info"]
             ),
             view=StartCancelView()
@@ -626,17 +632,29 @@ class Application(OakBranch):
 
             history = [m async for m in channel.history(limit=50)]
             if not any(m.author == self.bot.user and m.components for m in history):
+                panel_title, panel_description = get_message(
+                    self.config,
+                    "panel",
+                    "Staff Application",
+                    (
+                        "Interested in becoming staff? Click below to start your application!\n\n"
+                        "**Requirements:**\n"
+                        "- Be an active member of the community\n"
+                        "- Have a good understanding of server rules\n"
+                        "- Be willing to help other players\n"
+                        "- Have time to dedicate to staff duties"
+                    ),
+                )
+                # Honor the configurable button label (the @button decorator hardcodes
+                # a default; override it on the persistent view before posting).
+                button_label = self.config.get("settings", {}).get("application", {}).get("button_label", "Apply for Staff")
+                for child in self._application_button_view.children:
+                    if getattr(child, "custom_id", None) == "oak:application:apply":
+                        child.label = button_label
                 await channel.send(
                     embed=discord.Embed(
-                        title="Staff Application",
-                        description=(
-                            "Interested in becoming staff? Click below to start your application!\n\n"
-                            "**Requirements:**\n"
-                            "- Be an active member of the community\n"
-                            "- Have a good understanding of server rules\n"
-                            "- Be willing to help other players\n"
-                            "- Have time to dedicate to staff duties"
-                        ),
+                        title=panel_title,
+                        description=panel_description,
                         color=colors["info"]
                     ),
                     view=self._application_button_view

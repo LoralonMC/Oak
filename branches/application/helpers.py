@@ -30,6 +30,18 @@ def get_embed_colors(config: dict) -> dict:
     }
 
 
+def get_message(config: dict, key: str, default_title: str, default_description: str) -> tuple[str, str]:
+    """Fetch a configurable applicant-facing message (title, description).
+
+    Looks up ``settings.messages.<key>`` and falls back to the provided defaults,
+    so the branch works with no ``messages:`` config at all. Lets each deployment
+    override copy and tone without code changes (mirrors the ``inactivity.*_dm``
+    pattern). Defaults passed by the caller are the canonical English copy.
+    """
+    msg = config.get("settings", {}).get("messages", {}).get(key, {})
+    return msg.get("title", default_title), msg.get("description", default_description)
+
+
 def get_application_questions(config: dict) -> list:
     """Get application questions from config.
 

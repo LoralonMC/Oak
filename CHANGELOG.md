@@ -19,6 +19,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **Application**: The `button_label` setting is now honored on the Apply
+  button (it was previously hardcoded), the default welcome message no longer
+  states a fixed "5-10 minutes" completion time, and the unused `cleanup`
+  config block (which referenced a non-existent `/appcleanup` command) has
+  been removed.
 - **Tickets**: Ticket creation no longer holds the SQLite write lock during
   the Discord thread-creation API call. Numbered tickets now use a three-step
   reserve → create thread → finalize flow, and orphaned reservations from
@@ -57,6 +62,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Application**: Applicant-facing messages (welcome, apply panel, submission,
+  acceptance, denial) are now configurable via a `messages:` config section,
+  falling back to the existing copy as defaults. The `denied` message supports
+  a `{reason}` placeholder for the reviewer's reason.
 - **Vote Reminders**: New branch that posts a daily vote reminder embed in
   a configured channel at a configured UTC time, pinging a subscriber role.
   Includes an admin-only `/votereminder` command to post on demand for

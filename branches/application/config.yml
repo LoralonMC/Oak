@@ -78,9 +78,56 @@ settings:
     auto_delete_no_dm: true  # Automatically delete denied apps where DM failed after X time
     auto_delete_no_dm_after_hours: 24  # Hours to wait before auto-deleting denied apps where DM failed
 
-  # Manual cleanup settings (for /appcleanup command)
-  cleanup:
-    abandoned_after_days: 7  # Applications inactive for this long will be marked abandoned
+  # Applicant-facing message copy (optional). Omit any key to fall back to the
+  # built-in English defaults. Each entry takes a title and a description.
+  #   welcome   - shown in the application channel before the questions begin
+  #   panel     - the public "Apply" announcement embed
+  #   submitted - confirmation posted once all questions are answered
+  #   accepted  - DM sent when an application is accepted
+  #   denied    - DM sent when denied; {reason} is replaced with the reviewer's reason
+  messages:
+    welcome:
+      title: "Welcome to the Application Process"
+      description: |
+        Use the buttons below to begin your application or cancel if you changed your mind.
+
+        **Before you start:**
+        - Answer all questions honestly and thoroughly
+        - Your progress is saved after each page
+
+        Good luck!
+    panel:
+      title: "Staff Application"
+      description: |
+        Interested in becoming staff? Click below to start your application!
+
+        **Requirements:**
+        - Be an active member of the community
+        - Have a good understanding of server rules
+        - Be willing to help other players
+        - Have time to dedicate to staff duties
+    submitted:
+      title: "🎉 Application Submitted"
+      description: |
+        Thank you for completing your application!
+
+        Our staff team will review your responses and reach out here if we need more information. You will be notified when a decision is made.
+    accepted:
+      title: "Congratulations! You've Been Accepted."
+      description: |
+        Your application has been **accepted**!
+
+        A staff member will reach out to arrange your next steps. Welcome aboard, and thank you for your interest in helping our community!
+
+        *Please keep an eye on this channel for further instructions.*
+    denied:
+      title: "Application Update"
+      description: |
+        We're sorry to inform you that your application has been **denied**.
+
+        **Reason:** {reason}
+
+        We encourage you to continue contributing to the community and consider reapplying in the future.
 
   # MySQL/Plan Database (for background checks - playtime stats)
   # Set enabled to false if you don't use MySQL/Plan

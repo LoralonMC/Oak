@@ -11,7 +11,7 @@ from oak.constants import (
     MODAL_TEXT_INPUT_PLACEHOLDER_MAX,
     MODAL_TEXT_INPUT_VALUE_MAX
 )
-from .helpers import get_embed_colors, check_application_answer_quality, get_application_questions
+from .helpers import get_embed_colors, check_application_answer_quality, get_application_questions, get_message
 import json
 import asyncio
 import logging
@@ -167,13 +167,19 @@ class ApplicationModal(Modal):
         applicant = interaction.guild.get_member(interaction.user.id) or interaction.user
 
         # Send submission confirmation
-        embed = discord.Embed(
-            title="🎉 Application Submitted",
-            description=(
+        sub_title, sub_description = get_message(
+            _config,
+            "submitted",
+            "🎉 Application Submitted",
+            (
                 "Thank you for completing your application!\n\n"
                 "Our staff team will review your responses and reach out here if we need more information. "
                 "You will be notified when a decision is made."
             ),
+        )
+        embed = discord.Embed(
+            title=sub_title,
+            description=sub_description,
             color=colors["success"]
         )
 
@@ -333,14 +339,20 @@ class DeclineReasonModal(Modal):
         dm_sent = False
         if applicant:
             try:
+                deny_title, deny_description = get_message(
+                    _config,
+                    "denied",
+                    "Application Update",
+                    (
+                        "We're sorry to inform you that your application has been **denied**.\n\n"
+                        "**Reason:** {reason}\n\n"
+                        "We encourage you to continue contributing to the community and consider reapplying in the future."
+                    ),
+                )
                 await applicant.send(
                     embed=discord.Embed(
-                        title="Application Update",
-                        description=(
-                            "We're sorry to inform you that your application has been **denied**.\n\n"
-                            f"**Reason:** {sanitized_reason}\n\n"
-                            "We encourage you to continue contributing to the community and consider reapplying in the future."
-                        ),
+                        title=deny_title,
+                        description=deny_description.replace("{reason}", sanitized_reason),
                         color=colors["error"]
                     )
                 )

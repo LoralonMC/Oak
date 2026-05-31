@@ -8,7 +8,7 @@ from discord.ui import View, button
 import json
 import logging
 from oak.views import PaginatedEmbedView
-from .helpers import get_embed_colors, is_staff, get_application_questions, paginate_application_embed
+from .helpers import get_embed_colors, is_staff, get_application_questions, paginate_application_embed, get_message
 
 logger = logging.getLogger(__name__)
 
@@ -328,14 +328,20 @@ class ManageView(View):
         # the DM step ran to completion.
         if applicant:
             try:
+                accept_title, accept_description = get_message(
+                    _config,
+                    "accepted",
+                    "Congratulations! You've Been Accepted.",
+                    (
+                        "Your application has been **accepted**!\n\n"
+                        "A staff member will reach out to arrange your next steps. Welcome aboard, and thank you for your interest in helping our community!\n\n"
+                        "*Please keep an eye on this channel for further instructions.*"
+                    ),
+                )
                 await applicant.send(
                     embed=discord.Embed(
-                        title="Congratulations! You've Been Accepted.",
-                        description=(
-                            "Your application has been **accepted**!\n\n"
-                            "A staff member will reach out to arrange your next steps. Welcome aboard, and thank you for your interest in helping our community!\n\n"
-                            "*Please keep an eye on this channel for further instructions.*"
-                        ),
+                        title=accept_title,
+                        description=accept_description,
                         color=colors["success"]
                     )
                 )
