@@ -6,6 +6,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **Application**: Open applications are now closed out when the applicant
+  leaves the Discord server. Previously the application sat pending forever
+  and the channel lingered with a permission overwrite for someone who was
+  gone, until a human happened to notice. In-progress and pending
+  applications get status `left_server`, a notice is posted in admin chat
+  with the application number, its prior status and the applicant's
+  Minecraft name, and the channel is deleted. The record itself is kept, so
+  the answers stay available in `/apphistory`. Accepted applications are
+  left alone. Handled both by an `on_member_remove` listener and by a sweep
+  on the 12-hour inactivity task, so departures during a restart or deploy
+  aren't missed.
+
 ### Fixed
 
 - **Application**: The Background Check button now defers before running its

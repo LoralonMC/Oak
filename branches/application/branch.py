@@ -3,10 +3,12 @@ Application Branch - Main Module
 Manages staff application workflow with multi-page forms, background checks, and approval system.
 """
 
+import json
+
 import discord
 from sqlite3 import IntegrityError
 from discord import app_commands
-from discord.ext import tasks
+from discord.ext import commands, tasks
 from oak import OakBranch
 from oak.context import BranchContext
 from oak.database import Migration
@@ -708,8 +710,15 @@ class Application(OakBranch):
             # Check for denied applications that need cleanup (where DM failed)
             denied_to_cleanup = await self._check_denied_apps_cleanup()
 
-            if apps_needing_warning or apps_to_abandon or denied_to_cleanup:
-                self.log.info(f"Inactivity check: Processed {len(apps_needing_warning)} warnings, {len(apps_to_abandon)} abandonments, and {denied_to_cleanup} denied app cleanups")
+            # Catch applicants who left while the bot wasn't watching
+            departed = await self._reconcile_departed_applicants()
+
+            if apps_needing_warning or apps_to_abandon or denied_to_cleanup or departed:
+                self.log.info(
+                    f"Inactivity check: Processed {len(apps_needing_warning)} warnings, "
+                    f"{len(apps_to_abandon)} abandonments, {denied_to_cleanup} denied app cleanups, "
+                    f"and {departed} departed applicants"
+                )
 
         except Exception as e:
             self.log.error(f"Error in check_inactive_applications: {e}", exc_info=True)
@@ -822,6 +831,163 @@ class Application(OakBranch):
 
         except Exception as e:
             self.log.error(f"Error sending inactivity warning: {e}", exc_info=True)
+
+    async def _handle_departed_applicant(self, user_id: int, display_name: str | None = None) -> int:
+        """Close out any still-open applications for a member who left the guild.
+
+        The channel is deleted (it only existed for a person who is gone, and
+        its permission overwrite now points at nobody) but the row is kept with
+        status 'left_server' so the answers stay available in /apphistory and
+        /appstats totals don't shift. Same shape as cancel and abandon.
+
+        Only 'in_progress' and 'pending' are touched. Accepted applications are
+        deliberately left alone — those get moved to the accepted category for
+        record-keeping, and a hire who leaves is a different conversation.
+
+        Returns the number of applications closed.
+        """
+        try:
+            open_apps = await self.db.fetchall(
+                """SELECT channel_id, app_index, status, answers
+                FROM applications
+                WHERE user_id = ? AND status IN ('in_progress', 'pending')""",
+                (user_id,),
+            )
+            if not open_apps:
+                return 0
+
+            colors = get_embed_colors(self.config)
+            guild = self.bot.get_guild(self.bot.guild_id)
+            closed = 0
+
+            for channel_id, app_index, previous_status, answers_json in open_apps:
+                # Re-check status in the UPDATE so we don't stomp a decision a
+                # reviewer made between the SELECT above and here.
+                cursor = await self.db.execute(
+                    """UPDATE applications SET status = 'left_server'
+                    WHERE channel_id = ? AND status IN ('in_progress', 'pending')""",
+                    (channel_id,),
+                )
+                if cursor.rowcount == 0:
+                    self.log.info(
+                        f"App #{app_index} changed status while handling departure of {user_id}; leaving it alone"
+                    )
+                    continue
+                closed += 1
+
+                # Pull the Minecraft name (first answer) so the notice is
+                # actionable without digging through history.
+                mc_name = None
+                try:
+                    answers = json.loads(answers_json) if answers_json else []
+                    if isinstance(answers, list) and answers:
+                        mc_name = str(answers[0])[:64]
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
+                await self._notify_admin_applicant_left(
+                    user_id, app_index, previous_status, mc_name, display_name, colors
+                )
+
+                channel = guild.get_channel(channel_id) if guild else None
+                if channel:
+                    try:
+                        await channel.delete(
+                            reason=f"Applicant {user_id} left the server (application #{app_index})"
+                        )
+                        self.log.info(
+                            f"Deleted application channel {channel_id} (#{app_index}) — applicant {user_id} left"
+                        )
+                    except discord.HTTPException as e:
+                        self.log.error(f"Failed to delete channel {channel_id} after departure: {e}")
+
+            return closed
+
+        except Exception as e:
+            self.log.error(f"Error handling departed applicant {user_id}: {e}", exc_info=True)
+            return 0
+
+    async def _notify_admin_applicant_left(
+        self, user_id, app_index, previous_status, mc_name, display_name, colors
+    ):
+        """Post the departure notice to admin chat. Best-effort."""
+        if not self.admin_chat_id:
+            return
+        guild = self.bot.get_guild(self.bot.guild_id)
+        admin_chat = guild.get_channel(self.admin_chat_id) if guild else None
+        if not admin_chat:
+            self.log.warning(f"Admin chat {self.admin_chat_id} not found for departure notice")
+            return
+
+        who = f"{display_name} (`{user_id}`)" if display_name else f"<@{user_id}> (`{user_id}`)"
+        embed = discord.Embed(
+            title="🚪 Applicant Left the Server",
+            description=(
+                f"{who} left while application **#{app_index}** was **{previous_status}**.\n\n"
+                "The application channel has been deleted. Their answers are kept and "
+                "still viewable with `/apphistory`."
+            ),
+            color=colors["warning"],
+        )
+        if mc_name:
+            embed.add_field(name="Minecraft Name", value=mc_name, inline=True)
+        try:
+            await admin_chat.send(embed=embed)
+        except discord.HTTPException as e:
+            self.log.error(f"Failed to send applicant-left notice: {e}")
+
+    @commands.Cog.listener()
+    async def on_member_remove(self, member: discord.Member):
+        """Close open applications when their applicant leaves the guild."""
+        if member.guild.id != self.bot.guild_id:
+            return
+        closed = await self._handle_departed_applicant(member.id, display_name=str(member))
+        if closed:
+            self.log.info(f"Closed {closed} open application(s) for departed member {member.id}")
+
+    async def _reconcile_departed_applicants(self) -> int:
+        """Catch applicants who left while the bot was offline.
+
+        on_member_remove only fires for live events, so a leave during downtime
+        (a restart, a deploy) is missed entirely and the application sits open
+        forever. This sweeps for the same condition on the inactivity task.
+        """
+        try:
+            rows = await self.db.fetchall(
+                """SELECT DISTINCT user_id FROM applications
+                WHERE status IN ('in_progress', 'pending')"""
+            )
+            if not rows:
+                return 0
+
+            guild = self.bot.get_guild(self.bot.guild_id)
+            if not guild:
+                return 0
+
+            closed = 0
+            for (user_id,) in rows:
+                if guild.get_member(user_id) is not None:
+                    continue
+                # A cache miss is NOT proof of departure. Confirm against the
+                # API before deleting anything — acting on an incomplete member
+                # cache would destroy channels for people who never left.
+                try:
+                    await guild.fetch_member(user_id)
+                    continue
+                except discord.NotFound:
+                    pass
+                except discord.HTTPException as e:
+                    self.log.warning(f"Could not confirm membership of {user_id}, skipping: {e}")
+                    continue
+                closed += await self._handle_departed_applicant(user_id)
+
+            if closed:
+                self.log.info(f"Departed-applicant sweep closed {closed} application(s)")
+            return closed
+
+        except Exception as e:
+            self.log.error(f"Error reconciling departed applicants: {e}", exc_info=True)
+            return 0
 
     async def _abandon_application(self, user_id: int, channel_id: int):
         """Mark application as abandoned and delete channel."""

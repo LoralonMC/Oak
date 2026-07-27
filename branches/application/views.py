@@ -43,7 +43,8 @@ STATUS_EMOJI = {
     "denied": "❌",
     "cancelled": "🚫",
     "abandoned": "💤",
-    "in_progress": "📝"
+    "in_progress": "📝",
+    "left_server": "🚪"
 }
 
 
