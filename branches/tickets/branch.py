@@ -21,6 +21,7 @@ from .helpers import (
     get_embed_colors,
     is_staff,
     can_manage_ticket_category,
+    member_can_manage_category,
     hash_config,
     validate_config,
     format_log_embed,
@@ -180,6 +181,11 @@ class Tickets(OakBranch):
         self.register_task("check_reminders", self.check_reminders_task)
         self.log.info("Reminder check task started (interval: 1 minute)")
 
+        if self.setting("sla", "first_response_hours", default=6):
+            self.check_response_sla_task.start()
+            self.register_task("check_response_sla", self.check_response_sla_task)
+            self.log.info("First-response SLA task started (interval: 15 minutes)")
+
         # Periodically delete orphaned transcript HTML files. A transcript can
         # become orphan if the web save succeeded but the subsequent Discord
         # send failed before we recorded transcript_filename — or if a row was
@@ -208,6 +214,18 @@ class Tickets(OakBranch):
                 name="add_transcript_filename",
                 sql="ALTER TABLE tickets ADD COLUMN transcript_filename TEXT"
             ),
+            Migration(
+                name="add_first_response_at",
+                sql="ALTER TABLE tickets ADD COLUMN first_response_at TIMESTAMP"
+            ),
+            Migration(
+                name="add_first_responder_id",
+                sql="ALTER TABLE tickets ADD COLUMN first_responder_id INTEGER"
+            ),
+            Migration(
+                name="add_sla_alerted_at",
+                sql="ALTER TABLE tickets ADD COLUMN sla_alerted_at TIMESTAMP"
+            ),
         ])
 
     async def _cleanup_orphaned_reservations(self):
@@ -230,6 +248,8 @@ class Tickets(OakBranch):
             self.anti_archive_task.cancel()
         if self.check_reminders_task.is_running():
             self.check_reminders_task.cancel()
+        if self.check_response_sla_task.is_running():
+            self.check_response_sla_task.cancel()
         if self.cleanup_transcripts_task.is_running():
             self.cleanup_transcripts_task.cancel()
         for view in self._registered_views:
@@ -610,6 +630,127 @@ class Tickets(OakBranch):
     @cleanup_transcripts_task.error
     async def cleanup_transcripts_task_error(self, error):
         self.log.error(f"Unhandled error in cleanup_transcripts_task: {error}", exc_info=True)
+
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message):
+        """Record the first staff reply in a ticket thread.
+
+        Cheap guards first: this fires for every message in the guild, so bail
+        on anything that isn't a human posting in a thread before touching the
+        database.
+        """
+        if message.author.bot or not isinstance(message.channel, discord.Thread):
+            return
+        try:
+            row = await self.db.fetchone(
+                """SELECT user_id, category, first_response_at
+                   FROM tickets WHERE thread_id = ? AND status = 'open'""",
+                (message.channel.id,),
+            )
+            if not row:
+                return
+            creator_id, category, first_response_at = row
+            if first_response_at is not None:
+                return
+            # The person who opened the ticket replying to themselves isn't a
+            # response, even if they happen to be staff.
+            if message.author.id == creator_id:
+                return
+            if not member_can_manage_category(message.author, category, self.config):
+                return
+
+            await self.db.execute(
+                """UPDATE tickets
+                   SET first_response_at = datetime('now'), first_responder_id = ?
+                   WHERE thread_id = ? AND first_response_at IS NULL""",
+                (message.author.id, message.channel.id),
+            )
+            self.log.info(
+                f"First staff response on ticket {message.channel.id} by {message.author.id}"
+            )
+        except Exception as e:
+            self.log.error(f"Error recording first response: {e}", exc_info=True)
+
+    @tasks.loop(minutes=15)
+    async def check_response_sla_task(self):
+        """Flag open tickets that nobody on staff has replied to yet."""
+        try:
+            sla_hours = self.setting("sla", "first_response_hours", default=6)
+            repeat_hours = self.setting("sla", "realert_after_hours", default=12)
+            if not sla_hours or not self.log_channel_id:
+                return
+
+            overdue = await self.db.fetchall(
+                """SELECT thread_id, user_id, category, ticket_number,
+                          (julianday('now') - julianday(created_at)) * 24 AS age_hours
+                   FROM tickets
+                   WHERE status = 'open'
+                     AND first_response_at IS NULL
+                     AND (julianday('now') - julianday(created_at)) * 24 >= ?
+                     AND (sla_alerted_at IS NULL
+                          OR (julianday('now') - julianday(sla_alerted_at)) * 24 >= ?)
+                   ORDER BY created_at ASC""",
+                (sla_hours, repeat_hours),
+            )
+            if not overdue:
+                return
+
+            guild = self.bot.get_guild(self.bot.guild_id)
+            log_channel = guild.get_channel(self.log_channel_id) if guild else None
+            if not log_channel:
+                return
+
+            colors = get_embed_colors(self.config)
+            categories = self.config.get("settings", {}).get("categories", {})
+            lines = []
+            mention_role_ids = set()
+            for thread_id, creator_id, category, ticket_number, age_hours in overdue:
+                label = categories.get(category, {}).get(
+                    "label", category.replace("_", " ").title()
+                )
+                ident = f"#{ticket_number}" if ticket_number else ""
+                lines.append(
+                    f"<#{thread_id}> {ident} — **{label}** — opened by <@{creator_id}> "
+                    f"**{int(age_hours)}h** ago"
+                )
+                cat_config = categories.get(category, {})
+                for rid in cat_config.get("staff_roles", cat_config.get("ping_roles", [])):
+                    mention_role_ids.add(rid)
+
+            embed = discord.Embed(
+                title="⏰ Tickets Awaiting First Response",
+                description="\n".join(lines[:20]),
+                color=colors["log_closed"],
+            )
+            if len(lines) > 20:
+                embed.set_footer(text=f"...and {len(lines) - 20} more")
+
+            content = " ".join(f"<@&{rid}>" for rid in sorted(mention_role_ids)) or None
+            await log_channel.send(
+                content=content,
+                embed=embed,
+                allowed_mentions=discord.AllowedMentions(
+                    roles=True, everyone=False, users=False, replied_user=False
+                ),
+            )
+
+            for thread_id, *_ in overdue:
+                await self.db.execute(
+                    "UPDATE tickets SET sla_alerted_at = datetime('now') WHERE thread_id = ?",
+                    (thread_id,),
+                )
+            self.log.info(f"Flagged {len(overdue)} ticket(s) with no first response")
+
+        except Exception as e:
+            self.log.error(f"Error in check_response_sla_task: {e}", exc_info=True)
+
+    @check_response_sla_task.before_loop
+    async def before_check_response_sla_task(self):
+        await self.bot.wait_until_ready()
+
+    @check_response_sla_task.error
+    async def check_response_sla_task_error(self, error):
+        self.log.error(f"Unhandled error in check_response_sla_task: {error}", exc_info=True)
 
     @commands.Cog.listener()
     async def on_raw_thread_update(self, payload):

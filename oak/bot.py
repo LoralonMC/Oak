@@ -4,6 +4,7 @@ OakBot: the main bot class.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from pathlib import Path
@@ -37,7 +38,8 @@ class OakBot(commands.Bot):
 
         self.oak_config = config
         self.guild_id = config.guild_id
-        self.metrics = Metrics()
+        self.metrics = Metrics(path=Path(__file__).parent / "admin" / "metrics.json")
+        self.metrics.load()
         self.task_registry = TaskRegistry()
         self.event_bus = EventBus(metrics=self.metrics)
         self.router = InteractionRouter()
@@ -52,6 +54,7 @@ class OakBot(commands.Bot):
         self._watcher = None
         self._backup_manager = None
         self._error_reporter = None
+        self._metrics_task = None
 
         if config.dev_mode:
             logging.getLogger("oak").setLevel(logging.DEBUG)
@@ -127,11 +130,22 @@ class OakBot(commands.Bot):
         """Shut down gracefully: unload all branches via the loader, then close."""
         logger.info("Shutting down Oak...")
 
+        # Persist counters before anything else can fail during teardown.
+        self.metrics.save()
+
         # Stop backup manager if running (await so a mid-flight backup
         # finishes or cancels cleanly before we close DB connections)
         if self._backup_manager:
             await self._backup_manager.stop()
             self._backup_manager = None
+
+        if self._metrics_task and not self._metrics_task.done():
+            self._metrics_task.cancel()
+            try:
+                await self._metrics_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._metrics_task = None
 
         # Stop error forwarding before branches unload, so teardown noise
         # doesn't get posted to Discord as if it were a live failure.
@@ -189,6 +203,13 @@ class OakBot(commands.Bot):
             self._watcher.start()
             logger.info("Dev mode: file watcher started")
 
+        # Periodically persist metrics. close() saves too, but that only covers
+        # a graceful shutdown — this bounds what a hard crash can lose.
+        if self._metrics_task is None:
+            self._metrics_task = asyncio.create_task(
+                self._persist_metrics_loop(), name="oak-metrics-persist"
+            )
+
         # Start forwarding error logs to Discord
         if self.oak_config.error_log_channel and self._error_reporter is None:
             from .errorlog import ErrorReporter
@@ -218,6 +239,15 @@ class OakBot(commands.Bot):
             self._backup_manager.start()
 
         logger.info("Bot is ready!")
+
+    async def _persist_metrics_loop(self, interval_seconds: float = 600.0) -> None:
+        """Save metrics on an interval. Failures are swallowed by save()."""
+        try:
+            while True:
+                await asyncio.sleep(interval_seconds)
+                self.metrics.save()
+        except asyncio.CancelledError:
+            pass
 
     async def _track_slash_command(self, interaction: discord.Interaction) -> bool:
         """Interaction check that records slash command usage in metrics."""

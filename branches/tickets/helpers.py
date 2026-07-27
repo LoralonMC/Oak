@@ -53,13 +53,46 @@ def is_staff(interaction: discord.Interaction, staff_role_ids: list) -> bool:
     return any(role.id in staff_role_ids for role in interaction.user.roles)
 
 
+def member_can_manage_category(member, category: str, config: dict) -> bool:
+    """
+    Check if a member can manage tickets in a specific category.
+
+    Members can manage a category if they are an administrator, hold a global
+    staff role (``staff_role_ids``), or hold a role listed on that category.
+
+    Takes a Member rather than an Interaction so non-interaction paths (the
+    message listener that records first response) can use the same rules.
+
+    Args:
+        member: Discord member
+        category: Ticket category key
+        config: Tickets configuration dictionary
+
+    Returns:
+        True if the member can manage this category, False otherwise
+    """
+    perms = getattr(member, "guild_permissions", None)
+    if perms is not None and perms.administrator:
+        return True
+
+    roles = getattr(member, "roles", [])
+    settings = config.get("settings", {})
+
+    global_staff_role_ids = settings.get("staff_role_ids", [])
+    if any(role.id in global_staff_role_ids for role in roles):
+        return True
+
+    # Category-specific staff_roles (with backwards compatibility for ping_roles)
+    category_config = settings.get("categories", {}).get(category, {})
+    staff_roles = category_config.get("staff_roles", category_config.get("ping_roles", []))
+    return any(role.id in staff_roles for role in roles)
+
+
 def can_manage_ticket_category(interaction: discord.Interaction, category: str, config: dict) -> bool:
     """
-    Check if user can manage tickets in a specific category.
+    Check if the interacting user can manage tickets in a specific category.
 
-    Users can manage a category if they have:
-    - Global staff role (from staff_role_ids), OR
-    - Category-specific role (from that category's staff_roles)
+    Thin wrapper over :func:`member_can_manage_category`.
 
     Args:
         interaction: Discord interaction
@@ -71,25 +104,7 @@ def can_manage_ticket_category(interaction: discord.Interaction, category: str, 
     """
     if interaction.guild is None:
         return False
-
-    # Administrators always have access
-    if interaction.user.guild_permissions.administrator:
-        return True
-
-    # Check global staff roles
-    global_staff_role_ids = config.get("settings", {}).get("staff_role_ids", [])
-    if any(role.id in global_staff_role_ids for role in interaction.user.roles):
-        return True
-
-    # Check category-specific staff_roles (with backwards compatibility for ping_roles)
-    categories = config.get("settings", {}).get("categories", {})
-    category_config = categories.get(category, {})
-    staff_roles = category_config.get("staff_roles", category_config.get("ping_roles", []))
-
-    if any(role.id in staff_roles for role in interaction.user.roles):
-        return True
-
-    return False
+    return member_can_manage_category(interaction.user, category, config)
 
 
 def can_bypass_duplicate_check(interaction: discord.Interaction, config: dict) -> bool:

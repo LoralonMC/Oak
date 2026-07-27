@@ -22,8 +22,6 @@ CREATE TABLE IF NOT EXISTS suggestions (
     thread_id INTEGER,
     user_id INTEGER,
     content TEXT,
-    likes TEXT,
-    dislikes TEXT,
     status TEXT,
     reason TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -79,8 +77,10 @@ class Suggestions(OakBranch):
     async def on_enable(self) -> None:
         if self.db:
             await self.db.initialize(SUGGESTIONS_SCHEMA)
-            # Migrate existing votes from JSON columns to votes table
+            # Migrate existing votes from JSON columns to votes table,
+            # then retire the columns they came from.
             await self._migrate_votes()
+            await self._drop_legacy_vote_columns()
 
         # Set module-level refs for views/handlers/modals
         configure_views(self.db, self.config)
@@ -104,6 +104,54 @@ class Suggestions(OakBranch):
             view.stop()
         self._registered_views.clear()
 
+    async def _has_legacy_vote_columns(self) -> bool:
+        """True if the pre-``suggestion_votes`` JSON columns are still present."""
+        cols = {row[1] for row in await self.db.fetchall("PRAGMA table_info(suggestions)")}
+        return "likes" in cols or "dislikes" in cols
+
+    async def _drop_legacy_vote_columns(self) -> None:
+        """Drop the superseded ``likes``/``dislikes`` JSON columns.
+
+        Runs after ``_migrate_votes`` so anything they held is already in
+        ``suggestion_votes``. Guarded on the columns actually existing rather
+        than expressed as a framework Migration, because SQLite has no
+        conditional DDL and a plain DROP would fail on a fresh database that
+        never had them.
+
+        Requires SQLite >= 3.35 for ALTER TABLE DROP COLUMN; older versions
+        just leave the columns in place rather than failing the branch load.
+        """
+        try:
+            if not await self._has_legacy_vote_columns():
+                return
+
+            # Refuse to drop while anything still only exists in the old
+            # columns — better to keep dead columns than lose votes.
+            leftover = await self.db.fetchone(
+                """SELECT COUNT(*) FROM suggestions s
+                   WHERE (s.likes IS NOT NULL AND s.likes NOT IN ('', '[]'))
+                      OR (s.dislikes IS NOT NULL AND s.dislikes NOT IN ('', '[]'))"""
+            )
+            if leftover and leftover[0]:
+                votes_row = await self.db.fetchone("SELECT COUNT(*) FROM suggestion_votes")
+                if not (votes_row and votes_row[0]):
+                    self.log.warning(
+                        "Legacy vote columns still hold data and suggestion_votes is empty; "
+                        "leaving the columns in place"
+                    )
+                    return
+
+            for column in ("likes", "dislikes"):
+                try:
+                    # Column names are literals from this function, not input.
+                    await self.db.execute(f"ALTER TABLE suggestions DROP COLUMN {column}")
+                    self.log.info(f"Dropped legacy suggestions.{column} column")
+                except Exception as e:
+                    self.log.warning(f"Could not drop suggestions.{column}: {e}")
+                    return
+        except Exception as e:
+            self.log.error(f"Error dropping legacy vote columns: {e}", exc_info=True)
+
     async def _migrate_votes(self):
         """Backfill suggestion_votes table from legacy JSON columns.
 
@@ -111,6 +159,12 @@ class Suggestions(OakBranch):
         abort the whole migration and lose votes for every other suggestion.
         """
         try:
+            # A fresh database never had the legacy columns, and an already
+            # cleaned one has had them dropped. Either way there's nothing to
+            # backfill, and selecting them would raise.
+            if not await self._has_legacy_vote_columns():
+                return
+
             row = await self.db.fetchone("SELECT COUNT(*) FROM suggestion_votes")
             if row and row[0] > 0:
                 return  # Already migrated

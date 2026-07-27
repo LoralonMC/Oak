@@ -8,6 +8,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Tickets**: First-response tracking. The first reply from someone who can
+  manage the ticket's category (and isn't the person who opened it) is
+  recorded, and open tickets with no such reply after
+  `settings.sla.first_response_hours` (default 6) are listed in the log
+  channel, pinging that category's staff roles. Repeats every
+  `realert_after_hours` (default 12) until answered. Set
+  `first_response_hours: 0` to disable.
+- Metrics now survive restarts. Counters are persisted to
+  `oak/admin/metrics.json` on shutdown and every ten minutes, and reloaded at
+  startup, so a deploy no longer zeroes `/metrics`. `Metrics.reset()` clears
+  them deliberately, and the tracked `since` timestamp shows the real window.
+
 - Error logs are now forwarded to Discord. Set `ERROR_LOG_CHANNEL` (and
   optionally `ERROR_LOG_LEVEL`, default `ERROR`) and failures that previously
   only reached the container log get posted to a channel. Reports are deduped
@@ -38,6 +50,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   left alone. Handled both by an `on_member_remove` listener and by a sweep
   on the 12-hour inactivity task, so departures during a restart or deploy
   aren't missed.
+
+### Removed
+
+- **Suggestions**: The legacy `likes`/`dislikes` JSON columns are dropped once
+  their contents are in `suggestion_votes`. The drop is guarded on the columns
+  existing and on the votes table being populated, so a fresh database and an
+  unmigrated one are both safe, and it degrades to leaving them in place on
+  SQLite older than 3.35.
 
 ### Fixed
 
