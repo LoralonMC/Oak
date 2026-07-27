@@ -1,30 +1,35 @@
 # Tests
 
-Standalone check scripts. Each exits non-zero on failure, so they work as-is in
-a shell or a CI step.
-
-These import branch modules, which import `discord`, so they need an
-environment with the bot's dependencies installed. On a dev box that means
-`pip install -r requirements.txt`; against the live container it means:
+Pytest suite over the framework and branch logic that can be exercised without
+a live Discord connection. Run from the repo root:
 
 ```sh
-scp tests/check_hash.py root@<host>:/var/lib/pterodactyl/volumes/<uuid>/_check.py
-ssh root@<host> "docker exec <container> python /home/container/_check.py"
+pip install -r requirements.txt pytest
+pytest -q
 ```
 
-`OAK_ROOT` overrides the import root if the repo isn't the parent directory
-(that's how these run inside the container, where the code lives at
-`/home/container`).
+`conftest.py` puts the repo root on `sys.path`, so no install step is needed.
+`OAK_ROOT` overrides that if the code lives elsewhere (that's how these run
+inside the bot container, where it's `/home/container`).
 
-| Script | Covers |
+CI runs the same thing on 3.10 (matching the container image) plus a
+`compileall` pass over every module, which catches import and syntax errors in
+files no test touches.
+
+## Coverage
+
+| File | Covers |
 |---|---|
-| `check_hash.py` | `hash_config()` reacts to panel-visible config changes only, and ignores credentials, ports and staff roles. Guards against the panel being deleted and reposted on every unrelated edit. |
-| `check_errorlog.py` | `_BufferingErrorHandler` filters by level, drops `discord.*` records (feedback-loop guard), never raises out of `emit()`, and bounds its buffer. Plus the dedupe signature. |
+| `test_utils.py` | `sanitize_text`, `truncate`, `truncate_for_embed_field`, `paginate`, and `deep_merge` — including that merged config doesn't alias its inputs, since a shared nested reference would let one branch's config edit mutate another's defaults. |
+| `test_interactions.py` | `custom_id` build/parse round-trip, rejection of malformed ids and values, and the 100-char limit. Persistent views depend on these surviving a restart. |
+| `test_tickets_helpers.py` | `parse_time_string`, `sanitize_name`, `member_can_manage_category`, `validate_config`, and `hash_config` — the last asserting the panel is reposted only for changes that alter what it renders. |
+| `test_application_helpers.py` | `is_staff`, answer-quality checks, question loading, and `paginate_application_embed` against Discord's field-count, field-length and total-size limits, including that pagination terminates on pathological input. |
+| `test_errorlog.py` | The buffering handler: level filtering, traceback capture, the `discord.*` feedback-loop guard, bounded buffer, and that `emit()` never raises. It sits in the logging path, so a bug there breaks every log call. |
+| `test_metrics.py` | Persistence round-trip and that a corrupt, wrongly-shaped or hand-edited metrics file can't stop the bot starting. |
+| `test_status_channels.py` | `_validate_format` rejecting attribute and index access in config-supplied format strings. |
 
-## Still to do
+## Not covered
 
-Proper pytest suite over the other pure functions: `parse_time_string`,
-`_validate_format`, `deep_merge`, `sanitize_name`,
-`paginate_application_embed`, and the `custom_id` build/parse round-trip. Plus
-a CI workflow running `python -m compileall` across the tree, which would have
-caught a missing import that reached production once.
+Anything needing a live gateway connection: view callbacks, modal submission,
+the loader's cog lifecycle, and the branch background tasks. Those are still
+verified by deploying and reading the startup log.

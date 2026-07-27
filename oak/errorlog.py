@@ -53,7 +53,13 @@ class _BufferingErrorHandler(logging.Handler):
             try:
                 message = record.getMessage()
             except Exception:
-                message = str(record.msg)
+                # Bad %-args. Fall back to the raw template, and if even that
+                # can't be stringified, still report *something* — an error
+                # reporter that silently drops the weirdest errors is useless.
+                try:
+                    message = str(record.msg)
+                except Exception:
+                    message = f"<unformattable log record from {record.name}>"
             trace = ""
             if record.exc_info:
                 try:

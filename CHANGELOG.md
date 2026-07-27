@@ -11,8 +11,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Tickets**: First-response tracking. The first reply from someone who can
   manage the ticket's category (and isn't the person who opened it) is
   recorded, and open tickets with no such reply after
-  `settings.sla.first_response_hours` (default 6) are listed in the log
-  channel, pinging that category's staff roles. Repeats every
+  `settings.sla.first_response_hours` (default 6) are listed in
+  `settings.sla.alert_channel_id` (falling back to the log channel), pinging
+  that category's staff roles. Repeats every
   `realert_after_hours` (default 12) until answered. Set
   `first_response_hours: 0` to disable.
 - Metrics now survive restarts. Counters are persisted to
@@ -36,8 +37,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   reporting how many were started but never submitted. Numbers are assigned
   at channel creation, so abandoned attempts leave gaps that otherwise read
   as missing applications.
-- `tests/` with standalone check scripts for the tickets config hash and the
-  error-log buffering handler.
+- `tests/`: a pytest suite (184 tests) over the framework and branch logic
+  that runs without a Discord connection, plus a GitHub Actions workflow
+  running it on Python 3.10 alongside a `compileall` pass over every module.
 
 - **Application**: Open applications are now closed out when the applicant
   leaves the Discord server. Previously the application sat pending forever

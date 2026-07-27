@@ -677,7 +677,10 @@ class Tickets(OakBranch):
         try:
             sla_hours = self.setting("sla", "first_response_hours", default=6)
             repeat_hours = self.setting("sla", "realert_after_hours", default=12)
-            if not sla_hours or not self.log_channel_id:
+            # These are a nudge for staff, not an audit record, so they go to
+            # staff chat by default. Falls back to the log channel if unset.
+            alert_channel_id = self.setting("sla", "alert_channel_id", default=0) or self.log_channel_id
+            if not sla_hours or not alert_channel_id:
                 return
 
             overdue = await self.db.fetchall(
@@ -696,8 +699,9 @@ class Tickets(OakBranch):
                 return
 
             guild = self.bot.get_guild(self.bot.guild_id)
-            log_channel = guild.get_channel(self.log_channel_id) if guild else None
-            if not log_channel:
+            alert_channel = guild.get_channel(alert_channel_id) if guild else None
+            if not alert_channel:
+                self.log.warning(f"SLA alert channel {alert_channel_id} not found")
                 return
 
             colors = get_embed_colors(self.config)
@@ -726,7 +730,7 @@ class Tickets(OakBranch):
                 embed.set_footer(text=f"...and {len(lines) - 20} more")
 
             content = " ".join(f"<@&{rid}>" for rid in sorted(mention_role_ids)) or None
-            await log_channel.send(
+            await alert_channel.send(
                 content=content,
                 embed=embed,
                 allowed_mentions=discord.AllowedMentions(
