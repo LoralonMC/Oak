@@ -51,6 +51,7 @@ class OakBot(commands.Bot):
         self._start_time = time.monotonic()
         self._watcher = None
         self._backup_manager = None
+        self._error_reporter = None
 
         if config.dev_mode:
             logging.getLogger("oak").setLevel(logging.DEBUG)
@@ -132,6 +133,12 @@ class OakBot(commands.Bot):
             await self._backup_manager.stop()
             self._backup_manager = None
 
+        # Stop error forwarding before branches unload, so teardown noise
+        # doesn't get posted to Discord as if it were a live failure.
+        if self._error_reporter:
+            await self._error_reporter.stop()
+            self._error_reporter = None
+
         # Stop file watcher if running (await so a mid-reload completes
         # before we unload branches below)
         if self._watcher:
@@ -181,6 +188,23 @@ class OakBot(commands.Bot):
             self._watcher = BranchWatcher(self, self.loader)
             self._watcher.start()
             logger.info("Dev mode: file watcher started")
+
+        # Start forwarding error logs to Discord
+        if self.oak_config.error_log_channel and self._error_reporter is None:
+            from .errorlog import ErrorReporter
+
+            level = getattr(logging, self.oak_config.error_log_level, logging.ERROR)
+            if not isinstance(level, int):
+                logger.warning(
+                    f"Invalid ERROR_LOG_LEVEL '{self.oak_config.error_log_level}', using ERROR"
+                )
+                level = logging.ERROR
+            self._error_reporter = ErrorReporter(
+                self,
+                channel_id=self.oak_config.error_log_channel,
+                level=level,
+            )
+            self._error_reporter.start()
 
         # Start periodic database backups
         if self.oak_config.db_backup_interval > 0 and self._backup_manager is None:

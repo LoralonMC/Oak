@@ -102,6 +102,10 @@ class OakConfig:
         self.command_prefix = os.getenv("COMMAND_PREFIX", "!")
         self.dev_mode = os.getenv("DEV_MODE", "").lower() in ("true", "1", "yes")
         self.audit_log_channel = int(os.getenv("AUDIT_LOG_CHANNEL", "0"))
+        # Channel for forwarded error logs (0 = disabled). Separate from the
+        # audit channel: audit is "who did what", this is "what broke".
+        self.error_log_channel = int(os.getenv("ERROR_LOG_CHANNEL", "0"))
+        self.error_log_level = os.getenv("ERROR_LOG_LEVEL", "ERROR").upper()
         # Clamp to safe ranges — a negative interval would burn CPU in a tight
         # asyncio.sleep loop; a zero max-count would delete every backup
         # immediately after creating it.

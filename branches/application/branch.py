@@ -405,6 +405,10 @@ class Application(OakBranch):
                 name="add_cleanup_completed_at",
                 sql="ALTER TABLE applications ADD COLUMN cleanup_completed_at TIMESTAMP",
             ),
+            Migration(
+                name="add_nudged_at",
+                sql="ALTER TABLE applications ADD COLUMN nudged_at TIMESTAMP",
+            ),
         ])
 
         if self.application_channel_id == 0:
@@ -543,6 +547,24 @@ class Application(OakBranch):
             ])
 
             embed.add_field(name="Status Breakdown", value=status_text or "No data", inline=False)
+
+            # Application numbers are assigned when the channel is created, not
+            # when the form is submitted, so anything started and then dropped
+            # burns a number and leaves a visible gap. Say so, because the gaps
+            # otherwise read as missing applications.
+            unsubmitted = sum(
+                status_counts.get(s, 0) for s in ("cancelled", "abandoned")
+            )
+            if unsubmitted:
+                embed.add_field(
+                    name="Numbering",
+                    value=(
+                        f"**{unsubmitted}** application(s) were started but never submitted. "
+                        "Numbers are assigned when the channel is created, so those leave "
+                        "gaps in the sequence."
+                    ),
+                    inline=False,
+                )
 
             await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -713,11 +735,14 @@ class Application(OakBranch):
             # Catch applicants who left while the bot wasn't watching
             departed = await self._reconcile_departed_applicants()
 
-            if apps_needing_warning or apps_to_abandon or denied_to_cleanup or departed:
+            # Remind reviewers about submissions still waiting on them
+            nudged = await self._nudge_stale_pending()
+
+            if apps_needing_warning or apps_to_abandon or denied_to_cleanup or departed or nudged:
                 self.log.info(
                     f"Inactivity check: Processed {len(apps_needing_warning)} warnings, "
                     f"{len(apps_to_abandon)} abandonments, {denied_to_cleanup} denied app cleanups, "
-                    f"and {departed} departed applicants"
+                    f"{departed} departed applicants, and nudged {nudged} stale application(s)"
                 )
 
         except Exception as e:
@@ -831,6 +856,70 @@ class Application(OakBranch):
 
         except Exception as e:
             self.log.error(f"Error sending inactivity warning: {e}", exc_info=True)
+
+    async def _nudge_stale_pending(self) -> int:
+        """Remind admin chat about submitted applications nobody has reviewed.
+
+        The inactivity sweep intentionally ignores 'pending' — once someone
+        submits, the delay is the reviewers', not theirs. But nothing was
+        telling the reviewers either, so a submitted application could sit for
+        weeks unnoticed. This closes that loop without touching the applicant.
+
+        Nudges are rate-limited per application via nudged_at so a permanently
+        backlogged queue doesn't post every 12 hours forever.
+        """
+        try:
+            stale_days = self.setting("review", "stale_after_days", default=7)
+            repeat_days = self.setting("review", "renudge_after_days", default=7)
+            if not self.admin_chat_id or not stale_days:
+                return 0
+
+            stale = await self.db.fetchall(
+                """SELECT app_index, user_id, submitted_at,
+                          julianday('now') - julianday(submitted_at) AS age
+                   FROM applications
+                   WHERE status = 'pending'
+                     AND julianday('now') - julianday(submitted_at) >= ?
+                     AND (nudged_at IS NULL
+                          OR julianday('now') - julianday(nudged_at) >= ?)
+                   ORDER BY submitted_at ASC""",
+                (stale_days, repeat_days),
+            )
+            if not stale:
+                return 0
+
+            guild = self.bot.get_guild(self.bot.guild_id)
+            admin_chat = guild.get_channel(self.admin_chat_id) if guild else None
+            if not admin_chat:
+                return 0
+
+            colors = get_embed_colors(self.config)
+            lines = []
+            for app_index, user_id, _submitted_at, age in stale:
+                lines.append(f"**#{app_index}** — <@{user_id}> — waiting **{int(age)}** days")
+
+            embed = discord.Embed(
+                title="⏳ Applications Awaiting Review",
+                description="\n".join(lines[:20]),
+                color=colors["warning"],
+            )
+            if len(lines) > 20:
+                embed.set_footer(text=f"...and {len(lines) - 20} more")
+
+            await admin_chat.send(embed=embed)
+
+            for app_index, *_ in stale:
+                await self.db.execute(
+                    "UPDATE applications SET nudged_at = datetime('now') WHERE app_index = ?",
+                    (app_index,),
+                )
+
+            self.log.info(f"Nudged admin chat about {len(stale)} stale pending application(s)")
+            return len(stale)
+
+        except Exception as e:
+            self.log.error(f"Error nudging stale applications: {e}", exc_info=True)
+            return 0
 
     async def _handle_departed_applicant(self, user_id: int, display_name: str | None = None) -> int:
         """Close out any still-open applications for a member who left the guild.

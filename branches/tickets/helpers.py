@@ -201,7 +201,14 @@ async def has_active_ticket(user_id: int, category: str, db) -> tuple:
 
 def hash_config(config: dict) -> str:
     """
-    Generate SHA-256 hash of config for change detection.
+    Hash only the config fields that change what the panel message looks like.
+
+    The panel is deleted and reposted whenever this hash changes, which costs
+    the message id and any pin. Hashing the whole config meant editing a
+    transcript URL, a colour, a staff role or a database credential churned
+    the panel for no visible reason. Only the rendered fields count here:
+    panel title/description/colour, the categories field name, and each
+    enabled category's label, emoji and description.
 
     Args:
         config: Configuration dictionary
@@ -209,8 +216,28 @@ def hash_config(config: dict) -> str:
     Returns:
         SHA-256 hash string
     """
-    # Normalize and hash config
-    normalized = json.dumps(config, sort_keys=True)
+    settings = config.get("settings", {})
+    panel = settings.get("panel", {})
+
+    relevant = {
+        "title": panel.get("title"),
+        "description": panel.get("description"),
+        "color": panel.get("color"),
+        "categories_field_name": panel.get("categories_field_name"),
+        "categories": {
+            key: {
+                "label": cat.get("label"),
+                "emoji": cat.get("emoji"),
+                "description": cat.get("description"),
+            }
+            for key, cat in sorted(settings.get("categories", {}).items())
+            # A disabled category vanishes from the panel, so its presence
+            # matters even though its own fields no longer render.
+            if cat.get("enabled", True)
+        },
+    }
+
+    normalized = json.dumps(relevant, sort_keys=True, default=str)
     return hashlib.sha256(normalized.encode()).hexdigest()
 
 

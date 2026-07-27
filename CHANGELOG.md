@@ -8,6 +8,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Error logs are now forwarded to Discord. Set `ERROR_LOG_CHANNEL` (and
+  optionally `ERROR_LOG_LEVEL`, default `ERROR`) and failures that previously
+  only reached the container log get posted to a channel. Reports are deduped
+  over a five-minute window and capped per flush, so an outage produces a
+  handful of messages rather than hundreds, and `discord.*` records are never
+  forwarded so a failed send can't feed itself.
+- **Application**: Submitted applications that nobody has reviewed now nudge
+  admin chat, listing each application's number and how long it has been
+  waiting. Configurable via `settings.review.stale_after_days` (default 7)
+  and `renudge_after_days` (default 7). The inactivity sweep deliberately
+  ignores `pending`, since that delay belongs to the reviewers, so nothing
+  had been closing this loop.
+- **Application**: `/appstats` now explains gaps in application numbers,
+  reporting how many were started but never submitted. Numbers are assigned
+  at channel creation, so abandoned attempts leave gaps that otherwise read
+  as missing applications.
+- `tests/` with standalone check scripts for the tickets config hash and the
+  error-log buffering handler.
+
 - **Application**: Open applications are now closed out when the applicant
   leaves the Discord server. Previously the application sat pending forever
   and the channel lingered with a permission overwrite for someone who was
@@ -22,6 +41,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Tickets**: The panel is no longer deleted and reposted on unrelated config
+  changes. `hash_config()` hashed the entire config, so editing a transcript
+  URL, a staff role or a database credential churned the panel and lost its
+  message id and any pin. It now hashes only what the panel renders: the
+  panel title, description, colour and field name, plus each enabled
+  category's label, emoji and description.
 - **Application**: The Background Check button now defers before running its
   archived-thread scan and Plan playtime lookup. Both can exceed Discord's
   three-second interaction window, which showed up to staff as "This
