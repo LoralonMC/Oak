@@ -15,7 +15,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `settings.sla.alert_channel_id` (falling back to the log channel), pinging
   that category's staff roles. Repeats every
   `realert_after_hours` (default 12) until answered. Set
-  `first_response_hours: 0` to disable.
+  `first_response_hours: 0` to disable. Tickets that predate the feature are
+  backfilled from thread history on startup, so an already-answered ticket
+  isn't flagged forever; the same pass doubles as a safety net for replies
+  posted while the bot was offline.
 - Metrics now survive restarts. Counters are persisted to
   `oak/admin/metrics.json` on shutdown and every ten minutes, and reloaded at
   startup, so a deploy no longer zeroes `/metrics`. `Metrics.reset()` clears

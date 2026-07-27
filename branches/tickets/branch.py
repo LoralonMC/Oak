@@ -198,6 +198,84 @@ class Tickets(OakBranch):
     async def on_ready(self):
         """Validate panel after bot is connected and channel cache is populated."""
         await self.validate_panel()
+        await self._backfill_first_responses()
+
+    async def _backfill_first_responses(self, history_limit: int = 200, max_tickets: int = 50):
+        """Fill in first_response_at from thread history for tickets the
+        listener never saw.
+
+        on_message only observes live traffic, so every ticket that existed
+        before first-response tracking shipped looks unanswered no matter how
+        much staff conversation it contains — and would be re-flagged every
+        realert window forever. This reads the actual history instead.
+
+        Idempotent and self-limiting: once a ticket has a recorded response it
+        is never rescanned, and genuinely unanswered tickets are cheap to
+        re-check. That also makes this a safety net for replies posted while
+        the bot was offline.
+        """
+        try:
+            pending = await self.db.fetchall(
+                """SELECT thread_id, user_id, category FROM tickets
+                   WHERE status = 'open' AND first_response_at IS NULL
+                   ORDER BY created_at ASC LIMIT ?""",
+                (max_tickets,),
+            )
+            if not pending:
+                return
+
+            guild = self.bot.get_guild(self.bot.guild_id)
+            if not guild:
+                return
+
+            filled = 0
+            for thread_id, creator_id, category in pending:
+                thread = guild.get_channel(thread_id)
+                if thread is None:
+                    try:
+                        thread = await guild.fetch_channel(thread_id)
+                    except (discord.NotFound, discord.HTTPException):
+                        continue
+                if not isinstance(thread, discord.Thread):
+                    continue
+
+                try:
+                    async for message in thread.history(limit=history_limit, oldest_first=True):
+                        if message.author.bot or message.author.id == creator_id:
+                            continue
+                        # History can yield a User when the member isn't
+                        # cached; resolve so role checks are meaningful.
+                        member = guild.get_member(message.author.id)
+                        if member is None or not member_can_manage_category(
+                            member, category, self.config
+                        ):
+                            continue
+                        await self.db.execute(
+                            """UPDATE tickets
+                               SET first_response_at = ?, first_responder_id = ?
+                               WHERE thread_id = ? AND first_response_at IS NULL""",
+                            (
+                                message.created_at.strftime("%Y-%m-%d %H:%M:%S"),
+                                message.author.id,
+                                thread_id,
+                            ),
+                        )
+                        filled += 1
+                        self.log.info(
+                            f"Backfilled first response on ticket {thread_id} from "
+                            f"{message.author.id} at {message.created_at:%Y-%m-%d %H:%M}"
+                        )
+                        break
+                except discord.HTTPException as e:
+                    self.log.warning(f"Could not read history for ticket {thread_id}: {e}")
+                    continue
+                await asyncio.sleep(0.5)
+
+            if filled:
+                self.log.info(f"Backfilled first response for {filled} ticket(s) from history")
+
+        except Exception as e:
+            self.log.error(f"Error backfilling first responses: {e}", exc_info=True)
 
     async def _run_migrations(self):
         """Run database migrations using the framework's migration system."""
