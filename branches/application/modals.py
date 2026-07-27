@@ -11,7 +11,13 @@ from oak.constants import (
     MODAL_TEXT_INPUT_PLACEHOLDER_MAX,
     MODAL_TEXT_INPUT_VALUE_MAX
 )
-from .helpers import get_embed_colors, check_application_answer_quality, get_application_questions, get_message
+from .helpers import (
+    QUESTIONS_PER_PAGE,
+    get_embed_colors,
+    check_application_answer_quality,
+    get_application_questions,
+    get_message,
+)
 import json
 import asyncio
 import logging
@@ -43,7 +49,9 @@ class ApplicationModal(Modal):
         self.step = step
         self.answers = answers
         self.all_questions = get_application_questions(config)
-        self.questions = self.all_questions[step * 5: (step + 1) * 5]
+        self.questions = self.all_questions[
+            step * QUESTIONS_PER_PAGE: (step + 1) * QUESTIONS_PER_PAGE
+        ]
 
         for i, q in enumerate(self.questions):
             self.add_item(TextInput(
@@ -66,7 +74,7 @@ class ApplicationModal(Modal):
         validation_errors = []
 
         for i, item in enumerate(self.children):
-            question_idx = self.step * 5 + i
+            question_idx = self.step * QUESTIONS_PER_PAGE + i
             if question_idx < len(self.all_questions):
                 question = self.all_questions[question_idx]['label']
                 answer = sanitize_text(item.value, max_length=self.all_questions[question_idx].get('max_length', 1000))

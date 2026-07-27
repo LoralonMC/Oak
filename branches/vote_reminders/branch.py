@@ -153,6 +153,8 @@ class VoteReminders(OakBranch):
         name="votereminder",
         description="[Admin] Manually post the daily vote reminder now",
     )
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.guild_only()
     async def manual_reminder(self, interaction: discord.Interaction) -> None:
         """Manually trigger a vote reminder. Admin only.
 

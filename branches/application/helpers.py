@@ -10,6 +10,12 @@ from oak.utils import truncate_for_embed_field
 
 logger = logging.getLogger(__name__)
 
+# Questions per modal page. Discord caps a modal at 5 components, so this is a
+# hard ceiling rather than a preference. Both the modal's question slice and
+# the post-restart resume step derive from this — they must agree or a resumed
+# application re-asks or skips a page.
+QUESTIONS_PER_PAGE = 5
+
 
 def get_embed_colors(config: dict) -> dict:
     """Get embed colors from config.

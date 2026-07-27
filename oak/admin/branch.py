@@ -149,15 +149,15 @@ class AdminBranch(OakBranch):
         await interaction.response.defer(ephemeral=True)
 
         # Check if the branch is discovered
-        paths = self.bot.loader._paths
-        if branch_name not in paths:
+        branch_path = self.bot.loader.branch_path(branch_name)
+        if branch_path is None:
             await interaction.followup.send(
                 f"Branch **{branch_name}** not found.", ephemeral=True
             )
             return
 
         try:
-            write_branch_enabled(paths[branch_name], True)
+            write_branch_enabled(branch_path, True)
             instance = await self.bot.loader.load_branch(branch_name)
 
             if getattr(self.bot, "_ready_fired", False):
@@ -193,8 +193,8 @@ class AdminBranch(OakBranch):
 
         await interaction.response.defer(ephemeral=True)
 
-        paths = self.bot.loader._paths
-        if branch_name not in paths:
+        branch_path = self.bot.loader.branch_path(branch_name)
+        if branch_path is None:
             await interaction.followup.send(
                 f"Branch **{branch_name}** not found.", ephemeral=True
             )
@@ -205,7 +205,7 @@ class AdminBranch(OakBranch):
             if self.bot.loader.is_loaded(branch_name):
                 await self.bot.loader.unload_branch(branch_name)
 
-            write_branch_enabled(paths[branch_name], False)
+            write_branch_enabled(branch_path, False)
             await self.bot.sync_commands()
 
             await interaction.followup.send(

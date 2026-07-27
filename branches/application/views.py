@@ -8,7 +8,14 @@ from discord.ui import View, button
 import json
 import logging
 from oak.views import PaginatedEmbedView
-from .helpers import get_embed_colors, is_staff, get_application_questions, paginate_application_embed, get_message
+from .helpers import (
+    QUESTIONS_PER_PAGE,
+    get_embed_colors,
+    is_staff,
+    get_application_questions,
+    paginate_application_embed,
+    get_message,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +74,15 @@ _APP_BUTTON_ID_MAP = {
 }
 
 
+def _escape_reason(reason: str) -> str:
+    """Escape a stored denial reason for display.
+
+    Reasons are persisted raw so the original text survives; every render
+    path is responsible for escaping markdown and mentions itself.
+    """
+    return discord.utils.escape_markdown(discord.utils.escape_mentions(reason or ""))
+
+
 class ContinueView(View):
     """View with Continue button for multi-page applications."""
 
@@ -119,8 +135,7 @@ class ContinueView(View):
         if not answers and answers_json:
             try:
                 answers = json.loads(answers_json)
-                questions_per_page = 5
-                step = len(answers) // questions_per_page
+                step = len(answers) // QUESTIONS_PER_PAGE
                 logger.info(f"Recovered {len(answers)} partial answers from DB, resuming at step {step}")
             except (json.JSONDecodeError, TypeError) as e:
                 logger.error(f"Failed to recover partial answers from DB: {e}")
@@ -320,7 +335,16 @@ class ManageView(View):
             return
 
         applicant = interaction.guild.get_member(applicant_id)
-        dm_failed = False
+        if applicant is None:
+            # Applicant left the guild (or isn't cached). Fall back to a user
+            # fetch so we can still DM them; without this the DM block below
+            # is skipped silently and the channel claims they were notified.
+            try:
+                applicant = await interaction.client.fetch_user(applicant_id)
+            except discord.HTTPException as e:
+                logger.error(f"Failed to fetch applicant {applicant_id} for acceptance DM: {e}")
+        # No resolvable user means no DM was sent — report that, don't assume success.
+        dm_failed = applicant is None
 
         # DM the user. Broad HTTPException catch so a transient Discord
         # outage doesn't bubble out and leave the application in 'accepted'
@@ -469,6 +493,11 @@ class ManageView(View):
 
         from .background_check import fetch_playtime_embed
 
+        # Defer before the slow work below: the archived-thread scan and the
+        # Plan/MySQL playtime lookup can each outrun Discord's 3s interaction
+        # window, which surfaces to staff as "This interaction failed".
+        await interaction.response.defer(ephemeral=True)
+
         colors = get_embed_colors(_config)
 
         # Get MC name and applicant_id from DB
@@ -478,11 +507,17 @@ class ManageView(View):
         )
 
         if not row:
-            await interaction.response.send_message("No application data found.", ephemeral=True)
+            await interaction.followup.send("No application data found.", ephemeral=True)
             return
 
         applicant_id, answers_json = row
-        answers = json.loads(answers_json)
+        try:
+            answers = json.loads(answers_json) if answers_json else []
+        except (json.JSONDecodeError, TypeError):
+            await interaction.followup.send("Application data is corrupted.", ephemeral=True)
+            return
+        if not isinstance(answers, list):
+            answers = []
         # Safely get MC name (first answer), handle empty or missing answers
         mc_name = answers[0] if answers and len(answers) > 0 else None
 
@@ -535,7 +570,7 @@ class ManageView(View):
                 inline=False
             )
 
-        await interaction.response.send_message(
+        await interaction.followup.send(
             embeds=[embed, playtime_embed] if playtime_embed else [embed],
             ephemeral=True
         )
@@ -597,9 +632,11 @@ class ManageView(View):
 
             field_value = f"**Status:** {emoji} {status.title()}\n**Date:** {submitted_at[:10]}"
 
-            # Add denial reason if available
+            # Add denial reason if available. Reasons are stored raw, so escape
+            # at display time (same treatment DeclineReasonModal applies).
             if status == "denied" and denial_reason:
-                field_value += f"\n**Reason:** {denial_reason[:100]}{'...' if len(denial_reason) > 100 else ''}"
+                safe_reason = _escape_reason(denial_reason[:100])
+                field_value += f"\n**Reason:** {safe_reason}{'...' if len(denial_reason) > 100 else ''}"
 
             summary_embed.add_field(
                 name=f"Application #{app_index}",
@@ -695,7 +732,7 @@ class ApplicationHistoryView(View):
                 if denied_at:
                     header_info += f"**Denied:** {denied_at[:10]}\n"
                 if denial_reason:
-                    header_info += f"**Reason:** {denial_reason}\n"
+                    header_info += f"**Reason:** {_escape_reason(denial_reason)}\n"
 
             embeds[0].title = f"📜 Previous Application #{app_index}"
             embeds[0].description = header_info + "\n" + (embeds[0].description or "")

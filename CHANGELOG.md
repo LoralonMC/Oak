@@ -6,6 +6,37 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Application**: The Background Check button now defers before running its
+  archived-thread scan and Plan playtime lookup. Both can exceed Discord's
+  three-second interaction window, which showed up to staff as "This
+  interaction failed" instead of a result.
+- **Application**: Accepting an application whose applicant has left the
+  server now falls back to a user fetch, and reports the DM as failed when
+  the user can't be resolved at all. Previously the DM step was skipped
+  silently and the channel still announced the applicant had been notified.
+- **Application**: Denial reasons are now escaped wherever they're displayed.
+  The application-history views rendered stored reasons raw while the
+  decline message escaped them.
+- **Tickets**: The thread-update debounce cache is now pruned by the listener
+  rather than only by the anti-archive loop, so it no longer grows unbounded
+  when `anti_archive.enabled` is false.
+- Reads (`fetchone`/`fetchall`) now take the branch write lock. They share the
+  single connection with `transaction()`, so a read landing mid-transaction
+  ran inside it and could observe rows that were later rolled back.
+
+### Changed
+
+- **Vote Reminders**: `/votereminder` now declares
+  `default_permissions(administrator=True)` so it's hidden from non-admins
+  rather than only rejected at runtime.
+- **Application**: Modal page size is now the shared `QUESTIONS_PER_PAGE`
+  constant instead of a literal `5` repeated across the question split and
+  the post-restart resume step.
+- `BranchLoader.branch_path()` exposes a branch's directory so callers no
+  longer reach into `_paths` (the admin branch was doing this).
+
 ### Security
 
 - **Application**: Start/Continue application buttons now verify that the

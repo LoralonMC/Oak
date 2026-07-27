@@ -451,3 +451,12 @@ class BranchLoader:
     def discovered_ids(self) -> list[str]:
         """All discovered branch ids (loaded or not)."""
         return list(self._manifests.keys())
+
+    def branch_path(self, branch_id: str) -> Path | None:
+        """Folder a discovered branch was loaded from, or None if unknown.
+
+        Public accessor for callers that need the directory (e.g. the admin
+        branch toggling ``enabled`` in config.yml) so they don't reach into
+        ``_paths``.
+        """
+        return self._paths.get(branch_id)

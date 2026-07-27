@@ -197,22 +197,33 @@ class BranchDatabase:
             await self._conn.commit()
 
     async def fetchone(self, query: str, params: tuple = ()) -> aiosqlite.Row | None:
-        """Execute a read query and return one row."""
+        """Execute a read query and return one row.
+
+        Serialised against writes: reads share the single connection with
+        ``transaction()``, so an unlocked read landing between BEGIN
+        IMMEDIATE and COMMIT would run *inside* that transaction and see
+        rows that may still be rolled back.
+        """
         if not self._conn:
             raise RuntimeError("Database not initialized")
         if self._metrics and self._branch_id:
             self._metrics.inc(self._metrics.db_reads, self._branch_id)
-        cursor = await self._conn.execute(query, params)
-        return await cursor.fetchone()
+        async with self._write_lock:
+            cursor = await self._conn.execute(query, params)
+            return await cursor.fetchone()
 
     async def fetchall(self, query: str, params: tuple = ()) -> list[aiosqlite.Row]:
-        """Execute a read query and return all rows."""
+        """Execute a read query and return all rows.
+
+        Serialised against writes for the same reason as ``fetchone``.
+        """
         if not self._conn:
             raise RuntimeError("Database not initialized")
         if self._metrics and self._branch_id:
             self._metrics.inc(self._metrics.db_reads, self._branch_id)
-        cursor = await self._conn.execute(query, params)
-        return await cursor.fetchall()
+        async with self._write_lock:
+            cursor = await self._conn.execute(query, params)
+            return await cursor.fetchall()
 
     @property
     def write_lock(self) -> asyncio.Lock:

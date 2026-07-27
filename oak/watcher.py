@@ -92,7 +92,7 @@ class BranchWatcher:
 
     def _scan_branch(self, branch_id: str) -> dict[str, float]:
         """Return {filepath: mtime} for all .py files in a branch's directory."""
-        branch_dir = self._loader._paths.get(branch_id)
+        branch_dir = self._loader.branch_path(branch_id)
         if not branch_dir or not branch_dir.exists():
             return {}
         result = {}

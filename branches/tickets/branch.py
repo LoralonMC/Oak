@@ -362,14 +362,22 @@ class Tickets(OakBranch):
         except Exception as e:
             self.log.error(f"Error creating panel: {e}", exc_info=True)
 
-    @tasks.loop(minutes=30)
-    async def anti_archive_task(self):
-        """Periodically unarchive open ticket threads that were manually archived."""
-        # Cleanup stale entries from _thread_update_times
+    def _prune_thread_update_times(self) -> None:
+        """Drop debounce entries older than the debounce window.
+
+        Called from the listener itself rather than only from the
+        anti-archive loop, which doesn't run when anti_archive is disabled —
+        that left the dict growing for the lifetime of the process.
+        """
         now = time.time()
         stale = [tid for tid, ts in self._thread_update_times.items() if now - ts > 30]
         for tid in stale:
             del self._thread_update_times[tid]
+
+    @tasks.loop(minutes=30)
+    async def anti_archive_task(self):
+        """Periodically unarchive open ticket threads that were manually archived."""
+        self._prune_thread_update_times()
 
         try:
             open_tickets = await self.db.fetchall(
@@ -610,6 +618,7 @@ class Tickets(OakBranch):
             return
 
         # Debounce: skip if the same thread was processed within 5 seconds
+        self._prune_thread_update_times()
         now = time.time()
         last_update = self._thread_update_times.get(payload.thread_id, 0)
         if now - last_update < 5:
