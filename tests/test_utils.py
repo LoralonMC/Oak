@@ -1,8 +1,14 @@
 """Tests for oak.utils and oak.config pure helpers."""
 
 import pytest
+import yaml
 
-from oak.config import deep_merge
+from oak.config import (
+    deep_merge,
+    load_branch_config,
+    resolve_config_path,
+    write_branch_enabled,
+)
 from oak.utils import paginate, sanitize_text, truncate, truncate_for_embed_field
 
 
@@ -113,3 +119,50 @@ class TestDeepMerge:
         deep_merge(base, override)
         assert base == {"a": {"b": 1}}
         assert override == {"a": {"c": 2}}
+
+
+class TestConfigResolution:
+    """Live config.yml is gitignored; config.example.yml is committed. A fresh
+    clone must still start, and enabling/disabling must not destroy settings."""
+
+    def _write(self, path, data):
+        path.write_text(yaml.safe_dump(data), encoding="utf-8")
+
+    def test_prefers_live_config(self, tmp_path):
+        self._write(tmp_path / "config.yml", {"settings": {"a": "live"}})
+        self._write(tmp_path / "config.example.yml", {"settings": {"a": "example"}})
+        assert resolve_config_path(tmp_path).name == "config.yml"
+
+    def test_falls_back_to_example(self, tmp_path):
+        self._write(tmp_path / "config.example.yml", {"settings": {"a": "example"}})
+        assert resolve_config_path(tmp_path).name == "config.example.yml"
+
+    def test_none_when_neither_exists(self, tmp_path):
+        assert resolve_config_path(tmp_path) is None
+
+    def test_load_uses_example_when_live_absent(self, tmp_path):
+        self._write(tmp_path / "config.example.yml", {"settings": {"a": "example"}})
+        assert load_branch_config(tmp_path, {}, "t")["settings"]["a"] == "example"
+
+    def test_load_falls_back_to_defaults_with_no_files(self, tmp_path):
+        assert load_branch_config(tmp_path, {"settings": {"a": 1}}, "t") == {"settings": {"a": 1}}
+
+    def test_write_enabled_seeds_from_example(self, tmp_path):
+        # Otherwise /disable writes a config.yml containing only enabled:false,
+        # which then shadows the example and strips every other setting.
+        self._write(tmp_path / "config.example.yml", {"enabled": True, "settings": {"a": "kept"}})
+        write_branch_enabled(tmp_path, False)
+        written = yaml.safe_load((tmp_path / "config.yml").read_text(encoding="utf-8"))
+        assert written["enabled"] is False
+        assert written["settings"]["a"] == "kept"
+
+    def test_write_enabled_preserves_live_config(self, tmp_path):
+        self._write(tmp_path / "config.yml", {"enabled": True, "settings": {"a": "live"}})
+        write_branch_enabled(tmp_path, False)
+        written = yaml.safe_load((tmp_path / "config.yml").read_text(encoding="utf-8"))
+        assert written["enabled"] is False and written["settings"]["a"] == "live"
+
+    def test_write_enabled_leaves_no_temp_files(self, tmp_path):
+        self._write(tmp_path / "config.yml", {"settings": {}})
+        write_branch_enabled(tmp_path, True)
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["config.yml"]

@@ -1,0 +1,38 @@
+# Configuration for Vote Reminders Branch
+# Posts a daily reminder ping in a configured channel at a configured UTC time.
+
+enabled: true
+version: "1.0.0"
+
+settings:
+  # Channel where the daily reminder is posted
+  # Right-click the channel in Discord → Copy Channel ID
+  channel_id: 0  # CONFIGURE THIS (e.g. #general)
+
+  # Role to @mention so subscribers get notified
+  # Set to 0 to post the reminder with no role ping
+  ping_role_id: 0  # CONFIGURE THIS (e.g. ping-voting role ID)
+
+  # Channel referenced in the embed body for full voting info
+  # The {info_channel} placeholder in description_template resolves to this channel mention
+  # Set to 0 to fall back to plain text "#vote-links"
+  info_channel_id: 0  # CONFIGURE THIS (e.g. #vote-links)
+
+  # When the reminder fires daily (24h UTC)
+  # 12:00 UTC = 7 AM EST / 4 AM PST / 1 PM CET (good mixed-timezone default)
+  reminder_hour: 12
+  reminder_minute: 0
+
+  # Embed customization
+  embed:
+    title: "🗳️ Daily Vote Reminder"
+    # Available placeholder:
+    #   {info_channel} - Discord channel mention to #vote-links (or whatever info_channel_id points at)
+    description_template: |
+      Time to vote for Oakheart!
+
+      5 sites · 5 Vote Tokens + 5 Vote Keys daily · Each vote climbs your Vote Rank
+
+      Full list and clickable links in {info_channel}, or run `/vote` in-game.
+    color: 0xFCD472  # 0xFCD472 = Sunny Yellow (Oakheart palette)
+    footer: "Five minutes a day, 200 days to max rank."

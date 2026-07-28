@@ -367,9 +367,15 @@ class BranchLoader:
         return instance
 
     def _is_branch_enabled(self, branch_dir: Path) -> bool:
-        """Check if a branch's config.yml has enabled: false."""
-        config_path = branch_dir / "config.yml"
-        if not config_path.exists():
+        """Check if a branch's config has enabled: false.
+
+        Uses the same config.yml-then-example resolution as loading, so a
+        fresh clone doesn't enable a branch the example ships disabled.
+        """
+        from .config import resolve_config_path
+
+        config_path = resolve_config_path(branch_dir)
+        if config_path is None:
             return True
         try:
             with open(config_path, "r", encoding="utf-8") as f:

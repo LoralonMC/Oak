@@ -1,0 +1,23 @@
+enabled: true
+version: 1.0.0
+settings:
+  # OakheartWeb API base URL.
+  # Same-host Pterodactyl setup: 'http://172.17.0.1:4851' (Docker host gateway)
+  # If that fails, try 'http://<host-ip>:4851' or set up a shared Docker network.
+  api_url: ''
+  # OakheartWeb API key — copy the value from
+  # plugins/OakheartWeb/config.yml on the survival server.
+  # (OakheartWeb auto-generates this on first start; rotate via /oakweb reload after clearing.)
+  api_key: ''
+  ui:
+    embed_color: 5529949  # 0x545D4D (Forest Oak muted)
+    entries_per_page: 10
+    default_period: 7
+  # In-memory response cache. Tunable per-endpoint via code; these are the defaults.
+  cache:
+    default_ttl: 30    # Hot endpoints (/price, /search, /top, /player, /recent, /playershops)
+    overview_ttl: 60   # Stable aggregates (/economy, /health, /trending, /anomalies, /crate)
+  # Discord role IDs that grant access to staff-only commands
+  # (/economy, /cashflow, /crate, /anomalies). Users with Discord Administrator
+  # always pass regardless of this list.
+  admin_role_ids: []

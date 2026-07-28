@@ -4,6 +4,8 @@ A modular Discord bot framework with a branch-based plugin architecture. Each fe
 
 Built for a Minecraft community server. Includes suggestion voting, staff applications, support tickets, server status tracking, market analysis, and account linking out of the box.
 
+> **Project status:** built and maintained for one server (Oakheart), published in case it's useful to read or fork. It runs in production daily, but it isn't packaged as a general-purpose framework and isn't currently accepting third-party branches. See [Extension points](#extension-points) before building against it.
+
 ## Setup
 
 ### Requirements
@@ -31,7 +33,11 @@ Built for a Minecraft community server. Includes suggestion voting, staff applic
    ```
    Edit `.env` and fill in your bot token and guild ID.
 
-4. Configure branches — edit `config.yml` in each branch folder to set channel IDs, role IDs, etc.
+4. Configure branches — each branch ships a `config.example.yml`. Copy it to `config.yml` in the same folder and fill in your channel IDs, role IDs, and any credentials:
+   ```bash
+   for d in branches/*/; do cp -n "$d/config.example.yml" "$d/config.yml" 2>/dev/null; done
+   ```
+   `config.yml` is gitignored because it holds real IDs and secrets; the example is committed. If a branch has no `config.yml`, its example is loaded instead, so the bot still starts on a fresh clone.
 
 5. Run the bot
    ```bash
@@ -238,6 +244,19 @@ The generated branch includes a database schema, `DEFAULT_CONFIG`, lifecycle hoo
 Set `database: false` in `branch.yml` if you don't need a database.
 
 For the full developer guide — config, database, views, modals, events, background tasks, and more — see **[GUIDE.md](GUIDE.md)**.
+
+## Extension points
+
+Two subsystems are **built but currently unused by every shipped branch**, and are documented here so you don't assume they're load-bearing:
+
+| Subsystem | State |
+|---|---|
+| **Event bus** (`oak/events.py`, `ctx.events`) | Fully implemented: wildcard patterns, per-listener timeouts, parallel dispatch. No branch emits or subscribes to anything. |
+| **Service registry** (`self.services`, `require_branch()`) | Implemented. No branch registers or consumes a service. |
+
+They exist because the architecture is modelled on Minecraft plugin loaders, where plugins are compiled separately and can't import each other. Oak's branches all live in this repo and can simply import what they need, so neither has found a use. Cross-cutting concerns here have been better served by other means: error reporting is a `logging` handler on the root logger, and metrics are injected into `BranchDatabase` and the command tree.
+
+They're kept because they cost nothing at runtime and would be the right tool for a consumer that observes several branches without any of them knowing (an activity digest, for example). Treat them as untested: they have no production exercise, so expect to debug them the first time you rely on them.
 
 ## Logging
 

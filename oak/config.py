@@ -32,9 +32,29 @@ def deep_merge(base: dict, override: dict) -> dict:
     return result
 
 
+def resolve_config_path(branch_dir: Path) -> Path | None:
+    """Return the config file to load for a branch, or None if there isn't one.
+
+    Prefers ``config.yml``, falling back to ``config.example.yml``. Live
+    configs are gitignored (they hold tokens and channel ids) while the
+    example is committed, so a fresh clone still runs: branches whose settings
+    live entirely in config.yml rather than a DEFAULT_CONFIG would otherwise
+    start up empty.
+    """
+    live = branch_dir / "config.yml"
+    if live.exists():
+        return live
+    example = branch_dir / "config.example.yml"
+    if example.exists():
+        return example
+    return None
+
+
 def load_branch_config(branch_dir: Path, default_config: dict, branch_id: str) -> dict:
     """
-    Load a branch's config.yml and deep-merge against defaults.
+    Load a branch's config and deep-merge against defaults.
+
+    Reads ``config.yml`` when present, otherwise ``config.example.yml``.
 
     Args:
         branch_dir: The branch's directory (containing config.yml).
@@ -44,12 +64,12 @@ def load_branch_config(branch_dir: Path, default_config: dict, branch_id: str) -
     Returns:
         Merged configuration with defaults for missing keys.
     """
-    config_path = branch_dir / "config.yml"
-    if config_path.exists():
+    config_path = resolve_config_path(branch_dir)
+    if config_path is not None:
         try:
             with open(config_path, "r", encoding="utf-8") as f:
                 config = yaml.safe_load(f) or {}
-            logger.info(f"Loaded config for {branch_id}")
+            logger.info(f"Loaded config for {branch_id} from {config_path.name}")
             return deep_merge(default_config, config)
         except Exception as e:
             logger.error(f"Failed to load config for {branch_id}: {e}")
@@ -62,11 +82,17 @@ def write_branch_enabled(branch_dir: Path, enabled: bool) -> None:
     Writes to a temp file in the same directory then atomically replaces
     the target, so a crash mid-write can't truncate the file (branch
     configs may contain secrets — partial writes would be very bad).
+
+    When only ``config.example.yml`` exists, its contents are copied first.
+    Otherwise ``/disable`` would create a config.yml holding nothing but
+    ``enabled: false``, which then shadows the example and silently strips
+    the branch of every other setting.
     """
     config_path = branch_dir / "config.yml"
     try:
-        if config_path.exists():
-            with open(config_path, "r", encoding="utf-8") as f:
+        source = resolve_config_path(branch_dir)
+        if source is not None:
+            with open(source, "r", encoding="utf-8") as f:
                 data = yaml.safe_load(f) or {}
         else:
             data = {}
