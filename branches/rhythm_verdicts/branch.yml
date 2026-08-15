@@ -1,0 +1,6 @@
+id: rhythm_verdicts
+name: Chart Verdicts
+version: "1.0.0"
+description: DMs a chart author when staff accept or turn down their rhythm chart
+main: branch.RhythmVerdicts
+database: false

@@ -1,0 +1,45 @@
+# Configuration for Chart Verdicts Branch
+# Polls the website for reviewed rhythm charts and DMs their authors.
+
+enabled: true
+version: "1.0.0"
+
+settings:
+  # Website base URL as reachable FROM THIS CONTAINER. Use the website
+  # container's name or id, not the published host address — a published
+  # address fails container-to-container on this host (NAT hairpin).
+  api_url: 'http://CONFIGURE-THIS:4850'
+
+  # Must equal BOT_API_KEY in the website's environment. Without both sides
+  # set, the website answers 503 and nothing is delivered.
+  api_key: 'CONFIGURE THIS'
+
+  # How often to look for undelivered verdicts. Decisions are rare and a DM is
+  # not time-critical, so slow is fine.
+  poll_minutes: 5
+
+  # Where to post when the author has DMs closed: the public charts channel.
+  # The fallback names no verdict, only that one exists. 0 disables it.
+  fallback_channel_id: 0  # CONFIGURE THIS — #rhythm-charts
+
+  # Linked in the DM so the author can read the notes and reopen the chart.
+  forge_url: 'https://oakheart.net/rhythm'
+
+  embed:
+    approved_title: "🎉 Your chart was accepted"
+    approved_description: |-
+      **{title}** is going into the game, with your name on it.
+
+      It shows up in `/rhythm` once staff deliver it to the server.
+    approved_color: 0x8FAA87   # Garden Green
+
+    rejected_title: "🎵 Your chart was reviewed"
+    rejected_description: |-
+      **{title}** was not accepted this time.
+
+      Charts can be reopened and fixed in the Forge, and resubmitted.
+    # Storybook Brown, not the error red: not being accepted is not a fault.
+    rejected_color: 0x9D8B7A
+
+    reason_heading: "What the reviewer said"
+    footer: "Oakheart Chart Forge"
