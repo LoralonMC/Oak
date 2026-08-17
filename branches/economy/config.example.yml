@@ -21,3 +21,8 @@ settings:
   # (/economy, /cashflow, /crate, /anomalies). Users with Discord Administrator
   # always pass regardless of this list.
   admin_role_ids: []
+  # Shop names omitted from shop lists in /price and /player (case-insensitive).
+  # Intended for currency-faucet shops every player uses, which otherwise crowd
+  # out every ranking. Their trades still count toward the totals. Empty = show
+  # every shop.
+  hidden_shops: []

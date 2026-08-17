@@ -44,6 +44,10 @@ DEFAULT_CONFIG = {
             "overview_ttl": 60,   # Stable aggregates (/economy, /health, /trending, /anomalies)
         },
         "admin_role_ids": [],
+        # Shop names to omit from shop lists (not from totals). Intended for
+        # currency-faucet shops that every player uses, which otherwise crowd
+        # out every ranking. Server-specific, so the default is empty.
+        "hidden_shops": [],
     },
 }
 
@@ -74,6 +78,10 @@ class Economy(OakBranch):
         self.per_page = self.setting("ui", "entries_per_page", default=10)
         self.default_period = self.setting("ui", "default_period", default=7)
         self.admin_role_ids = self.setting("admin_role_ids", default=[])
+        self.hidden_shops = {
+            str(name).casefold()
+            for name in self.setting("hidden_shops", default=[]) or []
+        }
         self._cache_default_ttl = self.setting("cache", "default_ttl", default=30)
         self._cache_overview_ttl = self.setting("cache", "overview_ttl", default=60)
         self._session: aiohttp.ClientSession | None = None
@@ -213,6 +221,13 @@ class Economy(OakBranch):
 
     def _period_label(self, period: int) -> str:
         return "All time" if period == 0 else f"Last {period} days"
+
+    def _visible_shops(self, rows: list | None) -> list:
+        """Drop the configured emerald-faucet shops from a shop list."""
+        return [
+            r for r in (rows or [])
+            if str(r.get("shopName") or "").casefold() not in self.hidden_shops
+        ]
 
     def _emeralds(self, value) -> str:
         """Render a raw emerald amount in the abbreviations players use in game.
@@ -430,12 +445,7 @@ class Economy(OakBranch):
         await interaction.response.defer(ephemeral=not public)
         p = period if period is not None else self.default_period
 
-        # shopType=PLAYER keeps the admin shops at spawn out of the price, the
-        # counts and the shop list — they're fixed-price sinks, not market signal.
-        data = await self.api_get(
-            f"item/{urllib.parse.quote(item, safe='')}",
-            params={"period": p, "shopType": "PLAYER"},
-        )
+        data = await self.api_get(f"item/{urllib.parse.quote(item, safe='')}", params={"period": p})
         if not data:
             await interaction.followup.send(f"No data found for **{item[:100]}**.", ephemeral=True)
             return
@@ -484,7 +494,7 @@ class Economy(OakBranch):
         )
         embed.add_field(name="Material", value=data.get("material") or "--", inline=True)
 
-        top_shops = data.get("topShops", [])
+        top_shops = self._visible_shops(data.get("topShops"))
         if top_shops:
             lines = [
                 f"**{s.get('shopName') or '?'}** ({s.get('ownerName') or s.get('shopType', '?')})"
@@ -493,13 +503,7 @@ class Economy(OakBranch):
             ]
             embed.add_field(name="Top Shops", value="\n".join(lines), inline=False)
 
-        # Only claim the filter applied if the API echoed it back. An older
-        # plugin build ignores the unknown param and returns everything, and a
-        # footer asserting otherwise would be a lie about the numbers above it.
-        footer = self._period_label(p)
-        if data.get("shopType") == "PLAYER":
-            footer += " • Player shops only"
-        embed.set_footer(text=footer)
+        embed.set_footer(text=self._period_label(p))
         await interaction.followup.send(embed=embed, ephemeral=not public)
 
     @price.autocomplete("item")
@@ -643,17 +647,15 @@ class Economy(OakBranch):
                 lines.append(f"**{i}.** {self._item_name(item)} — {vol:,}")
             embed.add_field(name="Top Items", value="\n".join(lines), inline=False)
 
-        # Player shops only. The spawn admin shops are the universal emerald
-        # sink — everyone uses them, so they crowd out the list without saying
-        # anything about this player. The API returns the breakdown ungrouped
-        # and unlimited, so filtering here drops nothing but admin rows.
-        shops = [s for s in (data.get("shopBreakdown") or []) if s.get("shopType") == "PLAYER"]
+        # The API returns this breakdown unlimited and tagged, so filtering the
+        # emerald-faucet shops out here drops nothing else.
+        shops = self._visible_shops(data.get("shopBreakdown"))
         if shops:
             lines = [
-                f"**{s.get('shopName') or '?'}** — {int(s.get('trades', 0)):,} trades"
+                f"**{s.get('shopName') or '?'}** ({s.get('shopType', '?')}) — {int(s.get('trades', 0)):,} trades"
                 for s in shops[:5]
             ]
-            embed.add_field(name="Top Player Shops Used", value="\n".join(lines), inline=False)
+            embed.add_field(name="Top Shops Used", value="\n".join(lines), inline=False)
 
         embed.set_footer(text=self._period_label(p))
         await interaction.followup.send(embed=embed, ephemeral=not public)
