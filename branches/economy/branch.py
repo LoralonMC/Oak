@@ -54,6 +54,11 @@ DEFAULT_CONFIG = {
 # Legacy section-sign colour codes, stripped from display names defensively.
 _LEGACY_COLOR_RE = re.compile("§.")
 
+# Emerald item keys. Every sale pays out in these, so they swamp any
+# "top items" ranking built from what a player received — as currency moving,
+# not as a good the player trades.
+EMERALD_KEYS = {"minecraft:emerald", "minecraft:emerald_block"}
+
 # Emeralds in one emerald block. The API stores every price as a raw emerald
 # count (blocks already multiplied out), so this is only ever used to convert
 # back for display.
@@ -223,10 +228,20 @@ class Economy(OakBranch):
         return "All time" if period == 0 else f"Last {period} days"
 
     def _visible_shops(self, rows: list | None) -> list:
-        """Drop the configured emerald-faucet shops from a shop list."""
+        """Drop the configured faucet shops from a shop list.
+
+        Matched on name **and** ADMIN type. Players can rename a shop to
+        anything, so a name-only rule would both hide an innocent player shop
+        called "Farmer" and hand players a way to duck the rankings by naming
+        their shop after a spawn one. Only staff can create an ADMIN shop, so
+        the pair is unforgeable — no UUID needed.
+        """
         return [
             r for r in (rows or [])
-            if str(r.get("shopName") or "").casefold() not in self.hidden_shops
+            if not (
+                r.get("shopType") == "ADMIN"
+                and str(r.get("shopName") or "").casefold() in self.hidden_shops
+            )
         ]
 
     def _emeralds(self, value) -> str:
@@ -639,13 +654,20 @@ class Economy(OakBranch):
         if ranks:
             embed.add_field(name="Ranks", value="\n".join(ranks), inline=True)
 
-        top_items = data.get("topItems", [])
+        # Drop emeralds: the list ranks what the player received, and selling
+        # anything pays out in emeralds, so they take the top slot for every
+        # active trader. That says "this player sells things", not what they
+        # trade. The API returns 10 rows, so there's room to spare after the cut.
+        top_items = [
+            i for i in (data.get("topItems") or [])
+            if i.get("itemKey") not in EMERALD_KEYS
+        ]
         if top_items:
             lines = []
             for i, item in enumerate(top_items[:5], 1):
                 vol = int(item.get("volume", 0))
                 lines.append(f"**{i}.** {self._item_name(item)} — {vol:,}")
-            embed.add_field(name="Top Items", value="\n".join(lines), inline=False)
+            embed.add_field(name="Top Items Bought", value="\n".join(lines), inline=False)
 
         # The API returns this breakdown unlimited and tagged, so filtering the
         # emerald-faucet shops out here drops nothing else.
