@@ -484,10 +484,6 @@ class Economy(OakBranch):
         )
         embed.add_field(name="Material", value=data.get("material") or "--", inline=True)
 
-        plugin = data.get("pluginId", "vanilla")
-        if plugin != "vanilla":
-            embed.add_field(name="Source", value=plugin, inline=True)
-
         top_shops = data.get("topShops", [])
         if top_shops:
             lines = [
@@ -583,11 +579,9 @@ class Economy(OakBranch):
 
         rows = data["results"]
         def fmt(rank, row):
-            name = self._item_name(row)
-            key = row["itemKey"]
-            plugin = row.get("pluginId", "vanilla")
-            source = f" `{plugin}`" if plugin != "vanilla" else ""
-            return f"**{rank}.** {name}{source}\n　`{key}`"
+            # No plugin-id tag: it's internal plumbing, and the key on the next
+            # line already carries the same namespace.
+            return f"**{rank}.** {self._item_name(row)}\n　`{row['itemKey']}`"
 
         pages = self._build_pages(rows, self.per_page, f"Search: {query}"[:EMBED_TITLE_MAX], fmt)
         await self._send_paginated(interaction, pages, ephemeral=not public)
