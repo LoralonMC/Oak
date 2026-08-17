@@ -643,13 +643,17 @@ class Economy(OakBranch):
                 lines.append(f"**{i}.** {self._item_name(item)} — {vol:,}")
             embed.add_field(name="Top Items", value="\n".join(lines), inline=False)
 
-        shops = data.get("shopBreakdown", [])
+        # Player shops only. The spawn admin shops are the universal emerald
+        # sink — everyone uses them, so they crowd out the list without saying
+        # anything about this player. The API returns the breakdown ungrouped
+        # and unlimited, so filtering here drops nothing but admin rows.
+        shops = [s for s in (data.get("shopBreakdown") or []) if s.get("shopType") == "PLAYER"]
         if shops:
             lines = [
-                f"**{s.get('shopName') or '?'}** ({s.get('shopType', '?')}) — {int(s.get('trades', 0)):,} trades"
+                f"**{s.get('shopName') or '?'}** — {int(s.get('trades', 0)):,} trades"
                 for s in shops[:5]
             ]
-            embed.add_field(name="Top Shops Used", value="\n".join(lines), inline=False)
+            embed.add_field(name="Top Player Shops Used", value="\n".join(lines), inline=False)
 
         embed.set_footer(text=self._period_label(p))
         await interaction.followup.send(embed=embed, ephemeral=not public)
