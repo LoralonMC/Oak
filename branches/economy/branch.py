@@ -50,6 +50,11 @@ DEFAULT_CONFIG = {
 # Legacy section-sign colour codes, stripped from display names defensively.
 _LEGACY_COLOR_RE = re.compile("§.")
 
+# Emeralds in one emerald block. The API stores every price as a raw emerald
+# count (blocks already multiplied out), so this is only ever used to convert
+# back for display.
+EMERALDS_PER_BLOCK = 9
+
 # Currency display config
 CURRENCIES = {
     "emerald": {"name": "Emerald", "emoji": "🟢"},
@@ -208,6 +213,38 @@ class Economy(OakBranch):
 
     def _period_label(self, period: int) -> str:
         return "All time" if period == 0 else f"Last {period} days"
+
+    def _emeralds(self, value) -> str:
+        """Render a raw emerald amount in the abbreviations players use in game.
+
+        The API normalises every emerald block to 9 emeralds before it does any
+        maths, so prices arrive as a single raw emerald figure — but shop signs
+        are written in blocks, so 28.17 has to be read back as "3 blocks and a
+        bit". EM/EMS is one/many emeralds, EMB/EMBS one/many blocks.
+        """
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return "--"
+
+        blocks, remainder = divmod(abs(value), EMERALDS_PER_BLOCK)
+        blocks = int(blocks)
+        # Round first, then carry: 8.999 must read as one block, not "8.999 EMS".
+        remainder = round(remainder, 2)
+        if remainder >= EMERALDS_PER_BLOCK:
+            blocks += 1
+            remainder = 0.0
+
+        parts = []
+        if blocks:
+            parts.append(f"{blocks:,} {'EMB' if blocks == 1 else 'EMBS'}")
+        if remainder or not parts:
+            # %g drops trailing zeros: 1.17 -> "1.17", 1.0 -> "1"
+            shown = f"{remainder:g}"
+            parts.append(f"{shown} {'EM' if remainder == 1 else 'EMS'}")
+
+        sign = "-" if value < 0 else ""
+        return sign + " ".join(parts)
 
     def _plain(self, text) -> str:
         """Strip legacy section-sign colour codes from an API-supplied string."""
@@ -393,7 +430,12 @@ class Economy(OakBranch):
         await interaction.response.defer(ephemeral=not public)
         p = period if period is not None else self.default_period
 
-        data = await self.api_get(f"item/{urllib.parse.quote(item, safe='')}", params={"period": p})
+        # shopType=PLAYER keeps the admin shops at spawn out of the price, the
+        # counts and the shop list — they're fixed-price sinks, not market signal.
+        data = await self.api_get(
+            f"item/{urllib.parse.quote(item, safe='')}",
+            params={"period": p, "shopType": "PLAYER"},
+        )
         if not data:
             await interaction.followup.send(f"No data found for **{item[:100]}**.", ephemeral=True)
             return
@@ -406,8 +448,12 @@ class Economy(OakBranch):
             avg = float(data.get("avgPrice", 0))
             low = float(data.get("minPrice", 0))
             high = float(data.get("maxPrice", 0))
-            embed.add_field(name="Avg Price", value=f"🟢 {avg:,.2f} ea", inline=True)
-            embed.add_field(name="Range", value=f"{low:,.2f} – {high:,.2f}", inline=True)
+            embed.add_field(name="Avg Price", value=f"🟢 {self._emeralds(avg)} each", inline=True)
+            range_value = (
+                self._emeralds(low) if low == high
+                else f"{self._emeralds(low)} – {self._emeralds(high)}"
+            )
+            embed.add_field(name="Range", value=range_value, inline=True)
             embed.add_field(name="Priced Trades", value=f"{priced:,}", inline=True)
         else:
             embed.add_field(
@@ -416,21 +462,23 @@ class Economy(OakBranch):
                 inline=False,
             )
 
-        # The API splits trade stats by side: bought (this item was the result)
-        # vs spent (this item was the payment).
+        # The API splits trade stats by which side of the trade the item sat on.
+        # Shopkeepers models a buy-shop as "player hands over the item, receives
+        # emeralds", so the item-as-payment side is players *selling* it — not a
+        # separate "used as currency" concept.
         embed.add_field(
-            name="Bought",
+            name="Players Bought",
             value=(
-                f"{self._fmt(data.get('receivedCount'))} trades\n"
-                f"{self._fmt(data.get('receivedVolume'))} units"
+                f"{self._fmt(data.get('receivedVolume'))} units\n"
+                f"in {self._fmt(data.get('receivedCount'))} trades"
             ),
             inline=True,
         )
         embed.add_field(
-            name="Paid With",
+            name="Players Sold",
             value=(
-                f"{self._fmt(data.get('givenCount'))} trades\n"
-                f"{self._fmt(data.get('givenVolume'))} units"
+                f"{self._fmt(data.get('givenVolume'))} units\n"
+                f"in {self._fmt(data.get('givenCount'))} trades"
             ),
             inline=True,
         )
@@ -449,7 +497,13 @@ class Economy(OakBranch):
             ]
             embed.add_field(name="Top Shops", value="\n".join(lines), inline=False)
 
-        embed.set_footer(text=self._period_label(p))
+        # Only claim the filter applied if the API echoed it back. An older
+        # plugin build ignores the unknown param and returns everything, and a
+        # footer asserting otherwise would be a lie about the numbers above it.
+        footer = self._period_label(p)
+        if data.get("shopType") == "PLAYER":
+            footer += " • Player shops only"
+        embed.set_footer(text=footer)
         await interaction.followup.send(embed=embed, ephemeral=not public)
 
     @price.autocomplete("item")
@@ -487,7 +541,7 @@ class Economy(OakBranch):
                 vol = int(row.get("volume", 0))
                 trades = int(row.get("tradeCount", 0))
                 price = row.get("avgPrice")
-                price_part = f", 🟢 {float(price):,.2f} ea" if price is not None else ""
+                price_part = f", 🟢 {self._emeralds(price)} ea" if price is not None else ""
                 return f"**{rank}.** {name} — {vol:,} vol, {trades:,} trades{price_part}"
             title = "Top Traded Items"
 
