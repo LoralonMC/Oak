@@ -671,7 +671,20 @@ class Economy(OakBranch):
 
         # The API returns this breakdown unlimited and tagged, so filtering the
         # emerald-faucet shops out here drops nothing else.
-        shops = self._visible_shops(data.get("shopBreakdown"))
+        breakdown = data.get("shopBreakdown") or []
+        shops = self._visible_shops(breakdown)
+
+        # How much of the headline trade count is real player-market activity
+        # rather than grinding the spawn faucets. The breakdown sums exactly to
+        # tradeCount, so this is an exact split, not an estimate.
+        total_trades = int(data.get("tradeCount") or 0)
+        if breakdown and total_trades:
+            market = sum(int(s.get("trades", 0)) for s in shops)
+            embed.add_field(
+                name="Market Trades",
+                value=f"{market:,} of {total_trades:,} ({market / total_trades:.0%})",
+                inline=True,
+            )
         if shops:
             lines = [
                 f"**{s.get('shopName') or '?'}** ({s.get('shopType', '?')}) — {int(s.get('trades', 0)):,} trades"
