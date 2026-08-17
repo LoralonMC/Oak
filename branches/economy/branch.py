@@ -5,6 +5,7 @@ REST API — no local database.
 """
 
 import asyncio
+import re
 import time
 import urllib.parse
 from collections import OrderedDict
@@ -45,6 +46,9 @@ DEFAULT_CONFIG = {
         "admin_role_ids": [],
     },
 }
+
+# Legacy section-sign colour codes, stripped from display names defensively.
+_LEGACY_COLOR_RE = re.compile("§.")
 
 # Currency display config
 CURRENCIES = {
@@ -94,8 +98,13 @@ class Economy(OakBranch):
         params: dict | None = None,
         ttl: int | None = None,
         timeout: float = 10.0,
+        namespace: str = "economy",
     ) -> dict | None:
         """GET request to OakheartWeb API with in-memory caching.
+
+        ``namespace`` selects the API family — ``"economy"`` for
+        ``/api/economy/...`` (the default), or ``"player"`` for the core
+        ``/api/player/<name>`` lookup used to turn a name into a UUID.
 
         ``path`` is the endpoint path (e.g. ``"item/diamond"``); user-supplied
         path segments must be URL-encoded by the caller via
@@ -115,8 +124,8 @@ class Economy(OakBranch):
         if not self._session or not self.api_url:
             return None
         cache_ttl = ttl if ttl is not None else self._cache_default_ttl
-        # Cache key includes params so different queries don't collide
-        cache_key = (path, tuple(sorted(params.items())) if params else ())
+        # Cache key includes namespace + params so different queries don't collide
+        cache_key = (namespace, path, tuple(sorted(params.items())) if params else ())
         now = time.monotonic()
         if cache_ttl > 0:
             cached = self._api_cache.get(cache_key)
@@ -124,7 +133,7 @@ class Economy(OakBranch):
                 self._api_cache.move_to_end(cache_key)
                 return cached[1]
         try:
-            url = f"{self.api_url}/api/economy/{path}"
+            url = f"{self.api_url}/api/{namespace}/{path}"
             headers = {"Authorization": f"Bearer {self.api_key}"}
             async with self._session.get(
                 url,
@@ -200,6 +209,63 @@ class Economy(OakBranch):
     def _period_label(self, period: int) -> str:
         return "All time" if period == 0 else f"Last {period} days"
 
+    def _plain(self, text) -> str:
+        """Strip legacy section-sign colour codes from an API-supplied string."""
+        if not text:
+            return ""
+        return _LEGACY_COLOR_RE.sub("", str(text)).strip()
+
+    def _item_name(self, row: dict | None) -> str:
+        """Human-readable item name.
+
+        The API only sends ``displayName`` for items that carry a custom name —
+        vanilla rows omit the key entirely, so falling straight through to the
+        raw key printed things like ``minecraft:emerald``. Prettify the key
+        instead. Colours live in a separate ``nameColor`` field, so display
+        names arrive clean; the legacy-code strip is belt-and-braces.
+        """
+        if not isinstance(row, dict):
+            return "?"
+        name = row.get("displayName")
+        if name:
+            return _LEGACY_COLOR_RE.sub("", name).strip() or row.get("itemKey", "?")
+        key = row.get("itemKey")
+        if not key:
+            return "?"
+        tail = key.split(":", 1)[-1]
+        return tail.replace("_", " ").title() if tail else key
+
+    def _item_stack(self, row: dict | None) -> str:
+        """``6x Emerald`` — an item with its trade amount."""
+        if not isinstance(row, dict):
+            return "?"
+        amount = int(row.get("amount", 1) or 1)
+        return f"{amount:,}x {self._item_name(row)}"
+
+    def _rel_time(self, ms) -> str:
+        """Discord relative timestamp from an epoch-millisecond value."""
+        try:
+            return f"<t:{int(ms) // 1000}:R>"
+        except (TypeError, ValueError):
+            return ""
+
+    async def _resolve_player(self, name: str) -> tuple[str, str] | None:
+        """Resolve a player name to ``(uuid, name)`` via the core player API.
+
+        The economy ``player/<id>`` endpoint keys strictly on UUID: handed a
+        name it matches no rows and returns a well-formed all-zero body, which
+        rendered as a real embed full of zeros. Resolve first so an unknown
+        name is reported as unknown.
+        """
+        data = await self.api_get(
+            urllib.parse.quote(name, safe=""),
+            namespace="player",
+            ttl=self._cache_overview_ttl,
+        )
+        if not data or not data.get("uuid"):
+            return None
+        return data["uuid"], data.get("name", name)
+
     # ------------------------------------------------------------------
     # Staff gate
     # ------------------------------------------------------------------
@@ -252,7 +318,7 @@ class Economy(OakBranch):
                 return []
             choices = []
             for item in data["results"]:
-                name = item.get("displayName") or item["itemKey"]
+                name = self._item_name(item)
                 key = item["itemKey"]
                 # Discord limits choice name to 100 chars
                 choices.append(app_commands.Choice(name=name[:100], value=key[:100]))
@@ -287,18 +353,31 @@ class Economy(OakBranch):
         embed.add_field(name="Player Trades", value=self._fmt(data.get("playerTrades")), inline=True)
         embed.add_field(name="Crate Opens", value=self._fmt(data.get("totalCrateOpens")), inline=True)
 
-        # Currency flow
+        # Currency flow. The API nests one object per currency
+        # ({"emerald": {"totalIn": ..., "totalOut": ..., "net": ...}}); the old
+        # flat "<currency>_in" lookup missed every key and reported 0/0/0.
         flow = data.get("currencyFlow", {})
         for key, info in CURRENCIES.items():
-            inflow = flow.get(f"{key}_in", 0)
-            outflow = flow.get(f"{key}_out", 0)
-            net = inflow - outflow
+            cur = flow.get(key)
+            if not isinstance(cur, dict):
+                continue
+            inflow = int(cur.get("totalIn", 0))
+            outflow = int(cur.get("totalOut", 0))
+            net = int(cur.get("net", inflow - outflow))
+            traded = int(cur.get("traded", 0))
             sign = "+" if net >= 0 else ""
             embed.add_field(
                 name=f"{info['emoji']} {info['name']}",
-                value=f"In: {inflow:,}\nOut: {outflow:,}\nNet: {sign}{net:,}",
+                value=(
+                    f"In: {inflow:,}\nOut: {outflow:,}\n"
+                    f"Net: {sign}{net:,}\nTraded: {traded:,}"
+                ),
                 inline=True,
             )
+
+        velocity = data.get("emeraldVelocity")
+        if velocity is not None:
+            embed.add_field(name="Emerald Velocity", value=f"{float(velocity):.2f}", inline=True)
 
         embed.set_footer(text=self._period_label(p))
         await interaction.followup.send(embed=embed, ephemeral=not public)
@@ -319,15 +398,56 @@ class Economy(OakBranch):
             await interaction.followup.send(f"No data found for **{item[:100]}**.", ephemeral=True)
             return
 
-        name = data.get("displayName") or data.get("itemKey", item)
-        embed = discord.Embed(title=f"Item: {name}", color=self.embed_color)
-        embed.add_field(name="Volume", value=self._fmt(data.get("totalVolume")), inline=True)
-        embed.add_field(name="Trades", value=self._fmt(data.get("tradeCount")), inline=True)
-        embed.add_field(name="Material", value=data.get("material", "--"), inline=True)
+        embed = discord.Embed(title=f"Item: {self._item_name(data)}", color=self.embed_color)
+
+        # Price, in emeralds per unit, from trades where emeralds were the cost.
+        priced = int(data.get("pricedTrades", 0) or 0)
+        if priced:
+            avg = float(data.get("avgPrice", 0))
+            low = float(data.get("minPrice", 0))
+            high = float(data.get("maxPrice", 0))
+            embed.add_field(name="Avg Price", value=f"🟢 {avg:,.2f} ea", inline=True)
+            embed.add_field(name="Range", value=f"{low:,.2f} – {high:,.2f}", inline=True)
+            embed.add_field(name="Priced Trades", value=f"{priced:,}", inline=True)
+        else:
+            embed.add_field(
+                name="Avg Price",
+                value="No emerald-priced trades in this period",
+                inline=False,
+            )
+
+        # The API splits trade stats by side: bought (this item was the result)
+        # vs spent (this item was the payment).
+        embed.add_field(
+            name="Bought",
+            value=(
+                f"{self._fmt(data.get('receivedCount'))} trades\n"
+                f"{self._fmt(data.get('receivedVolume'))} units"
+            ),
+            inline=True,
+        )
+        embed.add_field(
+            name="Paid With",
+            value=(
+                f"{self._fmt(data.get('givenCount'))} trades\n"
+                f"{self._fmt(data.get('givenVolume'))} units"
+            ),
+            inline=True,
+        )
+        embed.add_field(name="Material", value=data.get("material") or "--", inline=True)
 
         plugin = data.get("pluginId", "vanilla")
         if plugin != "vanilla":
             embed.add_field(name="Source", value=plugin, inline=True)
+
+        top_shops = data.get("topShops", [])
+        if top_shops:
+            lines = [
+                f"**{s.get('shopName') or '?'}** ({s.get('ownerName') or s.get('shopType', '?')})"
+                f" — {int(s.get('trades', 0)):,} trades, {int(s.get('volume', 0)):,} units"
+                for s in top_shops[:5]
+            ]
+            embed.add_field(name="Top Shops", value="\n".join(lines), inline=False)
 
         embed.set_footer(text=self._period_label(p))
         await interaction.followup.send(embed=embed, ephemeral=not public)
@@ -363,10 +483,12 @@ class Economy(OakBranch):
         if category == "items":
             rows = data.get("items", [])
             def fmt(rank, row):
-                name = row.get("displayName") or row["itemKey"]
+                name = self._item_name(row)
                 vol = int(row.get("volume", 0))
                 trades = int(row.get("tradeCount", 0))
-                return f"**{rank}.** {name} — {vol:,} vol, {trades:,} trades"
+                price = row.get("avgPrice")
+                price_part = f", 🟢 {float(price):,.2f} ea" if price is not None else ""
+                return f"**{rank}.** {name} — {vol:,} vol, {trades:,} trades{price_part}"
             title = "Top Traded Items"
 
         elif category == "traders":
@@ -407,7 +529,7 @@ class Economy(OakBranch):
 
         rows = data["results"]
         def fmt(rank, row):
-            name = row.get("displayName") or row["itemKey"]
+            name = self._item_name(row)
             key = row["itemKey"]
             plugin = row.get("pluginId", "vanilla")
             source = f" `{plugin}`" if plugin != "vanilla" else ""
@@ -431,28 +553,55 @@ class Economy(OakBranch):
         await interaction.response.defer(ephemeral=not public)
         p = period if period is not None else self.default_period
 
-        # We need the UUID — for now pass the name and let the portal-side resolve it
-        # The API uses UUID, so this is a limitation until we add name→UUID resolution
-        data = await self.api_get(f"player/{urllib.parse.quote(name, safe='')}", params={"period": p})
+        # The economy endpoint keys on UUID — a name matches nothing and comes
+        # back as a well-formed all-zero body, so resolve the name first.
+        resolved = await self._resolve_player(name)
+        if not resolved:
+            await interaction.followup.send(f"Unknown player **{name[:100]}**.", ephemeral=True)
+            return
+        uuid, player_name = resolved
+
+        data = await self.api_get(f"player/{urllib.parse.quote(uuid, safe='')}", params={"period": p})
         # `tradeCount=0` is a valid response (known player with no trades in
         # period), so only treat None/missing as "not found".
         if not data or data.get("tradeCount") is None:
             await interaction.followup.send(f"No trade data found for **{name[:100]}**.", ephemeral=True)
             return
 
-        player_name = data.get("name", name)
-        embed = discord.Embed(title=f"Player: {player_name}", color=self.embed_color)
+        embed = discord.Embed(title=f"Player: {data.get('name') or player_name}", color=self.embed_color)
         embed.add_field(name="Total Trades", value=self._fmt(data.get("tradeCount")), inline=True)
         embed.add_field(name="Unique Items", value=self._fmt(data.get("uniqueItems")), inline=True)
+
+        balance = data.get("emeraldBalance")
+        if balance is not None:
+            sign = "+" if int(balance) >= 0 else ""
+            embed.add_field(name="🟢 Emerald Balance", value=f"{sign}{int(balance):,}", inline=True)
+            embed.add_field(name="Spent", value=self._fmt(data.get("emeraldsSpent")), inline=True)
+            embed.add_field(name="Received", value=self._fmt(data.get("emeraldsReceived")), inline=True)
+
+        ranks = []
+        if data.get("tradeRank"):
+            ranks.append(f"Trades: #{int(data['tradeRank']):,}")
+        if data.get("emeraldRank"):
+            ranks.append(f"Emeralds: #{int(data['emeraldRank']):,}")
+        if ranks:
+            embed.add_field(name="Ranks", value="\n".join(ranks), inline=True)
 
         top_items = data.get("topItems", [])
         if top_items:
             lines = []
             for i, item in enumerate(top_items[:5], 1):
-                iname = item.get("displayName") or item["itemKey"]
                 vol = int(item.get("volume", 0))
-                lines.append(f"**{i}.** {iname} — {vol:,}")
+                lines.append(f"**{i}.** {self._item_name(item)} — {vol:,}")
             embed.add_field(name="Top Items", value="\n".join(lines), inline=False)
+
+        shops = data.get("shopBreakdown", [])
+        if shops:
+            lines = [
+                f"**{s.get('shopName') or '?'}** ({s.get('shopType', '?')}) — {int(s.get('trades', 0)):,} trades"
+                for s in shops[:5]
+            ]
+            embed.add_field(name="Top Shops Used", value="\n".join(lines), inline=False)
 
         embed.set_footer(text=self._period_label(p))
         await interaction.followup.send(embed=embed, ephemeral=not public)
@@ -557,7 +706,7 @@ class Economy(OakBranch):
             if rewards:
                 lines = []
                 for r in rewards[:10]:
-                    name = r.get("rewardName", "Unknown")
+                    name = self._plain(r.get("rewardName")) or "Unknown"
                     won = int(r.get("timesWon", 0))
                     rarity = r.get("rarity", "")
                     rarity_tag = f" `{rarity}`" if rarity else ""
@@ -588,7 +737,7 @@ class Economy(OakBranch):
             if top_rewards:
                 lines = []
                 for r in top_rewards[:10]:
-                    name = r.get("rewardName", "Unknown")
+                    name = self._plain(r.get("rewardName")) or "Unknown"
                     won = int(r.get("timesWon", 0))
                     lines.append(f"{name} — {won:,}x")
                 embed.add_field(name="Top Rewards", value="\n".join(lines), inline=False)
@@ -619,13 +768,22 @@ class Economy(OakBranch):
             return
 
         def fmt(rank, row):
-            buyer = row.get("buyer") or row.get("buyerName", "?")
-            seller = row.get("seller") or row.get("sellerName", "?")
-            item = row.get("displayName") or row.get("itemKey", "?")
-            qty = int(row.get("quantity", 1))
-            price = int(row.get("price", 0))
-            currency = row.get("currency", "")
-            return f"**{rank}.** {buyer} ← {qty:,}x {item} ← {seller} ({price:,} {currency})"
+            # A trade row is {playerName, shopName, shopType, item1[, item2],
+            # result, timestamp} — the player received `result` and paid with
+            # item1 (+ item2 when Shopkeepers split the price over two slots).
+            buyer = row.get("playerName", "?")
+            got = self._item_stack(row.get("result"))
+            cost = [self._item_stack(row["item1"])] if row.get("item1") else []
+            if row.get("item2"):
+                cost.append(self._item_stack(row["item2"]))
+            paid = " + ".join(cost) if cost else "?"
+            shop = row.get("shopName") or "?"
+            shop_type = row.get("shopType", "")
+            when = self._rel_time(row.get("timestamp"))
+            return (
+                f"**{rank}.** {buyer} — {got} for {paid}\n"
+                f"　{shop} · {shop_type} · {when}"
+            )
 
         pages = self._build_pages(trades, self.per_page, "Recent Trades", fmt)
         await self._send_paginated(interaction, pages, ephemeral=not public)
@@ -635,8 +793,12 @@ class Economy(OakBranch):
     # ------------------------------------------------------------------
 
     @app_commands.command(name="trending", description="View hot items right now")
-    @app_commands.describe(public="Show result publicly")
-    async def trending(self, interaction: discord.Interaction, public: bool = False):
+    @app_commands.describe(direction="Rising or falling in volume", public="Show result publicly")
+    @app_commands.choices(direction=[
+        app_commands.Choice(name="Rising", value="rising"),
+        app_commands.Choice(name="Falling", value="falling"),
+    ])
+    async def trending(self, interaction: discord.Interaction, direction: str = "rising", public: bool = False):
         """Show currently trending items."""
         await interaction.response.defer(ephemeral=not public)
 
@@ -645,17 +807,28 @@ class Economy(OakBranch):
             await interaction.followup.send("Could not fetch trending data.", ephemeral=True)
             return
 
-        items = data.get("items", []) if isinstance(data, dict) else data
+        # The API splits the payload into "rising" and "falling" — there is no
+        # flat "items" list, so the old lookup always reported nothing trending.
+        items = data.get(direction, []) if isinstance(data, dict) else []
         if not items:
-            await interaction.followup.send("No trending items right now.", ephemeral=True)
+            await interaction.followup.send(f"No {direction} items right now.", ephemeral=True)
             return
 
         def fmt(rank, row):
-            name = row.get("displayName") or row.get("itemKey", "?")
-            recent = int(row.get("recentTradeCount", row.get("tradeCount", 0)))
-            return f"**{rank}.** {name} — {recent:,} recent trades"
+            name = self._item_name(row)
+            vol = int(row.get("currentVolume", 0))
+            change = int(row.get("change", 0))
+            pct = int(row.get("changePercent", 0))
+            trades = int(row.get("currentTrades", 0))
+            sign = "+" if change >= 0 else ""
+            return (
+                f"**{rank}.** {name} — {vol:,} vol "
+                f"({sign}{change:,}, {sign}{pct}%) · {trades:,} trades"
+            )
 
-        pages = self._build_pages(items, self.per_page, "🔥 Trending Items", fmt)
+        icon = "🔥" if direction == "rising" else "📉"
+        title = f"{icon} {direction.title()} Items"
+        pages = self._build_pages(items, self.per_page, title, fmt, footer_extra=self._period_label(int(data.get("period", 0))))
         await self._send_paginated(interaction, pages, ephemeral=not public)
 
     # ------------------------------------------------------------------
@@ -681,11 +854,24 @@ class Economy(OakBranch):
             return
 
         def fmt(rank, row):
-            flag = row.get("flag") or row.get("type", "unknown")
-            item = row.get("displayName") or row.get("itemKey", "?")
-            player = row.get("player") or row.get("playerName", "?")
-            details = row.get("details", "")
-            return f"**{rank}.** `{flag}` — {item} (player: {player})\n　{details}"
+            flag = row.get("type", "unknown")
+            player = row.get("playerName", "?")
+            # The API calls the human-readable detail "reason"; there is no
+            # "details" key, so that line always rendered blank. Rebuild it from
+            # the structured fields when they're present so the item reads as a
+            # name rather than the raw key the reason string embeds.
+            amount, avg = row.get("amount"), row.get("avgAmount")
+            if amount is not None and avg is not None:
+                reason = f"{int(amount):,}x {self._item_name(row)} (avg {int(avg):,})"
+            else:
+                reason = self._plain(row.get("reason")) or self._item_name(row)
+            shop = row.get("shopName") or "?"
+            shop_type = row.get("shopType", "")
+            when = self._rel_time(row.get("timestamp"))
+            return (
+                f"**{rank}.** `{flag}` — {player}: {reason}\n"
+                f"　{shop} · {shop_type} · {when}"
+            )
 
         pages = self._build_pages(anomalies_list, self.per_page, "🚨 Flagged Anomalies", fmt)
         await self._send_paginated(interaction, pages, ephemeral=not public)
@@ -694,27 +880,56 @@ class Economy(OakBranch):
     # /playershops
     # ------------------------------------------------------------------
 
-    @app_commands.command(name="playershops", description="View a player's shops")
-    @app_commands.describe(name="Player name", public="Show result publicly")
-    async def playershops(self, interaction: discord.Interaction, name: str, public: bool = False):
-        """Show shops owned by a specific player."""
+    @app_commands.command(name="playershops", description="View player shop owners and their best sellers")
+    @app_commands.describe(
+        name="Filter to one owner (leave empty for all)",
+        period="Time period in days (0 = all time)",
+        public="Show result publicly",
+    )
+    async def playershops(self, interaction: discord.Interaction, name: str = None, period: int = None, public: bool = False):
+        """Show player-shop owners ranked by trades, optionally filtered to one owner."""
         await interaction.response.defer(ephemeral=not public)
+        p = period if period is not None else self.default_period
 
-        data = await self.api_get("player-shops", params={"player": name})
+        # The endpoint takes no owner filter — it returns the top player-shop
+        # owners by trade count (server-capped at 100). Ask for the full 100 and
+        # filter here rather than passing a `player` param the API ignores,
+        # which used to return everyone's shops under one player's name.
+        data = await self.api_get("player-shops", params={"period": p, "limit": 100})
         if not data:
-            await interaction.followup.send(f"Could not fetch shops for **{name[:100]}**.", ephemeral=True)
+            await interaction.followup.send("Could not fetch player shop data.", ephemeral=True)
             return
 
         shops = data.get("shops", []) if isinstance(data, dict) else data
+        if name:
+            wanted = name.casefold()
+            shops = [s for s in shops if (s.get("ownerName") or "").casefold() == wanted]
+            if not shops:
+                await interaction.followup.send(
+                    f"No shop trades recorded for **{name[:100]}** in this period "
+                    "(only the top 100 owners by trade count are ranked).",
+                    ephemeral=True,
+                )
+                return
         if not shops:
-            await interaction.followup.send(f"No shops found for **{name[:100]}**.", ephemeral=True)
+            await interaction.followup.send("No player shop trades in this period.", ephemeral=True)
             return
 
         def fmt(rank, row):
-            shop_name = row.get("shopName") or row.get("name") or f"Shop {row.get('id', '?')}"
-            item = row.get("displayName") or row.get("itemKey", "?")
+            owner = row.get("ownerName") or "Unknown"
             trades = int(row.get("tradeCount", 0))
-            return f"**{rank}.** {shop_name} — {item} ({trades:,} trades)"
+            customers = int(row.get("uniqueCustomers", 0))
+            shop_count = int(row.get("shopCount", 0))
+            top = ", ".join(self._item_name(i) for i in (row.get("topItems") or [])[:3])
+            line = (
+                f"**{rank}.** {owner} — {trades:,} trades, "
+                f"{customers} customers, {shop_count} shop{'' if shop_count == 1 else 's'}"
+            )
+            return f"{line}\n　{top}" if top else line
 
-        pages = self._build_pages(shops, self.per_page, f"{name}'s Shops"[:EMBED_TITLE_MAX], fmt)
+        title = f"{shops[0].get('ownerName')}'s Shops" if name else "Player Shops"
+        pages = self._build_pages(
+            shops, self.per_page, title[:EMBED_TITLE_MAX], fmt,
+            footer_extra=self._period_label(p),
+        )
         await self._send_paginated(interaction, pages, ephemeral=not public)
