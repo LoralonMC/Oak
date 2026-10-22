@@ -68,6 +68,11 @@ DEFAULT_CONFIG = {
 }
 
 
+def _safe_text(text: str) -> str:
+    """Contributor text for a Discord message: markdown and mentions escaped."""
+    return discord.utils.escape_mentions(discord.utils.escape_markdown(str(text)))
+
+
 class RhythmVerdicts(OakBranch):
     """Delivers Chart Forge decisions to the people who made the charts."""
 
@@ -158,7 +163,9 @@ class RhythmVerdicts(OakBranch):
         title = self.setting("embed", f"{prefix}_title", default="Your chart was reviewed")
         template = self.setting("embed", f"{prefix}_description", default="**{title}** was reviewed.")
         color = int(self.setting("embed", f"{prefix}_color", default=0x9D8B7A))
-        chart_title = decision.get("title") or "your chart"
+        # Contributor-chosen text: escaped so a title can't carry a masked
+        # link or formatting into the message.
+        chart_title = _safe_text(decision.get("title") or "your chart")
         try:
             description = template.format(title=chart_title)
         except (KeyError, IndexError) as e:
@@ -212,12 +219,14 @@ class RhythmVerdicts(OakBranch):
         try:
             await channel.send(
                 content=(
-                    f"<@{author_id}> your chart **{decision.get('title') or 'submission'}** has been"
-                    f" reviewed. I could not DM you, so the result and any notes are waiting in the"
-                    f" Chart Forge: {self.forge_url}"
+                    f"<@{author_id}> your chart **{_safe_text(decision.get('title') or 'submission')}**"
+                    f" has been reviewed. I could not DM you, so the result and any notes are waiting"
+                    f" in the Chart Forge: {self.forge_url}"
                 ),
+                # Only the chart's author may be pinged: a title like "<@1><@2>" is
+                # escaped above, and this stops any mention that slipped through.
                 allowed_mentions=discord.AllowedMentions(
-                    users=True, roles=False, everyone=False, replied_user=False
+                    users=[discord.Object(id=int(author_id))], roles=False, everyone=False, replied_user=False
                 ),
             )
             return True
